@@ -13,10 +13,10 @@ import {
 import { createGameController } from "./gameController.js";
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: "*" }));
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
-  cors: { origin: ["https://masoi-client.vercel.app", "https://masoi.hiepd5.com", "https://hiepd5.com", "http://localhost:5173"] },
+  cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
 function broadcastRoom(room) {
