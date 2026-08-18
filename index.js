@@ -16,7 +16,7 @@ const app = express();
 app.use(cors());
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
-  cors: { origin: "*" }, // local dev only — siết lại domain khi deploy
+  cors: { origin: ["https://masoi-client.vercel.app", "https://hiepd5.com", "http://localhost:5173"] },
 });
 
 function broadcastRoom(room) {
