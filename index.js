@@ -43,6 +43,7 @@ io.on("connection", (socket) => {
     const { room: joinedRoom, player } = addPlayer(room.code, socket.id);
     socket.join(room.code);
     socket.data.roomCode = room.code;
+    socket.data.playerId = player.id;
     cb?.({ ok: true, roomCode: room.code, playerId: player.id });
     broadcastRoom(joinedRoom);
   });
@@ -55,6 +56,7 @@ io.on("connection", (socket) => {
     }
     socket.join(result.room.code);
     socket.data.roomCode = result.room.code;
+    socket.data.playerId = result.player.id;  // ← lưu stable playerId
     cb?.({ ok: true, roomCode: result.room.code, playerId: result.player.id });
     broadcastRoom(result.room);
   });
@@ -77,6 +79,7 @@ io.on("connection", (socket) => {
     const room = removePlayer(code, socket.id);
     socket.leave(code);
     socket.data.roomCode = null;
+    socket.data.playerId = null;
     if (room) broadcastRoom(room);
   });
 
@@ -84,12 +87,13 @@ io.on("connection", (socket) => {
     const code = socket.data.roomCode;
     const room = getRoom(code);
     if (!room) return cb?.({ error: "Không tìm thấy phòng." });
-    const player = room.players.find((p) => p.socketId === socket.id);
+    const player = room.players.find((p) => p.socketId === socket.id)
+                || room.players.find((p) => p.id === socket.data.playerId);
     if (!player) return cb?.({ error: "Không tìm thấy người chơi." });
 
     try {
       const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
-        identity: player.id, // LiveKit uses the fixed player.id
+        identity: player.id,
         name: player.name,
       });
       at.addGrant({ roomJoin: true, room: code, canPublish: true, canSubscribe: true });
@@ -112,7 +116,21 @@ io.on("connection", (socket) => {
     const code = socket.data.roomCode;
     const room = getRoom(code);
     if (!room) return null;
-    const player = room.players.find((p) => p.socketId === socket.id);
+
+    // Tìm theo socketId (bình thường)
+    let player = room.players.find((p) => p.socketId === socket.id);
+
+    // Fallback: tìm theo playerId đã lưu trong socket.data (trường hợp reconnect edge case)
+    if (!player && socket.data.playerId) {
+      player = room.players.find((p) => p.id === socket.data.playerId);
+      if (player) {
+        // Tự sửa: cập nhật socketId để các lần sau hoạt động bình thường
+        console.log(`[Reconnect Repair] Player ${player.name}: socketId fixed ${player.socketId} → ${socket.id}`);
+        player.socketId = socket.id;
+        player.connected = true;
+      }
+    }
+
     if (!player) return null;
     return cb(room, player);
   }
