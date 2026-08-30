@@ -11,6 +11,11 @@ import {
   publicRoomView,
 } from "./rooms.js";
 import { createGameController } from "./gameController.js";
+import { AccessToken } from "livekit-server-sdk";
+
+const LIVEKIT_URL = process.env.LIVEKIT_URL || "wss://ma-soi-online-rac6j8ri.livekit.cloud";
+const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || "APIQ2WP9w5JhSKX";
+const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || "ivTQhkkUZ3otV7XepsCnBdPmHTP6RIFhJRRsn1d28jI";
 
 const app = express();
 app.use(cors({ origin: "*" }));
@@ -71,6 +76,25 @@ io.on("connection", (socket) => {
     socket.leave(code);
     socket.data.roomCode = null;
     if (room) broadcastRoom(room);
+  });
+
+  socket.on("livekit:token", async (_, cb) => {
+    const code = socket.data.roomCode;
+    const room = getRoom(code);
+    if (!room) return cb?.({ error: "Không tìm thấy phòng." });
+    const player = room.players.find((p) => p.id === socket.id);
+    if (!player) return cb?.({ error: "Không tìm thấy người chơi." });
+
+    try {
+      const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+        identity: player.id,
+        name: player.name,
+      });
+      at.addGrant({ roomJoin: true, room: code, canPublish: true, canSubscribe: true });
+      cb?.({ token: await at.toJwt(), url: LIVEKIT_URL });
+    } catch (e) {
+      cb?.({ error: e.message });
+    }
   });
 
   socket.on("disconnect", () => {
