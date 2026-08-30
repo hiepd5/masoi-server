@@ -37,19 +37,37 @@ export function getRoom(code) {
 export function addPlayer(code, socketId, requestedName) {
   const room = getRoom(code);
   if (!room) return { error: "Phòng không tồn tại." };
+  
+  let name = requestedName?.trim();
+  
+  // Reconnect logic
+  if (room.phase !== "lobby" && name) {
+    const existingPlayer = room.players.find(p => p.name === name);
+    if (existingPlayer && !existingPlayer.connected) {
+       existingPlayer.socketId = socketId;
+       existingPlayer.connected = true;
+       if (existingPlayer.disconnectTimer) {
+         clearTimeout(existingPlayer.disconnectTimer);
+         existingPlayer.disconnectTimer = null;
+       }
+       return { room, player: existingPlayer };
+    }
+  }
+
   if (room.phase !== "lobby")
     return { error: "Ván chơi đã bắt đầu, không thể vào phòng." };
   if (room.players.length >= 18)
     return { error: "Phòng đã đầy (tối đa 18 người)." };
 
   const existingNames = room.players.map((p) => p.name);
-  let name = requestedName?.trim();
   if (!name || existingNames.includes(name)) {
     name = getDefaultName(existingNames);
   }
 
   const player = {
     id: socketId,
+    socketId: socketId,
+    connected: true,
     name,
     avatar: getAvatarUrl(name + "-" + socketId.slice(0, 4)),
     isHost: room.players.length === 0,
@@ -63,16 +81,25 @@ export function addPlayer(code, socketId, requestedName) {
 export function removePlayer(code, socketId) {
   const room = getRoom(code);
   if (!room) return null;
-  room.players = room.players.filter((p) => p.id !== socketId);
+  
+  const player = room.players.find((p) => p.socketId === socketId);
+  if (!player) return room;
 
-  // Nếu host rời phòng, chuyển host cho người tiếp theo
-  if (room.players.length > 0 && !room.players.some((p) => p.isHost)) {
-    room.players[0].isHost = true;
-    room.hostId = room.players[0].id;
+  if (room.phase === "lobby") {
+    room.players = room.players.filter((p) => p.id !== player.id);
+    // Chuyển host
+    if (room.players.length > 0 && !room.players.some((p) => p.isHost)) {
+      room.players[0].isHost = true;
+      room.hostId = room.players[0].id;
+    }
+  } else {
+    // Đang chơi, chỉ set connected = false
+    player.connected = false;
+    // (Tuỳ chọn: 5 phút sau xoá hẳn, nhưng trong board game nên giữ lại "cái xác" để không hỏng game)
   }
 
-  // Phòng trống thì dọn dẹp
-  if (room.players.length === 0) {
+  // Dọn phòng nếu trống (trong lobby) hoặc tất cả đều rớt mạng
+  if (room.players.length === 0 || room.players.every(p => !p.connected)) {
     rooms.delete(room.code);
     return null;
   }
@@ -87,14 +114,14 @@ export function renamePlayer(code, socketId, newName) {
   if (trimmed.length > 20) return { error: "Tên tối đa 20 ký tự." };
 
   const taken = room.players.some(
-    (p) => p.id !== socketId && p.name === trimmed
+    (p) => p.socketId !== socketId && p.name === trimmed
   );
   if (taken) return { error: "Tên này đã có người dùng trong phòng." };
 
-  const player = room.players.find((p) => p.id === socketId);
+  const player = room.players.find((p) => p.socketId === socketId);
   if (!player) return { error: "Không tìm thấy người chơi." };
   player.name = trimmed;
-  player.avatar = getAvatarUrl(trimmed + "-" + socketId.slice(0, 4));
+  player.avatar = getAvatarUrl(trimmed + "-" + player.id.slice(0, 4));
   return { room, player };
 }
 
@@ -102,6 +129,7 @@ export function renamePlayer(code, socketId, newName) {
 export function publicRoomView(room, forSocketId) {
   const g = room.game;
   const gameOver = g?.winner;
+  const me = room.players.find((p) => p.socketId === forSocketId);
 
   const base = {
     code: room.code,
@@ -112,14 +140,13 @@ export function publicRoomView(room, forSocketId) {
       avatar: p.avatar,
       isHost: p.isHost,
       alive: p.alive,
+      connected: p.connected,
       // chỉ trả về role của chính người xem, hoặc nếu game đã kết thúc, hoặc đã chết (lộ bài)
-      role: p.id === forSocketId || gameOver || !p.alive ? p.role : null,
+      role: p.id === me?.id || gameOver || !p.alive ? p.role : null,
     })),
   };
 
   if (!g) return base;
-
-  const me = room.players.find((p) => p.id === forSocketId);
 
   return {
     ...base,

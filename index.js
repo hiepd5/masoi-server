@@ -27,7 +27,9 @@ const io = new Server(httpServer, {
 function broadcastRoom(room) {
   // Mỗi client nhận view riêng (role của chính họ), nên emit riêng từng socket
   room.players.forEach((p) => {
-    io.to(p.id).emit("room:update", publicRoomView(room, p.id));
+    if (p.connected && p.socketId) {
+      io.to(p.socketId).emit("room:update", publicRoomView(room, p.socketId));
+    }
   });
 }
 
@@ -82,12 +84,12 @@ io.on("connection", (socket) => {
     const code = socket.data.roomCode;
     const room = getRoom(code);
     if (!room) return cb?.({ error: "Không tìm thấy phòng." });
-    const player = room.players.find((p) => p.id === socket.id);
+    const player = room.players.find((p) => p.socketId === socket.id);
     if (!player) return cb?.({ error: "Không tìm thấy người chơi." });
 
     try {
       const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
-        identity: player.id,
+        identity: player.id, // LiveKit uses the fixed player.id
         name: player.name,
       });
       at.addGrant({ roomJoin: true, room: code, canPublish: true, canSubscribe: true });
@@ -106,26 +108,26 @@ io.on("connection", (socket) => {
   });
 
   // ============ GAME EVENTS ============
-  function withRoom(cb) {
+  function withPlayer(cb) {
     const code = socket.data.roomCode;
     const room = getRoom(code);
     if (!room) return null;
-    return cb(room);
+    const player = room.players.find((p) => p.socketId === socket.id);
+    if (!player) return null;
+    return cb(room, player);
   }
 
   socket.on("game:start", (_, cb) => {
-    withRoom((room) => {
-      const player = room.players.find((p) => p.id === socket.id);
-      if (!player?.isHost) return cb?.({ ok: false, error: "Chỉ chủ phòng mới bắt đầu được." });
+    withPlayer((room, player) => {
+      if (!player.isHost) return cb?.({ ok: false, error: "Chỉ chủ phòng mới bắt đầu được." });
       const result = gameCtrl.startGame(room);
       cb?.(result);
     });
   });
 
   socket.on("room:restart", (_, cb) => {
-    withRoom((room) => {
-      const player = room.players.find((p) => p.id === socket.id);
-      if (!player?.isHost) return cb?.({ ok: false, error: "Chỉ chủ phòng mới có thể chơi lại." });
+    withPlayer((room, player) => {
+      if (!player.isHost) return cb?.({ ok: false, error: "Chỉ chủ phòng mới có thể chơi lại." });
       
       gameCtrl.clearRoomTimer(room.code);
       room.game = null;
@@ -136,28 +138,27 @@ io.on("connection", (socket) => {
   });
 
   socket.on("action:guardProtect", ({ targetId }, cb) => {
-    withRoom((room) => {
-      const result = gameCtrl.guardProtect(room, socket.id, targetId);
+    withPlayer((room, player) => {
+      const result = gameCtrl.guardProtect(room, player.id, targetId);
       if (result.ok) gameCtrl.broadcast(room);
       cb?.(result);
     });
   });
 
   socket.on("action:wolfPick", ({ targetId }, cb) => {
-    withRoom((room) => {
-      const result = gameCtrl.wolfPick(room, socket.id, targetId);
+    withPlayer((room, player) => {
+      const result = gameCtrl.wolfPick(room, player.id, targetId);
       if (result.ok) gameCtrl.broadcast(room); // để sói khác thấy realtime ai đang chọn ai
       cb?.(result);
     });
   });
 
   socket.on("action:wolfChat", ({ message }, cb) => {
-    withRoom((room) => {
-      const sender = room.players.find(p => p.id === socket.id);
-      if (sender?.role !== "wolf") return;
+    withPlayer((room, player) => {
+      if (player.role !== "wolf") return;
       room.players.forEach(p => {
-        if (p.role === "wolf" && p.id !== socket.id) {
-          io.to(p.id).emit("wolf:chat", { senderId: socket.id, message });
+        if (p.role === "wolf" && p.id !== player.id && p.connected && p.socketId) {
+          io.to(p.socketId).emit("wolf:chat", { senderId: player.id, message });
         }
       });
       cb?.({ ok: true });
@@ -165,16 +166,15 @@ io.on("connection", (socket) => {
   });
 
   socket.on("action:villageChat", ({ message }, cb) => {
-    withRoom((room) => {
-      const sender = room.players.find(p => p.id === socket.id);
-      if (!sender || !sender.alive) return cb?.({ ok: false, error: "Bạn đã chết, không thể chat" });
+    withPlayer((room, player) => {
+      if (!player.alive) return cb?.({ ok: false, error: "Bạn đã chết, không thể chat" });
       
       // Chỉ cho phép chat công khai ban ngày
       if (room.game.phase.startsWith("night_")) return cb?.({ ok: false, error: "Ban đêm không được chat ồn ào!" });
 
       io.to(room.code).emit("village:chat", { 
-        senderId: socket.id, 
-        senderName: sender.name, 
+        senderId: player.id, 
+        senderName: player.name, 
         message 
       });
       cb?.({ ok: true });
@@ -182,40 +182,40 @@ io.on("connection", (socket) => {
   });
 
   socket.on("action:witchDecide", (payload, cb) => {
-    withRoom((room) => {
-      const result = gameCtrl.witchDecide(room, socket.id, payload);
+    withPlayer((room, player) => {
+      const result = gameCtrl.witchDecide(room, player.id, payload);
       if (result.ok) gameCtrl.broadcast(room);
       cb?.(result);
     });
   });
 
   socket.on("action:seerCheck", ({ targetId }, cb) => {
-    withRoom((room) => {
-      const result = gameCtrl.seerCheck(room, socket.id, targetId);
+    withPlayer((room, player) => {
+      const result = gameCtrl.seerCheck(room, player.id, targetId);
       if (result.ok) gameCtrl.broadcast(room);
       cb?.(result);
     });
   });
 
   socket.on("action:voteExtendDiscussion", ({ wantExtend }, cb) => {
-    withRoom((room) => {
-      const result = gameCtrl.voteExtendDiscussion(room, socket.id, wantExtend);
+    withPlayer((room, player) => {
+      const result = gameCtrl.voteExtendDiscussion(room, player.id, wantExtend);
       gameCtrl.broadcast(room);
       cb?.(result);
     });
   });
 
   socket.on("action:nominationVote", ({ targetId }, cb) => {
-    withRoom((room) => {
-      const result = gameCtrl.nominationVote(room, socket.id, targetId);
+    withPlayer((room, player) => {
+      const result = gameCtrl.nominationVote(room, player.id, targetId);
       if (result.ok) gameCtrl.broadcast(room);
       cb?.(result);
     });
   });
 
   socket.on("action:finalVote", ({ decision }, cb) => {
-    withRoom((room) => {
-      const result = gameCtrl.finalVote(room, socket.id, decision);
+    withPlayer((room, player) => {
+      const result = gameCtrl.finalVote(room, player.id, decision);
       cb?.(result);
     });
   });
