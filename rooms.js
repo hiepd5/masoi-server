@@ -40,17 +40,21 @@ export function addPlayer(code, socketId, requestedName) {
   
   let name = requestedName?.trim();
   
-  // Reconnect logic
+  // Reconnect logic — cho phép kể cả khi connected=true nhưng socketId khác (reconnect nhanh)
   if (room.phase !== "lobby" && name) {
     const existingPlayer = room.players.find(p => p.name === name);
-    if (existingPlayer && !existingPlayer.connected) {
-       existingPlayer.socketId = socketId;
-       existingPlayer.connected = true;
-       if (existingPlayer.disconnectTimer) {
-         clearTimeout(existingPlayer.disconnectTimer);
-         existingPlayer.disconnectTimer = null;
-       }
-       return { room, player: existingPlayer };
+    if (existingPlayer && existingPlayer.socketId !== socketId) {
+      existingPlayer.socketId = socketId;
+      existingPlayer.connected = true;
+      if (existingPlayer.disconnectTimer) {
+        clearTimeout(existingPlayer.disconnectTimer);
+        existingPlayer.disconnectTimer = null;
+      }
+      return { room, player: existingPlayer };
+    }
+    // Cùng socketId — đã kết nối rồi, trả về luôn
+    if (existingPlayer && existingPlayer.socketId === socketId) {
+      return { room, player: existingPlayer };
     }
   }
 
