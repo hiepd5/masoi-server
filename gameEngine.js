@@ -48,6 +48,7 @@ export function initGameState(room) {
     // Thảo luận ban ngày
     discussEndsAt: null,
     extendVotes: {}, // { playerId: true/false }
+    skipDiscussVotes: {}, // { playerId: true } — tất cả đồng ý thì kết thúc sớm
 
     // Đề cử
     nominationVotes: {}, // { voterId: targetId }
@@ -304,6 +305,7 @@ export function startDiscussion(room) {
   g.phase = "day_discuss";
   g.discussEndsAt = Date.now() + TIMERS.dayDiscuss * 1000;
   g.extendVotes = {};
+  g.skipDiscussVotes = {};
 }
 
 export function voteExtendDiscussion(room, playerId, wantExtend) {
@@ -321,6 +323,27 @@ export function voteExtendDiscussion(room, playerId, wantExtend) {
     return { ok: true, extended: true, newEndsAt: g.discussEndsAt };
   }
   return { ok: true, extended: false };
+}
+
+export function voteSkipDiscussion(room, playerId) {
+  const g = room.game;
+  if (g.phase !== 'day_discuss') return { ok: false, error: 'Không phải giai đoạn thảo luận.' };
+  const alive = alivePlayers(room);
+  const voter = alive.find(p => p.id === playerId);
+  if (!voter) return { ok: false, error: 'Bạn không thể bỏ phiếu.' };
+
+  // Toggle vote
+  if (g.skipDiscussVotes[playerId]) {
+    delete g.skipDiscussVotes[playerId];
+  } else {
+    g.skipDiscussVotes[playerId] = true;
+  }
+
+  const skipCount = Object.keys(g.skipDiscussVotes).length;
+  const totalAlive = alive.length;
+  const allSkipped = skipCount >= totalAlive;
+
+  return { ok: true, skipCount, totalAlive, allSkipped };
 }
 
 // ============ BAN NGÀY: ĐỀ CỬ (VOTE CÔNG KHAI) ============

@@ -203,6 +203,7 @@ export function publicRoomView(room, forSocketId) {
       finalVotes: g.phase === "day_final_vote" ? g.finalVotes : {},
       winner: g.winner,
       history: gameOver ? g.history : [],
+      skipDiscussVotes: g.phase === 'day_discuss' ? g.skipDiscussVotes : {},
 
       // Thông tin riêng theo vai trò của người xem
       myRole: me?.role || null,

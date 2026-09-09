@@ -93,7 +93,7 @@ export function createGameController(io) {
   // ============ NGÀY: THẢO LUẬN ============
   function beginDiscussion(room) {
     GE.startDiscussion(room);
-    announce(room, "Cả làng thảo luận. Thời gian mặc định 3 phút.");
+    announce(room, `☀️ Cả làng thảo luận trong ${GE.TIMERS.dayDiscuss} giây. Nếu tất cả đồng ý bỏ qua có thể kết thúc sớm.`);
     scheduleDiscussEnd(room);
     broadcast(room);
   }
@@ -205,6 +205,8 @@ export function createGameController(io) {
       if (result.extended) rescheduleDiscussIfExtended(room, true);
       return result;
     },
+    voteSkipDiscussion: (room, playerId) => GE.voteSkipDiscussion(room, playerId),
+    forceEndDiscussion: (room) => { beginNomination(room); },
     nominationVote: (room, id, targetId) => GE.nominationVote(room, id, targetId),
     finalVote: (room, id, decision) => GE.finalVote(room, id, decision),
     clearRoomTimer,

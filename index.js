@@ -237,6 +237,21 @@ io.on("connection", (socket) => {
     });
   });
 
+  socket.on("action:skipDiscussion", (_, cb) => {
+    withPlayer((room, player) => {
+      const result = gameCtrl.voteSkipDiscussion(room, player.id);
+      if (result.ok) {
+        gameCtrl.broadcast(room);
+        if (result.allSkipped) {
+          // Clear timer and move to nomination
+          gameCtrl.clearRoomTimer(room.code);
+          gameCtrl.forceEndDiscussion(room);
+        }
+      }
+      cb?.(result);
+    });
+  });
+
   socket.on("action:nominationVote", ({ targetId }, cb) => {
     withPlayer((room, player) => {
       const result = gameCtrl.nominationVote(room, player.id, targetId);
