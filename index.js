@@ -39,6 +39,23 @@ const gameCtrl = createGameController(io);
 io.on("connection", (socket) => {
   console.log("Kết nối mới:", socket.id);
 
+  // Heartbeat: ping mỗi 30s, kick sau 60s không pong
+  let missedPings = 0;
+  const heartbeatInterval = setInterval(() => {
+    if (missedPings >= 2) {
+      // 2 missed pings = ~60s không phản hồi → disconnect
+      clearInterval(heartbeatInterval);
+      socket.disconnect(true);
+      return;
+    }
+    missedPings++;
+    socket.emit('ping:server');
+  }, 30000);
+
+  socket.on('pong:client', () => {
+    missedPings = 0; // reset khi nhận pong
+  });
+
   socket.on("room:create", (_, cb) => {
     const room = createRoom(socket.id);
     const { room: joinedRoom, player } = addPlayer(room.code, socket.id);
@@ -118,6 +135,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
+    clearInterval(heartbeatInterval);
     const code = socket.data.roomCode;
     if (!code) return;
     const room = removePlayer(code, socket.id);
@@ -265,6 +283,12 @@ io.on("connection", (socket) => {
       const result = gameCtrl.finalVote(room, player.id, decision);
       cb?.(result);
     });
+  });
+
+  socket.on('reaction', ({ emoji, name }) => {
+    const code = socket.data.roomCode;
+    if (!code) return;
+    io.to(code).emit('reaction:broadcast', { emoji, name, senderId: socket.id });
   });
 });
 
