@@ -6,6 +6,7 @@ import {
   createRoom,
   getRoom,
   addPlayer,
+  reconnectByToken,
   removePlayer,
   renamePlayer,
   publicRoomView,
@@ -46,6 +47,19 @@ io.on("connection", (socket) => {
     socket.data.playerId = player.id;
     cb?.({ ok: true, roomCode: room.code, playerId: player.id });
     broadcastRoom(joinedRoom);
+  });
+
+  socket.on("room:reconnect", ({ roomCode, sessionToken }, cb) => {
+    const result = reconnectByToken(roomCode, sessionToken, socket.id);
+    if (result.error) {
+      cb?.({ ok: false, error: result.error });
+      return;
+    }
+    socket.join(result.room.code);
+    socket.data.roomCode = result.room.code;
+    socket.data.playerId = result.player.id;
+    cb?.({ ok: true, roomCode: result.room.code, playerId: result.player.id });
+    broadcastRoom(result.room);
   });
 
   socket.on("room:join", ({ roomCode, name }, cb) => {

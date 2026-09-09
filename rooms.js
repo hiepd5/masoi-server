@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import { getDefaultName, getAvatarUrl } from "./defaultNames.js";
 
 // rooms: Map<roomCode, RoomState>
@@ -72,6 +73,8 @@ export function addPlayer(code, socketId, requestedName) {
     id: socketId,
     socketId: socketId,
     connected: true,
+    sessionToken: randomUUID(),
+    disconnectedAt: null,
     name,
     avatar: getAvatarUrl(name + "-" + socketId.slice(0, 4)),
     isHost: room.players.length === 0,
@@ -79,6 +82,28 @@ export function addPlayer(code, socketId, requestedName) {
     role: null,
   };
   room.players.push(player);
+  return { room, player };
+}
+
+export function reconnectByToken(code, token, newSocketId) {
+  const room = getRoom(code);
+  if (!room) return { error: "Token không hợp lệ hoặc đã hết hạn." };
+
+  const player = room.players.find((p) => p.sessionToken === token);
+  if (!player) return { error: "Token không hợp lệ hoặc đã hết hạn." };
+
+  if (player.disconnectedAt !== null && Date.now() - player.disconnectedAt > 30 * 60 * 1000) {
+    return { error: "Phiên chơi đã hết hạn (30 phút). Vui lòng tạo phòng mới." };
+  }
+
+  player.socketId = newSocketId;
+  player.connected = true;
+  player.disconnectedAt = null;
+  if (player.disconnectTimer) {
+    clearTimeout(player.disconnectTimer);
+    player.disconnectTimer = null;
+  }
+
   return { room, player };
 }
 
@@ -99,6 +124,7 @@ export function removePlayer(code, socketId) {
   } else {
     // Đang chơi, chỉ set connected = false
     player.connected = false;
+    player.disconnectedAt = Date.now();
     // (Tuỳ chọn: 5 phút sau xoá hẳn, nhưng trong board game nên giữ lại "cái xác" để không hỏng game)
   }
 
@@ -145,6 +171,7 @@ export function publicRoomView(room, forSocketId) {
       isHost: p.isHost,
       alive: p.alive,
       connected: p.connected,
+      sessionToken: p.id === me?.id ? p.sessionToken : undefined,
       // chỉ trả về role của chính người xem, hoặc nếu game đã kết thúc, hoặc đã chết (lộ bài)
       role: p.id === me?.id || gameOver || !p.alive ? p.role : null,
     })),
