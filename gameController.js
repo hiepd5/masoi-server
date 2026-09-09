@@ -29,8 +29,11 @@ function setRoomTimer(code, ms, fn) {
 
 export function createGameController(io) {
   function broadcast(room) {
+    // PHẢI dùng p.socketId (socket hiện tại sau reconnect), KHÔNG dùng p.id (socket cũ có thể đã chết)
     room.players.forEach((p) => {
-      io.to(p.id).emit("room:update", publicRoomView(room, p.id));
+      if (p.connected && p.socketId) {
+        io.to(p.socketId).emit("room:update", publicRoomView(room, p.socketId));
+      }
     });
   }
 
