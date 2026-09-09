@@ -79,8 +79,8 @@ io.on("connection", (socket) => {
     broadcastRoom(result.room);
   });
 
-  socket.on("room:join", ({ roomCode, name }, cb) => {
-    const result = addPlayer(roomCode, socket.id, name);
+  socket.on("room:join", ({ roomCode, name, avatarSeed }, cb) => {
+    const result = addPlayer(roomCode, socket.id, name, avatarSeed || null);
     if (result.error) {
       cb?.({ ok: false, error: result.error });
       return;
@@ -92,10 +92,10 @@ io.on("connection", (socket) => {
     broadcastRoom(result.room);
   });
 
-  socket.on("room:rename", ({ newName }, cb) => {
+  socket.on("room:rename", ({ newName, avatarSeed }, cb) => {
     const code = socket.data.roomCode;
     if (!code) return cb?.({ ok: false, error: "Bạn chưa ở trong phòng." });
-    const result = renamePlayer(code, socket.id, newName);
+    const result = renamePlayer(code, socket.id, newName, avatarSeed || null);
     if (result.error) {
       cb?.({ ok: false, error: result.error });
       return;
@@ -289,6 +289,38 @@ io.on("connection", (socket) => {
     const code = socket.data.roomCode;
     if (!code) return;
     io.to(code).emit('reaction:broadcast', { emoji, name, senderId: socket.id });
+  });
+
+  // Kick player — chỉ host mới kick được, chỉ khi phase = 'lobby'
+  socket.on('room:kick', ({ targetId }, cb) => {
+    const code = socket.data.roomCode;
+    if (!code) return cb?.({ ok: false, error: 'Không trong phòng.' });
+    const room = getRoom(code);
+    if (!room) return cb?.({ ok: false, error: 'Phòng không tồn tại.' });
+
+    // Chỉ kick khi đang ở lobby
+    if (room.phase !== 'lobby') return cb?.({ ok: false, error: 'Không thể kick khi đang chơi.' });
+
+    // Tìm kicker
+    const kicker = room.players.find(p => p.socketId === socket.id || p.id === socket.data.playerId);
+    if (!kicker?.isHost) return cb?.({ ok: false, error: 'Chỉ chủ phòng mới kick được.' });
+
+    // Tìm target
+    const target = room.players.find(p => p.id === targetId);
+    if (!target) return cb?.({ ok: false, error: 'Không tìm thấy người chơi.' });
+    if (target.isHost) return cb?.({ ok: false, error: 'Không thể kick chủ phòng.' });
+
+    // Gửi thông báo bị kick
+    const targetSocket = io.sockets.sockets.get(target.socketId);
+    if (targetSocket) {
+      targetSocket.emit('room:kicked', { reason: `Bạn đã bị kick khỏi phòng bởi chủ phòng.` });
+      targetSocket.leave(code);
+    }
+
+    // Xóa khỏi room
+    const updatedRoom = removePlayer(code, target.socketId || target.id);
+    if (updatedRoom) broadcastRoom(updatedRoom);
+    cb?.({ ok: true });
   });
 });
 

@@ -35,7 +35,7 @@ export function getRoom(code) {
   return rooms.get(code?.toUpperCase());
 }
 
-export function addPlayer(code, socketId, requestedName) {
+export function addPlayer(code, socketId, requestedName, avatarSeed = null) {
   const room = getRoom(code);
   if (!room) return { error: "Phòng không tồn tại." };
   
@@ -76,7 +76,9 @@ export function addPlayer(code, socketId, requestedName) {
     sessionToken: randomUUID(),
     disconnectedAt: null,
     name,
-    avatar: getAvatarUrl(name + "-" + socketId.slice(0, 4)),
+    avatar: avatarSeed
+      ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${avatarSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
+      : getAvatarUrl(name + "-" + socketId.slice(0, 4)),
     isHost: room.players.length === 0,
     alive: true,
     role: null,
@@ -136,7 +138,7 @@ export function removePlayer(code, socketId) {
   return room;
 }
 
-export function renamePlayer(code, socketId, newName) {
+export function renamePlayer(code, socketId, newName, avatarSeed = null) {
   const room = getRoom(code);
   if (!room) return { error: "Phòng không tồn tại." };
   const trimmed = newName?.trim();
@@ -151,7 +153,9 @@ export function renamePlayer(code, socketId, newName) {
   const player = room.players.find((p) => p.socketId === socketId);
   if (!player) return { error: "Không tìm thấy người chơi." };
   player.name = trimmed;
-  player.avatar = getAvatarUrl(trimmed + "-" + player.id.slice(0, 4));
+  player.avatar = avatarSeed
+    ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${avatarSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
+    : getAvatarUrl(trimmed + "-" + player.id.slice(0, 4));
   return { room, player };
 }
 
