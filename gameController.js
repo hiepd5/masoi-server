@@ -47,9 +47,20 @@ export function createGameController(io) {
     GE.initGameState(room);
     room.phase = "playing";
     announce(room, `Trò chơi bắt đầu với ${room.players.length} người chơi. Đêm đầu tiên buông xuống...`);
+    // Delay nhỏ rồi gọi Bảo Vệ thức dậy
+    setTimeout(() => {
+      announce(room, "Bảo Vệ ơi, thức dậy! Hãy chọn người bạn muốn bảo vệ đêm nay.");
+    }, 2500);
     setRoomTimer(room.code, GE.TIMERS.guard * 1000, () => advanceFromGuard(room));
     broadcast(room);
     return { ok: true };
+  }
+
+  // Helper: gọi Bảo Vệ thức dậy (dùng cho các đêm tiếp theo)
+  function announceGuardPhase(room) {
+    announce(room, "Bảo Vệ ơi, thức dậy! Hãy chọn người bạn muốn bảo vệ đêm nay.");
+    setRoomTimer(room.code, GE.TIMERS.guard * 1000, () => advanceFromGuard(room));
+    broadcast(room);
   }
 
   // ============ ĐÊM: BẢO VỆ ============
@@ -58,6 +69,7 @@ export function createGameController(io) {
     announce(room, "Bảo Vệ đã ngủ lại. Sói ơi, hãy thức dậy và chọn con mồi...");
     setRoomTimer(room.code, GE.TIMERS.wolf * 1000, () => advanceFromWolf(room));
     broadcast(room);
+
   }
 
   // ============ ĐÊM: SÓI ============
@@ -149,15 +161,9 @@ export function createGameController(io) {
     const defendant = room.players.find((p) => p.id === result.defendantId);
 
     if (result.hanged) {
-      announce(
-        room,
-        `${defendant?.name} bị treo cổ với ${result.hangCount} phiếu thuận / ${result.spareCount} phiếu tha.`
-      );
+      announce(room, `Làng đã quyết định! ${defendant?.name} sẽ rời khỏi ván đấu. Xin hãy giữ im lặng tuyệt đối.`);
     } else {
-      announce(
-        room,
-        `${defendant?.name} được tha với ${result.spareCount} phiếu tha / ${result.hangCount} phiếu thuận.`
-      );
+      announce(room, `Làng đã tha ${defendant?.name}! Không ai bị xử tử hôm nay.`);
     }
 
     if (result.tannerWin) {
@@ -188,11 +194,16 @@ export function createGameController(io) {
     room.phase = "ended";
     room.game.winner = winner;
     clearRoomTimer(room.code);
-    const label =
-      winner === "wolf" ? "Phe Sói" : winner === "village" ? "Phe Dân" : "Chán Đời (thắng riêng)";
-    announce(room, `Trò chơi kết thúc! ${label} chiến thắng.`);
+    if (winner === "wolf") {
+      announce(room, "Trò chơi kết thúc! Phe Sói chiến thắng. Bóng tối đã nuốt chửng cả làng...");
+    } else if (winner === "village") {
+      announce(room, "Trò chơi kết thúc! Phe Dân chiến thắng. Ánh sáng công lý đã xua tan bóng tối!");
+    } else {
+      announce(room, "Trò chơi kết thúc! Chán Đời thắng riêng — người này thực sự muốn bị treo cổ!");
+    }
     broadcast(room);
   }
+
 
   // ============ EXPORT HANDLERS CHO index.js ============
   return {
