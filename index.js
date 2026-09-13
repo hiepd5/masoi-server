@@ -79,8 +79,8 @@ io.on("connection", (socket) => {
     broadcastRoom(result.room);
   });
 
-  socket.on("room:join", ({ roomCode, name, avatarSeed }, cb) => {
-    const result = addPlayer(roomCode, socket.id, name, avatarSeed || null);
+  socket.on("room:join", ({ roomCode, name, avatarSeed, avatarUrl }, cb) => {
+    const result = addPlayer(roomCode, socket.id, name, avatarSeed || null, avatarUrl || null);
     if (result.error) {
       cb?.({ ok: false, error: result.error });
       return;
@@ -92,10 +92,10 @@ io.on("connection", (socket) => {
     broadcastRoom(result.room);
   });
 
-  socket.on("room:rename", ({ newName, avatarSeed }, cb) => {
+  socket.on("room:rename", ({ newName, avatarSeed, avatarUrl }, cb) => {
     const code = socket.data.roomCode;
     if (!code) return cb?.({ ok: false, error: "Bạn chưa ở trong phòng." });
-    const result = renamePlayer(code, socket.id, newName, avatarSeed || null);
+    const result = renamePlayer(code, socket.id, newName, avatarSeed || null, avatarUrl || null);
     if (result.error) {
       cb?.({ ok: false, error: result.error });
       return;

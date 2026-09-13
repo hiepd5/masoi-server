@@ -35,7 +35,7 @@ export function getRoom(code) {
   return rooms.get(code?.toUpperCase());
 }
 
-export function addPlayer(code, socketId, requestedName, avatarSeed = null) {
+export function addPlayer(code, socketId, requestedName, avatarSeed = null, avatarUrl = null) {
   const room = getRoom(code);
   if (!room) return { error: "Phòng không tồn tại." };
   
@@ -76,9 +76,10 @@ export function addPlayer(code, socketId, requestedName, avatarSeed = null) {
     sessionToken: randomUUID(),
     disconnectedAt: null,
     name,
-    avatar: avatarSeed
-      ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${avatarSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
-      : getAvatarUrl(name + "-" + socketId.slice(0, 4)),
+    avatar: avatarUrl
+      || (avatarSeed
+        ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${avatarSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
+        : getAvatarUrl(name + "-" + socketId.slice(0, 4))),
     isHost: room.players.length === 0,
     alive: true,
     role: null,
@@ -138,7 +139,7 @@ export function removePlayer(code, socketId) {
   return room;
 }
 
-export function renamePlayer(code, socketId, newName, avatarSeed = null) {
+export function renamePlayer(code, socketId, newName, avatarSeed = null, avatarUrl = null) {
   const room = getRoom(code);
   if (!room) return { error: "Phòng không tồn tại." };
   const trimmed = newName?.trim();
@@ -153,9 +154,10 @@ export function renamePlayer(code, socketId, newName, avatarSeed = null) {
   const player = room.players.find((p) => p.socketId === socketId);
   if (!player) return { error: "Không tìm thấy người chơi." };
   player.name = trimmed;
-  player.avatar = avatarSeed
-    ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${avatarSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
-    : getAvatarUrl(trimmed + "-" + player.id.slice(0, 4));
+  player.avatar = avatarUrl
+    || (avatarSeed
+      ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${avatarSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
+      : getAvatarUrl(trimmed + "-" + player.id.slice(0, 4)));
   return { room, player };
 }
 
