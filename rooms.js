@@ -1,10 +1,11 @@
 import { randomUUID } from "crypto";
 import { getDefaultName, getAvatarUrl } from "./defaultNames.js";
+import { generateDefaultRoles } from "./roles.js";
 
 // rooms: Map<roomCode, RoomState>
 // RoomState = {
 //   code, hostId, phase: 'lobby'|'night'|'day'|'vote'|'ended',
-//   players: [{ id, name, avatar, isHost, alive, role }]
+//   players: [{ id, name, avatar, isHost, alive, role, ready }]
 // }
 const rooms = new Map();
 
@@ -26,10 +27,13 @@ export function createRoom(hostSocketId) {
     hostId: hostSocketId,
     phase: "lobby",
     players: [],
+    rolesConfig: generateDefaultRoles(6),
+    lobbyMessages: [],
   };
   rooms.set(code, room);
   return room;
 }
+
 
 export function getRoom(code) {
   return rooms.get(code?.toUpperCase());
@@ -81,12 +85,18 @@ export function addPlayer(code, socketId, requestedName, avatarSeed = null, avat
         ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${avatarSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
         : getAvatarUrl(name + "-" + socketId.slice(0, 4))),
     isHost: room.players.length === 0,
+    ready: room.players.length === 0,
     alive: true,
     role: null,
   };
   room.players.push(player);
+  // Cập nhật cấu hình vai trò mặc định theo số người chơi
+  if (room.phase === "lobby" && (!room.rolesConfig || Object.keys(room.rolesConfig).length === 0)) {
+    room.rolesConfig = generateDefaultRoles(room.players.length);
+  }
   return { room, player };
 }
+
 
 export function reconnectByToken(code, token, newSocketId) {
   const room = getRoom(code);
@@ -161,6 +171,59 @@ export function renamePlayer(code, socketId, newName, avatarSeed = null, avatarU
   return { room, player };
 }
 
+export function toggleReady(code, socketId) {
+  const room = getRoom(code);
+  if (!room) return { error: "Phòng không tồn tại." };
+  const player = room.players.find((p) => p.socketId === socketId);
+  if (!player) return { error: "Không tìm thấy người chơi." };
+
+  if (player.isHost) {
+    player.ready = true;
+  } else {
+    player.ready = !player.ready;
+  }
+  return { ok: true, room, ready: player.ready };
+}
+
+export function setRolesConfig(code, requesterSocketId, newConfig) {
+  const room = getRoom(code);
+  if (!room) return { error: "Phòng không tồn tại." };
+  const player = room.players.find((p) => p.socketId === requesterSocketId);
+  if (!player || !player.isHost) {
+    return { error: "Chỉ chủ phòng mới có quyền thay đổi cấu hình vai trò." };
+  }
+  if (!newConfig || typeof newConfig !== "object") {
+    return { error: "Cấu hình vai trò không hợp lệ." };
+  }
+  room.rolesConfig = newConfig;
+  return { ok: true, room };
+}
+
+export function addLobbyMessage(code, senderSocketId, text) {
+  const room = getRoom(code);
+  if (!room) return null;
+  const player = room.players.find((p) => p.socketId === senderSocketId);
+  if (!player) return null;
+  const trimmed = text?.trim();
+  if (!trimmed) return null;
+
+  const msg = {
+    id: randomUUID(),
+    senderId: player.id,
+    senderName: player.name,
+    avatar: player.avatar,
+    text: trimmed,
+    time: new Date().toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" }),
+  };
+
+  if (!room.lobbyMessages) room.lobbyMessages = [];
+  room.lobbyMessages.push(msg);
+  if (room.lobbyMessages.length > 50) {
+    room.lobbyMessages.shift();
+  }
+  return msg;
+}
+
 // Trả về bản public của room (an toàn để gửi cho mọi client — không lộ role người khác)
 export function publicRoomView(room, forSocketId) {
   const g = room.game;
@@ -170,11 +233,14 @@ export function publicRoomView(room, forSocketId) {
   const base = {
     code: room.code,
     phase: room.phase, // 'lobby' | 'playing' | 'ended'
+    rolesConfig: room.rolesConfig || generateDefaultRoles(room.players.length),
+    lobbyMessages: room.lobbyMessages || [],
     players: room.players.map((p) => ({
       id: p.id,
       name: p.name,
       avatar: p.avatar,
       isHost: p.isHost,
+      ready: p.isHost ? true : Boolean(p.ready),
       alive: p.alive,
       connected: p.connected,
       sessionToken: p.id === me?.id ? p.sessionToken : undefined,
@@ -182,6 +248,7 @@ export function publicRoomView(room, forSocketId) {
       role: p.id === me?.id || gameOver || !p.alive ? p.role : null,
     })),
   };
+
 
   if (!g) return base;
 

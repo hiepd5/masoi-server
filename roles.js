@@ -1,37 +1,49 @@
-// Chia vai trò dựa trên tổng số người chơi
-// Vai: wolf, seer, guard, witch, tanner (Chán Đời), villager (Nông dân)
+// Chia vai trò: wolf, seer, guard, witch, tough_guy, cursed, tanner, villager
 
-export function calculateRoleCounts(totalPlayers) {
-  if (totalPlayers < 6) {
-    throw new Error("Cần tối thiểu 6 người để chia vai.");
-  }
+export const ROLE_LABELS = {
+  wolf: "Sói",
+  seer: "Tiên Tri",
+  guard: "Bảo Vệ",
+  witch: "Phù Thủy",
+  tough_guy: "Người Cứng Cỏi",
+  cursed: "Kẻ Bị Nguyền",
+  tanner: "Chán Đời",
+  villager: "Nông Dân",
+};
 
-  const wolfCount = calculateWolfCount(totalPlayers);
+// Số lượng Sói chuẩn theo số người chơi
+export function calculateWolfCount(totalPlayers) {
+  if (totalPlayers <= 8) return 2; // 6-8 người
+  if (totalPlayers <= 10) return 3; // 9-10 người
+  if (totalPlayers <= 12) return 4; // 11-12 người
+  if (totalPlayers <= 15) return 4; // 13-15 người
+  return 5; // 16-18 người
+}
+
+// Sinh cấu hình vai trò mặc định (Preset Cân Bằng) theo số lượng người
+export function generateDefaultRoles(totalPlayers) {
+  const count = Math.max(6, totalPlayers || 6);
+  const wolfCount = calculateWolfCount(count);
   const seerCount = 1;
   const guardCount = 1;
   const witchCount = 1;
-  const tannerCount = totalPlayers >= 8 ? 1 : 0;
+  const toughGuyCount = count >= 6 ? 1 : 0;
+  const cursedCount = count >= 7 ? 1 : 0;
+  const tannerCount = count >= 8 ? 1 : 0;
 
-  const specialCount = wolfCount + seerCount + guardCount + witchCount + tannerCount;
-  const villagerCount = Math.max(0, totalPlayers - specialCount);
+  const specialCount = wolfCount + seerCount + guardCount + witchCount + toughGuyCount + cursedCount + tannerCount;
+  const villagerCount = Math.max(0, count - specialCount);
 
   return {
     wolf: wolfCount,
     seer: seerCount,
     guard: guardCount,
     witch: witchCount,
+    tough_guy: toughGuyCount,
+    cursed: cursedCount,
     tanner: tannerCount,
     villager: villagerCount,
   };
-}
-
-// Số lượng Sói theo mốc cố định (theo cách nhóm bạn chơi thực tế)
-function calculateWolfCount(totalPlayers) {
-  if (totalPlayers <= 8) return 2; // 6-8 người
-  if (totalPlayers <= 10) return 3; // 9-10 người
-  if (totalPlayers <= 12) return 4; // 11-12 người (nội suy)
-  if (totalPlayers <= 15) return 4; // 13-15 người
-  return 5; // 16-18 người
 }
 
 function shuffle(arr) {
@@ -43,20 +55,24 @@ function shuffle(arr) {
   return a;
 }
 
-// Trả về Map<playerId, role>
-export function assignRoles(playerIds) {
-  const counts = calculateRoleCounts(playerIds.length);
-  const roleList = [
-    ...Array(counts.wolf).fill("wolf"),
-    ...Array(counts.seer).fill("seer"),
-    ...Array(counts.guard).fill("guard"),
-    ...Array(counts.witch).fill("witch"),
-    ...Array(counts.tanner).fill("tanner"),
-    ...Array(counts.villager).fill("villager"),
-  ];
+// Chia vai trò tự động theo cấu hình tùy chỉnh hoặc mặc định
+export function assignCustomRoles(playerIds, customRoleCounts) {
+  const counts = customRoleCounts || generateDefaultRoles(playerIds.length);
+  const roleList = [];
+
+  Object.entries(counts).forEach(([role, qty]) => {
+    for (let i = 0; i < qty; i++) {
+      roleList.push(role);
+    }
+  });
+
+  // Nếu số vai chưa đủ (fallback khẩn cấp), bù bằng Nông Dân
+  while (roleList.length < playerIds.length) {
+    roleList.push("villager");
+  }
 
   const shuffledPlayers = shuffle(playerIds);
-  const shuffledRoles = shuffle(roleList);
+  const shuffledRoles = shuffle(roleList.slice(0, playerIds.length));
 
   const assignment = new Map();
   shuffledPlayers.forEach((pid, idx) => {
@@ -66,11 +82,8 @@ export function assignRoles(playerIds) {
   return { assignment, counts };
 }
 
-export const ROLE_LABELS = {
-  wolf: "Sói",
-  seer: "Tiên Tri",
-  guard: "Bảo Vệ",
-  witch: "Phù Thủy",
-  tanner: "Chán Đời",
-  villager: "Nông Dân",
-};
+// Giữ lại assignRoles để tương thích ngược
+export function assignRoles(playerIds) {
+  return assignCustomRoles(playerIds, generateDefaultRoles(playerIds.length));
+}
+

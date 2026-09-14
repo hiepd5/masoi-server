@@ -1,4 +1,4 @@
-import { assignRoles } from "./roles.js";
+import { assignCustomRoles } from "./roles.js";
 
 // ============ HẰNG SỐ THỜI GIAN (giây) ============
 export const TIMERS = {
@@ -15,7 +15,7 @@ export const TIMERS = {
 // ============ TẠO GAME STATE MỚI TỪ ROOM ============
 export function initGameState(room) {
   const alivePlayerIds = room.players.map((p) => p.id);
-  const { assignment, counts } = assignRoles(alivePlayerIds);
+  const { assignment, counts } = assignCustomRoles(alivePlayerIds, room.rolesConfig);
 
   room.players.forEach((p) => {
     p.role = assignment.get(p.id);
@@ -44,6 +44,10 @@ export function initGameState(room) {
     seerChecksLog: [], // { seerId, targetId, dayNumber, result }
 
     nightDeaths: [], // playerId chết đêm qua (để công bố)
+
+    // Trạng thái nhân vật đặc biệt
+    toughGuyPoisonedDay: null, // Ngày Người Cứng Cỏi bị cắn (đêm sau mới chết)
+
 
     // Thảo luận ban ngày
     discussEndsAt: null,
@@ -277,11 +281,48 @@ export function resolveNightDeaths(room) {
   const g = room.game;
   const deaths = new Set();
 
+  // Kiểm tra Người Cứng Cỏi (tough_guy) bị cắn từ đêm trước -> đến đêm nay chết
+  if (g.toughGuyPoisonedDay && g.toughGuyPoisonedDay < g.dayNumber) {
+    const toughGuy = room.players.find((p) => p.role === "tough_guy" && p.alive);
+    if (toughGuy) {
+      deaths.add(toughGuy.id);
+      g.history.push({
+        type: "death",
+        day: g.dayNumber,
+        text: `Người Cứng Cỏi [${toughGuy.name}] đã không thể gượng dậy sau vết thương từ đêm trước và đã qua đời.`,
+      });
+    }
+  }
+
   const victimSaved =
     g.wolfVictimId && (g.wolfVictimId === g.guardedIdTonight || g.witchSaveTonight);
 
   if (g.wolfVictimId && !victimSaved) {
-    deaths.add(g.wolfVictimId);
+    const victim = getPlayer(room, g.wolfVictimId);
+
+    if (victim?.role === "cursed") {
+      // Kẻ Bị Nguyền: Bị Sói cắn -> Không chết mà HÓA THÀNH SÓI!
+      victim.role = "wolf";
+      g.history.push({
+        type: "cursed_transformed",
+        day: g.dayNumber,
+        targetId: victim.id,
+        text: `Kẻ Bị Nguyền [${victim.name}] đã bị Sói cắn nhưng không chết, mà dòng máu Sói đã thức tỉnh!`,
+      });
+    } else if (victim?.role === "tough_guy") {
+      // Người Cứng Cỏi: Bị Sói cắn -> Không chết ngay đêm nay, đánh dấu để đêm sau chết
+      if (!g.toughGuyPoisonedDay) {
+        g.toughGuyPoisonedDay = g.dayNumber;
+        g.history.push({
+          type: "tough_guy_endured",
+          day: g.dayNumber,
+          targetId: victim.id,
+          text: `Người Cứng Cỏi [${victim.name}] bị Sói tấn công nhưng đã kiên cường chịu đựng vết thương để sống sót qua ngày hôm nay!`,
+        });
+      }
+    } else {
+      deaths.add(g.wolfVictimId);
+    }
   }
 
   if (g.witchPoisonTargetId) {
@@ -298,6 +339,7 @@ export function resolveNightDeaths(room) {
 
   return g.nightDeaths;
 }
+
 
 // ============ BAN NGÀY: THẢO LUẬN CÓ GIA HẠN ============
 export function startDiscussion(room) {

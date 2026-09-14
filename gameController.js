@@ -43,7 +43,28 @@ export function createGameController(io) {
 
   // ============ BẮT ĐẦU GAME ============
   function startGame(room) {
-    if (room.players.length < 6) return { error: "Cần tối thiểu 6 người." };
+    if (room.players.length < 6) return { error: "Cần tối thiểu 6 người để bắt đầu." };
+
+    // Kiểm tra người chơi sẵn sàng
+    const notReady = room.players.filter((p) => !p.isHost && !p.ready);
+    if (notReady.length > 0) {
+      return {
+        error: `Còn ${notReady.length} người chơi chưa sẵn sàng (${notReady.map((p) => p.name).join(", ")}).`,
+      };
+    }
+
+    // Kiểm tra cấu hình vai trò khớp số lượng người chơi
+    const totalRoles = Object.values(room.rolesConfig || {}).reduce((a, b) => a + b, 0);
+    if (totalRoles !== room.players.length) {
+      return {
+        error: `Tổng số vai trò đã chọn (${totalRoles}) chưa khớp với số người chơi (${room.players.length}).`,
+      };
+    }
+
+    if (!room.rolesConfig?.wolf || room.rolesConfig.wolf < 1) {
+      return { error: "Cần tối thiểu 1 Sói trong ván đấu." };
+    }
+
     GE.initGameState(room);
     room.phase = "playing";
     announce(room, `Trò chơi bắt đầu với ${room.players.length} người chơi. Đêm đầu tiên buông xuống...`);
@@ -55,6 +76,7 @@ export function createGameController(io) {
     broadcast(room);
     return { ok: true };
   }
+
 
   // Helper: gọi Bảo Vệ thức dậy (dùng cho các đêm tiếp theo)
   function announceGuardPhase(room) {

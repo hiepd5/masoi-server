@@ -9,8 +9,12 @@ import {
   reconnectByToken,
   removePlayer,
   renamePlayer,
+  toggleReady,
+  setRolesConfig,
+  addLobbyMessage,
   publicRoomView,
 } from "./rooms.js";
+
 import { createGameController } from "./gameController.js";
 import { AccessToken } from "livekit-server-sdk";
 
@@ -113,6 +117,34 @@ io.on("connection", (socket) => {
     socket.data.playerId = null;
     if (room) broadcastRoom(room);
   });
+
+  socket.on("room:toggleReady", (_, cb) => {
+    const code = socket.data.roomCode;
+    if (!code) return cb?.({ ok: false, error: "Bạn chưa ở trong phòng." });
+    const result = toggleReady(code, socket.id);
+    if (result.error) return cb?.({ ok: false, error: result.error });
+    broadcastRoom(result.room);
+    cb?.({ ok: true, ready: result.ready });
+  });
+
+  socket.on("room:setRolesConfig", ({ rolesConfig }, cb) => {
+    const code = socket.data.roomCode;
+    if (!code) return cb?.({ ok: false, error: "Bạn chưa ở trong phòng." });
+    const result = setRolesConfig(code, socket.id, rolesConfig);
+    if (result.error) return cb?.({ ok: false, error: result.error });
+    broadcastRoom(result.room);
+    cb?.({ ok: true });
+  });
+
+  socket.on("room:lobbyChat", ({ message }, cb) => {
+    const code = socket.data.roomCode;
+    if (!code) return cb?.({ ok: false, error: "Bạn chưa ở trong phòng." });
+    const msg = addLobbyMessage(code, socket.id, message);
+    if (!msg) return cb?.({ ok: false, error: "Không gửi được tin nhắn." });
+    io.to(code).emit("room:lobbyMessage", msg);
+    cb?.({ ok: true });
+  });
+
 
   socket.on("livekit:token", async (_, cb) => {
     const code = socket.data.roomCode;
