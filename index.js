@@ -126,9 +126,11 @@ io.on("connection", (socket) => {
       const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
         identity: player.id,
         name: player.name,
+        ttl: '6h',
       });
       at.addGrant({ roomJoin: true, room: code, canPublish: true, canSubscribe: true });
       cb?.({ token: await at.toJwt(), url: LIVEKIT_URL });
+
     } catch (e) {
       cb?.({ error: e.message });
     }
