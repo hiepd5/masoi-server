@@ -331,8 +331,26 @@ export function resolveNightDeaths(room) {
 
   deaths.forEach((id) => {
     const p = getPlayer(room, id);
-    if (p) p.alive = false;
+    if (p) {
+      p.alive = false;
+      g.history.push({
+        type: "death",
+        day: g.dayNumber,
+        targetId: id,
+        targetName: p.name,
+        targetRole: p.role,
+        text: `${p.name} không qua khỏi đêm đẫm máu.`,
+      });
+    }
   });
+
+  if (deaths.size === 0) {
+    g.history.push({
+      type: "peaceful_night",
+      day: g.dayNumber,
+      text: "Đêm qua là một đêm bình yên, không ai chết!",
+    });
+  }
 
   g.nightDeaths = Array.from(deaths);
   g.phase = "day_reveal";
@@ -443,6 +461,21 @@ export function finalizeNomination(room) {
   g.phase = "day_defense";
   g.hotSeatEndsAt = Date.now() + TIMERS.defense * 1000;
 
+  if (topCandidates.length > 0) {
+    const candidateNames = topCandidates.map((c) => getPlayer(room, c.playerId)?.name).filter(Boolean);
+    g.history.push({
+      type: "nomination",
+      day: g.dayNumber,
+      nominees: topCandidates.map((c) => ({
+        playerId: c.playerId,
+        name: getPlayer(room, c.playerId)?.name,
+        votes: c.votes,
+      })),
+      text: `Cả làng đã đề cử ${candidateNames.join(", ")} lên ghế nóng!`,
+      votesDetail: { ...g.nominationVotes },
+    });
+  }
+
   return { nominees: topCandidates };
 }
 
@@ -488,11 +521,17 @@ export function resolveFinalVote(room) {
     const defendant = getPlayer(room, defendantId);
     if (defendant) {
       defendant.alive = false;
+      const roleName = ROLE_LABELS[defendant.role] || defendant.role;
       g.history.push({
         type: "hang",
         day: g.dayNumber,
         targetId: defendantId,
-        text: `${defendant.name} đã bị treo cổ với ${hangCount} phiếu thuận.`
+        targetName: defendant.name,
+        targetRole: defendant.role,
+        hangCount,
+        spareCount,
+        votesDetail: { ...g.finalVotes },
+        text: `${defendant.name} (${roleName}) đã bị treo cổ (${hangCount} phiếu Treo vs ${spareCount} phiếu Tha).`
       });
       if (defendant.role === "tanner") {
         tannerWin = true;
@@ -506,7 +545,12 @@ export function resolveFinalVote(room) {
         type: "spare",
         day: g.dayNumber,
         targetId: defendantId,
-        text: `${defendant.name} đã được tha bổng với ${spareCount} phiếu tha.`
+        targetName: defendant.name,
+        targetRole: defendant.role,
+        hangCount,
+        spareCount,
+        votesDetail: { ...g.finalVotes },
+        text: `${defendant.name} đã được tha bổng (${spareCount} phiếu Tha vs ${hangCount} phiếu Treo).`
       });
     }
   }
@@ -544,4 +588,262 @@ export function startNextNight(room) {
   g.witchSaveTonight = false;
   g.witchPoisonTargetId = null;
   g.nightDeaths = [];
+}
+
+// ============ TÍNH TOÁN DANH HIỆU & MVP VÁN ĐẤU ============
+export function computeMatchAwards(room) {
+  const g = room.game;
+  if (!g) return [];
+  const players = room.players || [];
+  const history = g.history || [];
+  const winner = g.winner;
+
+  const scores = {};
+  const stats = {};
+
+  players.forEach((p) => {
+    scores[p.id] = 0;
+    stats[p.id] = {
+      saves: 0,
+      seerWolvesFound: 0,
+      votesToHangWolf: 0,
+      totalHangVotes: 0,
+      survived: p.alive,
+      role: p.role,
+      name: p.name,
+    };
+  });
+
+  // Phân tích lịch sử sự kiện
+  history.forEach((ev) => {
+    if (ev.type === "guard" && ev.targetId) {
+      // Bảo vệ thành công nếu cùng đêm đó Sói cắn đúng người này
+      const wolfAttack = history.find(
+        (h) => h.day === ev.day && h.type === "wolf" && h.targetId === ev.targetId
+      );
+      if (wolfAttack && ev.sourceId && scores[ev.sourceId] !== undefined) {
+        scores[ev.sourceId] += 30;
+        stats[ev.sourceId].saves += 1;
+      }
+    }
+
+    if (ev.type === "witch_save" && ev.targetId) {
+      const witch = players.find((p) => p.role === "witch");
+      if (witch) {
+        scores[witch.id] += 20;
+        stats[witch.id].saves += 1;
+      }
+    }
+
+    if (ev.type === "witch_poison" && ev.targetId) {
+      const witch = players.find((p) => p.role === "witch");
+      const target = players.find((p) => p.id === ev.targetId);
+      if (witch && target) {
+        if (target.role === "wolf") {
+          scores[witch.id] += 25;
+        } else {
+          scores[witch.id] -= 10;
+        }
+      }
+    }
+
+    if (ev.type === "seer" && ev.sourceId) {
+      if (ev.isWolf || ev.text?.includes("là Sói")) {
+        scores[ev.sourceId] += 25;
+        stats[ev.sourceId].seerWolvesFound += 1;
+      } else {
+        scores[ev.sourceId] += 5;
+      }
+    }
+
+    if (ev.type === "tough_guy_endured" && ev.targetId) {
+      if (scores[ev.targetId] !== undefined) {
+        scores[ev.targetId] += 20;
+      }
+    }
+
+    if (ev.type === "cursed_transformed" && ev.targetId) {
+      if (scores[ev.targetId] !== undefined) {
+        scores[ev.targetId] += 15;
+      }
+    }
+
+    if (ev.type === "hang") {
+      const defendant = players.find((p) => p.id === ev.targetId);
+      const isWolf = defendant?.role === "wolf";
+      if (ev.votesDetail) {
+        Object.entries(ev.votesDetail).forEach(([voterId, vote]) => {
+          if (vote === "hang" && scores[voterId] !== undefined) {
+            stats[voterId].totalHangVotes += 1;
+            if (isWolf) {
+              scores[voterId] += 15;
+              stats[voterId].votesToHangWolf += 1;
+            }
+          }
+        });
+      }
+    }
+  });
+
+  // Cộng điểm chiến thắng và sống sót
+  players.forEach((p) => {
+    const isWolfTeam = p.role === "wolf";
+    const isVillageTeam = p.role !== "wolf" && p.role !== "tanner";
+    const isTanner = p.role === "tanner";
+
+    if (winner === "wolf" && isWolfTeam) {
+      scores[p.id] += 20;
+    } else if (winner === "village" && isVillageTeam) {
+      scores[p.id] += 15;
+    } else if (winner === "tanner" && isTanner) {
+      scores[p.id] += 40;
+    }
+
+    if (p.alive) {
+      scores[p.id] += 10;
+    }
+  });
+
+  // Tìm MVP cao điểm nhất
+  let mvpPlayer = null;
+  let maxScore = -999;
+  players.forEach((p) => {
+    const s = scores[p.id] || 0;
+    if (s > maxScore) {
+      maxScore = s;
+      mvpPlayer = p;
+    }
+  });
+
+  const awards = [];
+
+  if (mvpPlayer) {
+    let mvpReason = "Có đóng góp xuất sắc nhất trận đấu!";
+    if (mvpPlayer.role === "wolf") {
+      mvpReason = mvpPlayer.alive
+        ? "Bầy Sói tinh quái dẫn dắt thế trận và sống sót đến phút cuối!"
+        : "Đóng góp chiến thuật then chốt cho chiến thắng của Bầy Sói!";
+    } else if (mvpPlayer.role === "guard") {
+      mvpReason = `Bảo vệ thần thánh với ${stats[mvpPlayer.id].saves} lần cứu người chuẩn xác!`;
+    } else if (mvpPlayer.role === "seer") {
+      mvpReason = `Mắt thần soi đúng ${stats[mvpPlayer.id].seerWolvesFound} Sói, định hướng cho cả làng!`;
+    } else if (mvpPlayer.role === "tanner") {
+      mvpReason = "Cú lừa ngoạn mục dẫn dụ cả làng treo cổ mình thành công!";
+    } else {
+      mvpReason = `Đóng góp ${stats[mvpPlayer.id].votesToHangWolf} phiếu treo cổ Sói chuẩn xác!`;
+    }
+
+    awards.push({
+      id: "mvp",
+      title: "👑 MVP Ván Đấu",
+      playerId: mvpPlayer.id,
+      name: mvpPlayer.name,
+      avatar: mvpPlayer.avatar,
+      role: mvpPlayer.role,
+      score: maxScore,
+      description: mvpReason,
+      color: "#fbbf24",
+    });
+  }
+
+  // 1. Hộ Vệ Thần Thánh (Guard cứu người thành công)
+  const guard = players.find((p) => p.role === "guard");
+  if (guard && stats[guard.id].saves > 0 && guard.id !== mvpPlayer?.id) {
+    awards.push({
+      id: "best_guard",
+      title: "🛡️ Hộ Vệ Thần Thánh",
+      playerId: guard.id,
+      name: guard.name,
+      avatar: guard.avatar,
+      role: guard.role,
+      description: `Đã ${stats[guard.id].saves} lần chặn đứng móng vuốt của Sói trong đêm!`,
+      color: "#3b82f6",
+    });
+  }
+
+  // 2. Mắt Thần Vô Song (Seer soi ra Sói)
+  const seer = players.find((p) => p.role === "seer");
+  if (seer && stats[seer.id].seerWolvesFound > 0 && seer.id !== mvpPlayer?.id) {
+    awards.push({
+      id: "best_seer",
+      title: "🔮 Mắt Thần Vô Song",
+      playerId: seer.id,
+      name: seer.name,
+      avatar: seer.avatar,
+      role: seer.role,
+      description: `Đã vạch trần ${stats[seer.id].seerWolvesFound} Sói ẩn mình trong làng!`,
+      color: "#6366f1",
+    });
+  }
+
+  // 3. Diễn Viên Oscar / Cú Lừa Thế Kỷ (Tanner thắng hoặc Sói diễn sâu)
+  const tanner = players.find((p) => p.role === "tanner");
+  if (winner === "tanner" && tanner && tanner.id !== mvpPlayer?.id) {
+    awards.push({
+      id: "best_actor",
+      title: "🎭 Cú Lừa Thế Kỷ",
+      playerId: tanner.id,
+      name: tanner.name,
+      avatar: tanner.avatar,
+      role: tanner.role,
+      description: "Đánh lừa cả làng treo cổ mình để giành chiến thắng vang dội!",
+      color: "#ec4899",
+    });
+  } else if (winner === "wolf") {
+    const survivingWolf = players.find((p) => p.role === "wolf" && p.alive && p.id !== mvpPlayer?.id);
+    if (survivingWolf) {
+      awards.push({
+        id: "best_actor",
+        title: "🎭 Diễn Viên Oscar",
+        playerId: survivingWolf.id,
+        name: survivingWolf.name,
+        avatar: survivingWolf.avatar,
+        role: survivingWolf.role,
+        description: "Ngụy trang hoàn hảo, sống sót qua mọi nghi ngờ của dân làng!",
+        color: "#f43f5e",
+      });
+    }
+  }
+
+  // 4. Đao Phủ Quyết Đoán (Bỏ nhiều phiếu Treo nhất)
+  let maxHangVotes = 0;
+  let executioner = null;
+  players.forEach((p) => {
+    if (stats[p.id].totalHangVotes > maxHangVotes && p.id !== mvpPlayer?.id) {
+      maxHangVotes = stats[p.id].totalHangVotes;
+      executioner = p;
+    }
+  });
+  if (executioner && maxHangVotes >= 1) {
+    awards.push({
+      id: "executioner",
+      title: "🪓 Đao Phủ Quyết Đoán",
+      playerId: executioner.id,
+      name: executioner.name,
+      avatar: executioner.avatar,
+      role: executioner.role,
+      description: `Bỏ ${maxHangVotes} phiếu treo cổ, kiên quyết diệt trừ hiểm họa!`,
+      color: "#f97316",
+    });
+  }
+
+  // 5. Nạn Nhân Vô Tội (Chết Đêm 1)
+  const night1Death = history.find((h) => h.day === 1 && h.type === "death");
+  if (night1Death && night1Death.targetId && night1Death.targetId !== mvpPlayer?.id) {
+    const victim = players.find((p) => p.id === night1Death.targetId);
+    if (victim) {
+      awards.push({
+        id: "martyr",
+        title: "🕊️ Nạn Nhân Vô Tội",
+        playerId: victim.id,
+        name: victim.name,
+        avatar: victim.avatar,
+        role: victim.role,
+        description: "Chưa kịp cất lời đã bị tiễn về cõi vĩnh hằng ngay Đêm 1!",
+        color: "#94a3b8",
+      });
+    }
+  }
+
+  return awards;
 }

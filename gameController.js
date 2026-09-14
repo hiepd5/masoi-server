@@ -215,6 +215,7 @@ export function createGameController(io) {
   function endGame(room, winner, tannerWinnerId) {
     room.phase = "ended";
     room.game.winner = winner;
+    room.game.awards = GE.computeMatchAwards(room);
     clearRoomTimer(room.code);
     if (winner === "wolf") {
       announce(room, "Trò chơi kết thúc! Phe Sói chiến thắng. Bóng tối đã nuốt chửng cả làng...");
