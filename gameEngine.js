@@ -98,6 +98,10 @@ export function guardProtect(room, guardId, targetId) {
   if (targetId === g.lastGuardedId) {
     return { error: "Không thể bảo vệ trùng người vừa bảo vệ đêm trước." };
   }
+  // BUG F2 FIX: Không thể bảo vệ người đã chết
+  const target = getPlayer(room, targetId);
+  if (!target?.alive) return { error: "Người chơi này đã chết." };
+
   g.guardedIdTonight = targetId;
   return { ok: true };
 }
@@ -134,6 +138,12 @@ export function wolfPick(room, wolfId, targetId) {
     return { error: "Bạn không phải Sói hoặc đã chết." };
   }
   if (g.phase !== "night_wolf") return { error: "Không phải lượt Sói." };
+  // BUG F FIX: Không thể cắn người đã chết
+  const target = getPlayer(room, targetId);
+  if (!target?.alive) return { error: "Người chơi này đã chết." };
+  // Không thể cắn đồng đội Sói
+  if (target.role === "wolf") return { error: "Không thể cắn đồng loại." };
+
   g.wolfPicks[wolfId] = { targetId, timestamp: Date.now() };
   return { ok: true };
 }
@@ -208,6 +218,9 @@ export function witchDecide(room, witchId, { save, poisonTargetId }) {
 
   if (poisonTargetId) {
     if (g.witchUsedPoison) return { error: "Bạn đã dùng bình độc rồi." };
+    // BUG G FIX: Không thể đầu độc người đã chết
+    const poisonTarget = getPlayer(room, poisonTargetId);
+    if (!poisonTarget?.alive) return { error: "Người chơi này đã chết." };
     g.witchPoisonTargetId = poisonTargetId;
     g.witchUsedPoison = true;
   }
@@ -286,11 +299,8 @@ export function resolveNightDeaths(room) {
     const toughGuy = room.players.find((p) => p.role === "tough_guy" && p.alive);
     if (toughGuy) {
       deaths.add(toughGuy.id);
-      g.history.push({
-        type: "death",
-        day: g.dayNumber,
-        text: `Người Cứng Cỏi [${toughGuy.name}] đã không thể gượng dậy sau vết thương từ đêm trước và đã qua đời.`,
-      });
+      // BUG C FIX: KHÔNG push history ở đây vì forEach bên dưới đã xử lý.
+      // Push ở đây sẽ gây duplicate "death" event trong Recap.
     }
   }
 
@@ -371,6 +381,10 @@ export function startDiscussion(room) {
 export function voteExtendDiscussion(room, playerId, wantExtend) {
   const g = room.game;
   if (g.phase !== "day_discuss") return { error: "Không phải lúc thảo luận." };
+  // BUG H FIX: Chỉ người sống mới được vote gia hạn
+  const voter = getPlayer(room, playerId);
+  if (!voter?.alive) return { error: "Bạn đã chết, không thể vote." };
+
   g.extendVotes[playerId] = wantExtend;
 
   const votes = Object.values(g.extendVotes);
@@ -413,7 +427,9 @@ export function startNomination(room) {
   g.nominationVotes = {};
   g.nominees = [];
   g.hotSeatQueue = [];
-  g.hotSeatIndex = 0;
+  // BUG A FIX: Bắt đầu từ -1 để lần gọi nextDefenseOrFinalVote đầu tiên
+  // tăng lên 0 → trả về đúng defendant đầu tiên (index 0)
+  g.hotSeatIndex = -1;
 }
 
 // Ngưỡng để 1 người "lên ghế nóng": có nhiều phiếu nhất, xử lý hòa = cả 2 lên ghế
@@ -422,6 +438,11 @@ export function nominationVote(room, voterId, targetId) {
   if (g.phase !== "day_nominate") return { error: "Không phải lúc đề cử." };
   const voter = getPlayer(room, voterId);
   if (!voter?.alive) return { error: "Bạn đã chết, không thể vote." };
+  // BUG J FIX: Không thể đề cử người đã chết
+  const target = getPlayer(room, targetId);
+  if (!target?.alive) return { error: "Không thể đề cử người đã chết." };
+  // Không thể tự đề cử mình
+  if (voterId === targetId) return { error: "Không thể tự đề cử bản thân." };
 
   g.nominationVotes[voterId] = { targetId, timestamp: Date.now() };
   return { ok: true };
@@ -457,7 +478,7 @@ export function finalizeNomination(room) {
 
   g.nominees = topCandidates;
   g.hotSeatQueue = topCandidates.map((c) => c.playerId);
-  g.hotSeatIndex = 0;
+  g.hotSeatIndex = -1; // BUG A FIX: -1 so first nextDefenseOrFinalVote call → index 0
   g.phase = "day_defense";
   g.hotSeatEndsAt = Date.now() + TIMERS.defense * 1000;
 
@@ -598,7 +619,7 @@ export function startNextNight(room) {
   g.nominationVotes = {};
   g.nominees = [];
   g.hotSeatQueue = [];
-  g.hotSeatIndex = 0;
+  g.hotSeatIndex = -1; // Consistent với startNomination
   g.hotSeatEndsAt = null;
   g.finalVotes = {};
   g.finalVoteEndsAt = null;

@@ -24,8 +24,13 @@ function setRoomTimer(code, ms, fn) {
       timers.delete(code);
       // BUG 3 FIX: luôn dùng fresh room, không dùng closure cũ
       const freshRoom = getRoom(code);
-      if (!freshRoom || !freshRoom.game || freshRoom.game.winner) return; // game đã kết thúc hoặc phòng bị xóa
-      fn(freshRoom);
+      if (!freshRoom || !freshRoom.game || freshRoom.game.winner) return;
+      // BUG L FIX: try/catch để ngăn uncaught exception crash server
+      try {
+        fn(freshRoom);
+      } catch (err) {
+        console.error(`[Timer Error] room=${code} fn=${fn.name}:`, err);
+      }
     }, ms)
   );
 }
@@ -79,14 +84,6 @@ export function createGameController(io) {
     setRoomTimer(room.code, GE.TIMERS.guard * 1000, advanceFromGuard);
     broadcast(room);
     return { ok: true };
-  }
-
-
-  // Helper: gọi Bảo Vệ thức dậy (dùng cho các đêm tiếp theo)
-  function announceGuardPhase(room) {
-    announce(room, "Bảo Vệ ơi, thức dậy! Hãy chọn người bạn muốn bảo vệ đêm nay.");
-    setRoomTimer(room.code, GE.TIMERS.guard * 1000, advanceFromGuard);
-    broadcast(room);
   }
 
   // ============ ĐÊM: BẢO VỆ ============
@@ -163,22 +160,24 @@ export function createGameController(io) {
       announce(room, "Không ai bị đề cử. Đêm mới lại đến...");
       return goToNextNight(room);
     }
-    const names = nominees.map((n) => room.players.find((p) => p.id === n.playerId)?.name).join(", ");
-    announce(room, `${names} bị đề cử nhiều nhất. Mời lần lượt lên biện hộ.`);
-    setRoomTimer(room.code, GE.TIMERS.defense * 1000, finishDefenseTurn);
-    broadcast(room);
+    // BUG B FIX: Announce TẤT CẢ người bị đề cử, sau đó announce rõ ai biện hộ đầu tiên
+    const allNames = nominees.map((n) => room.players.find((p) => p.id === n.playerId)?.name).join(", ");
+    announce(room, `${allNames} bị đề cử nhiều nhất. Mời lần lượt lên biện hộ.`);
+    // Gọi finishDefenseTurn ngay để advance sang defendant đầu tiên (index -1 → 0)
+    finishDefenseTurn(room);
   }
 
   function finishDefenseTurn(room) {
     const result = GE.nextDefenseOrFinalVote(room);
     if (result.phase === "day_defense") {
+      // BUG B FIX: Announce tên người đang biện hộ để client hiển thị đúng
       const name = room.players.find((p) => p.id === result.currentDefendantId)?.name;
-      announce(room, `Mời ${name || "người tiếp theo"} lên biện hộ.`);
+      announce(room, `🎤 Mời ${name || "người tiếp theo"} lên biện hộ. (${GE.TIMERS.defense} giây)`);
       setRoomTimer(room.code, GE.TIMERS.defense * 1000, finishDefenseTurn);
     } else {
-      // phase = day_final_vote, hotSeatIndex đã = 0 bởi nextDefenseOrFinalVote
+      // phase = day_final_vote, hotSeatIndex = 0 → defendant đầu tiên
       const defendant = room.players.find((p) => p.id === result.currentDefendantId);
-      announce(room, `Mời cả làng vote cho ${defendant?.name || "bị cáo đầu tiên"}: Treo cổ hay Tha.`);
+      announce(room, `⚖️ Mời cả làng vote cho ${defendant?.name || "bị cáo đầu tiên"}: Treo cổ hay Tha.`);
       setRoomTimer(room.code, GE.TIMERS.finalVote * 1000, finishFinalVoteTurn);
     }
     broadcast(room);

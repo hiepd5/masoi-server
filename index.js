@@ -252,6 +252,14 @@ io.on("connection", (socket) => {
       gameCtrl.clearRoomTimer(room.code);
       room.game = null;
       room.phase = "lobby";
+
+      // BUG E FIX: Reset trạng thái người chơi để không lộ role/alive từ ván cũ vào lobby
+      room.players.forEach((p) => {
+        p.alive = true;
+        p.role = null;
+        p.ready = p.isHost; // Host luôn sẵn sàng, member phải bấm Ready lại
+      });
+
       broadcastRoom(room);
       cb?.({ ok: true });
     });
