@@ -135,17 +135,24 @@ export function removePlayer(code, socketId) {
       room.hostId = room.players[0].id;
     }
   } else {
-    // Đang chơi, chỉ set connected = false
+    // Đang chơi, chỉ set connected = false (giữ lại dữ liệu để reconnect)
     player.connected = false;
     player.disconnectedAt = Date.now();
-    // (Tuỳ chọn: 5 phút sau xoá hẳn, nhưng trong board game nên giữ lại "cái xác" để không hỏng game)
   }
 
-  // Dọn phòng nếu trống (trong lobby) hoặc tất cả đều rớt mạng
-  if (room.players.length === 0 || room.players.every(p => !p.connected)) {
+  // BUG 2 FIX: Chỉ xóa phòng khi:
+  // - Đang lobby và không còn ai
+  // - Game đã kết thúc (ended) và tất cả đều offline
+  // KHÔNG BAO GIỜ xóa phòng khi đang chơi (playing) chỉ vì tất cả tạm thời offline
+  const allDisconnected = room.players.every((p) => !p.connected);
+  const isLobbyEmpty = room.phase === "lobby" && room.players.length === 0;
+  const isEndedAndEmpty = room.phase === "ended" && allDisconnected;
+
+  if (isLobbyEmpty || isEndedAndEmpty) {
     rooms.delete(room.code);
     return null;
   }
+
   return room;
 }
 
@@ -272,7 +279,7 @@ export function publicRoomView(room, forSocketId) {
       hotSeatEndsAt: g.hotSeatEndsAt,
       finalVoteEndsAt: g.finalVoteEndsAt,
       // vote đề cử công khai -> ai cũng thấy ai vote ai
-      nominationVotes: g.phase === "day_nominate" || g.hotSeatQueue.length ? g.nominationVotes : {},
+      nominationVotes: g.phase === "day_nominate" || (g.hotSeatQueue?.length ?? 0) > 0 ? g.nominationVotes : {},
       finalVotes: g.phase === "day_final_vote" ? g.finalVotes : {},
       winner: g.winner,
       history: gameOver ? g.history : [],

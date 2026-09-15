@@ -17,12 +17,15 @@ function setRoomTimer(code, ms, fn) {
   if (room && room.game) {
     room.game.phaseEndsAt = Date.now() + ms;
   }
-  
+
   timers.set(
     code,
     setTimeout(() => {
       timers.delete(code);
-      fn();
+      // BUG 3 FIX: luôn dùng fresh room, không dùng closure cũ
+      const freshRoom = getRoom(code);
+      if (!freshRoom || !freshRoom.game || freshRoom.game.winner) return; // game đã kết thúc hoặc phòng bị xóa
+      fn(freshRoom);
     }, ms)
   );
 }
@@ -70,9 +73,10 @@ export function createGameController(io) {
     announce(room, `Trò chơi bắt đầu với ${room.players.length} người chơi. Đêm đầu tiên buông xuống...`);
     // Delay nhỏ rồi gọi Bảo Vệ thức dậy
     setTimeout(() => {
-      announce(room, "Bảo Vệ ơi, thức dậy! Hãy chọn người bạn muốn bảo vệ đêm nay.");
+      const r = getRoom(room.code);
+      if (r && r.game && !r.game.winner) announce(r, "Bảo Vệ ơi, thức dậy! Hãy chọn người bạn muốn bảo vệ đêm nay.");
     }, 2500);
-    setRoomTimer(room.code, GE.TIMERS.guard * 1000, () => advanceFromGuard(room));
+    setRoomTimer(room.code, GE.TIMERS.guard * 1000, advanceFromGuard);
     broadcast(room);
     return { ok: true };
   }
@@ -81,7 +85,7 @@ export function createGameController(io) {
   // Helper: gọi Bảo Vệ thức dậy (dùng cho các đêm tiếp theo)
   function announceGuardPhase(room) {
     announce(room, "Bảo Vệ ơi, thức dậy! Hãy chọn người bạn muốn bảo vệ đêm nay.");
-    setRoomTimer(room.code, GE.TIMERS.guard * 1000, () => advanceFromGuard(room));
+    setRoomTimer(room.code, GE.TIMERS.guard * 1000, advanceFromGuard);
     broadcast(room);
   }
 
@@ -89,16 +93,15 @@ export function createGameController(io) {
   function advanceFromGuard(room) {
     GE.endGuardPhase(room);
     announce(room, "Bảo Vệ đã ngủ lại. Sói ơi, hãy thức dậy và chọn con mồi...");
-    setRoomTimer(room.code, GE.TIMERS.wolf * 1000, () => advanceFromWolf(room));
+    setRoomTimer(room.code, GE.TIMERS.wolf * 1000, advanceFromWolf);
     broadcast(room);
-
   }
 
   // ============ ĐÊM: SÓI ============
   function advanceFromWolf(room) {
     GE.endWolfPhase(room);
     announce(room, "Sói đã ngủ lại. Phù Thủy ơi, hãy thức dậy...");
-    setRoomTimer(room.code, GE.TIMERS.witch * 1000, () => advanceFromWitch(room));
+    setRoomTimer(room.code, GE.TIMERS.witch * 1000, advanceFromWitch);
     broadcast(room);
   }
 
@@ -106,7 +109,7 @@ export function createGameController(io) {
   function advanceFromWitch(room) {
     GE.endWitchPhase(room);
     announce(room, "Phù Thủy đã ngủ lại. Tiên Tri ơi, hãy thức dậy và soi một người...");
-    setRoomTimer(room.code, GE.TIMERS.seer * 1000, () => advanceFromSeer(room));
+    setRoomTimer(room.code, GE.TIMERS.seer * 1000, advanceFromSeer);
     broadcast(room);
   }
 
@@ -123,7 +126,7 @@ export function createGameController(io) {
     const winner = GE.checkWinCondition(room);
     if (winner) return endGame(room, winner);
 
-    setRoomTimer(room.code, 5000, () => beginDiscussion(room));
+    setRoomTimer(room.code, 5000, beginDiscussion);
     broadcast(room);
   }
 
@@ -138,7 +141,7 @@ export function createGameController(io) {
   function scheduleDiscussEnd(room) {
     const g = room.game;
     const msLeft = g.discussEndsAt - Date.now();
-    setRoomTimer(room.code, Math.max(0, msLeft), () => beginNomination(room));
+    setRoomTimer(room.code, Math.max(0, msLeft), beginNomination);
   }
 
   // gọi khi có gia hạn để reset lại timer theo thời gian mới
@@ -150,7 +153,7 @@ export function createGameController(io) {
   function beginNomination(room) {
     GE.startNomination(room);
     announce(room, "Hết giờ thảo luận. Mời cả làng đề cử người nghi ngờ.");
-    setRoomTimer(room.code, 30000, () => finalizeNominationPhase(room));
+    setRoomTimer(room.code, 30000, finalizeNominationPhase);
     broadcast(room);
   }
 
@@ -162,45 +165,58 @@ export function createGameController(io) {
     }
     const names = nominees.map((n) => room.players.find((p) => p.id === n.playerId)?.name).join(", ");
     announce(room, `${names} bị đề cử nhiều nhất. Mời lần lượt lên biện hộ.`);
-    setRoomTimer(room.code, GE.TIMERS.defense * 1000, () => finishDefenseTurn(room));
+    setRoomTimer(room.code, GE.TIMERS.defense * 1000, finishDefenseTurn);
     broadcast(room);
   }
 
   function finishDefenseTurn(room) {
     const result = GE.nextDefenseOrFinalVote(room);
     if (result.phase === "day_defense") {
-      setRoomTimer(room.code, GE.TIMERS.defense * 1000, () => finishDefenseTurn(room));
+      const name = room.players.find((p) => p.id === result.currentDefendantId)?.name;
+      announce(room, `Mời ${name || "người tiếp theo"} lên biện hộ.`);
+      setRoomTimer(room.code, GE.TIMERS.defense * 1000, finishDefenseTurn);
     } else {
-      announce(room, "Mời cả làng vote: Treo cổ hay Tha.");
-      setRoomTimer(room.code, GE.TIMERS.finalVote * 1000, () => finishFinalVoteTurn(room));
+      // phase = day_final_vote, hotSeatIndex đã = 0 bởi nextDefenseOrFinalVote
+      const defendant = room.players.find((p) => p.id === result.currentDefendantId);
+      announce(room, `Mời cả làng vote cho ${defendant?.name || "bị cáo đầu tiên"}: Treo cổ hay Tha.`);
+      setRoomTimer(room.code, GE.TIMERS.finalVote * 1000, finishFinalVoteTurn);
     }
     broadcast(room);
   }
 
+  // BUG 1 FIX: Không double-increment hotSeatIndex. Logic đúng:
+  // resolveFinalVote dùng hotSeatIndex hiện tại, sau đó tăng index để sang người tiếp theo.
   function finishFinalVoteTurn(room) {
     const g = room.game;
-    const result = GE.resolveFinalVote(room);
+    const result = GE.resolveFinalVote(room); // xử lý hotSeatQueue[hotSeatIndex]
     const defendant = room.players.find((p) => p.id === result.defendantId);
 
     if (result.hanged) {
-      announce(room, `Làng đã quyết định! ${defendant?.name} sẽ rời khỏi ván đấu. Xin hãy giữ im lặng tuyệt đối.`);
+      announce(room, `Làng đã quyết định! ${defendant?.name || "Bị cáo"} sẽ rời khỏi ván đấu. Xin hãy giữ im lặng tuyệt đối.`);
     } else {
-      announce(room, `Làng đã tha ${defendant?.name}! Không ai bị xử tử hôm nay.`);
+      announce(room, `Làng đã tha ${defendant?.name || "bị cáo"}! Không ai bị xử tử hôm nay.`);
     }
 
     if (result.tannerWin) {
-      return endGame(room, "tanner", defendant?.id);
+      return endGame(room, "tanner");
     }
 
     const winner = GE.checkWinCondition(room);
     if (winner) return endGame(room, winner);
 
+    // Tăng index để sang defendant tiếp theo (nếu có)
     g.hotSeatIndex += 1;
     g.finalVotes = {};
+
     if (g.hotSeatIndex < g.hotSeatQueue.length) {
-      setRoomTimer(room.code, GE.TIMERS.finalVote * 1000, () => finishFinalVoteTurn(room));
+      // Còn người nữa trong queue — vote tiếp
+      const nextDefendant = room.players.find((p) => p.id === g.hotSeatQueue[g.hotSeatIndex]);
+      announce(room, `Tiếp theo: Mời cả làng vote cho ${nextDefendant?.name || "bị cáo tiếp theo"}: Treo cổ hay Tha.`);
+      g.finalVoteEndsAt = Date.now() + GE.TIMERS.finalVote * 1000;
+      setRoomTimer(room.code, GE.TIMERS.finalVote * 1000, finishFinalVoteTurn);
       broadcast(room);
     } else {
+      // Hết queue — sang đêm mới
       goToNextNight(room);
     }
   }
@@ -208,7 +224,7 @@ export function createGameController(io) {
   function goToNextNight(room) {
     GE.startNextNight(room);
     announce(room, `Đêm thứ ${room.game.dayNumber} bắt đầu. Bảo Vệ ơi, hãy thức dậy...`);
-    setRoomTimer(room.code, GE.TIMERS.guard * 1000, () => advanceFromGuard(room));
+    setRoomTimer(room.code, GE.TIMERS.guard * 1000, advanceFromGuard);
     broadcast(room);
   }
 

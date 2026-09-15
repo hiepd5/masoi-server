@@ -582,12 +582,26 @@ export function startNextNight(room) {
   const g = room.game;
   g.dayNumber += 1;
   g.phase = "night_guard";
+
+  // Reset trạng thái đêm
   g.guardedIdTonight = null;
   g.wolfPicks = {};
   g.wolfVictimId = null;
   g.witchSaveTonight = false;
   g.witchPoisonTargetId = null;
   g.nightDeaths = [];
+
+  // BUG 8 FIX: Reset tất cả trạng thái ban ngày để tránh state leak sang ngày tiếp theo
+  g.discussEndsAt = null;
+  g.extendVotes = {};
+  g.skipDiscussVotes = {};
+  g.nominationVotes = {};
+  g.nominees = [];
+  g.hotSeatQueue = [];
+  g.hotSeatIndex = 0;
+  g.hotSeatEndsAt = null;
+  g.finalVotes = {};
+  g.finalVoteEndsAt = null;
 }
 
 // ============ TÍNH TOÁN DANH HIỆU & MVP VÁN ĐẤU ============

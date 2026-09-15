@@ -289,8 +289,8 @@ io.on("connection", (socket) => {
     withPlayer((room, player) => {
       if (!player.alive) return cb?.({ ok: false, error: "Bạn đã chết, không thể chat" });
       
-      // Chỉ cho phép chat công khai ban ngày
-      if (room.game.phase.startsWith("night_")) return cb?.({ ok: false, error: "Ban đêm không được chat ồn ào!" });
+      // BUG 10 FIX: Thêm optional chaining để tránh crash khi room.game là null
+      if (room.game?.phase?.startsWith("night_")) return cb?.({ ok: false, error: "Ban đêm không được chat ồn ào!" });
 
       io.to(room.code).emit("village:chat", { 
         senderId: player.id, 
@@ -327,6 +327,8 @@ io.on("connection", (socket) => {
 
   socket.on("action:skipDiscussion", (_, cb) => {
     withPlayer((room, player) => {
+      // BUG 9 FIX: Không trigger phase mới sau khi game đã kết thúc
+      if (room.game?.winner) return cb?.({ ok: false });
       const result = gameCtrl.voteSkipDiscussion(room, player.id);
       if (result.ok) {
         gameCtrl.broadcast(room);
@@ -340,8 +342,11 @@ io.on("connection", (socket) => {
     });
   });
 
+
   socket.on("action:nominationVote", ({ targetId }, cb) => {
     withPlayer((room, player) => {
+      // BUG 9 FIX: Không cho vote sau khi game kết thúc
+      if (room.game?.winner) return cb?.({ ok: false, error: "Trò chơi đã kết thúc." });
       const result = gameCtrl.nominationVote(room, player.id, targetId);
       if (result.ok) gameCtrl.broadcast(room);
       cb?.(result);
@@ -350,7 +355,11 @@ io.on("connection", (socket) => {
 
   socket.on("action:finalVote", ({ decision }, cb) => {
     withPlayer((room, player) => {
+      // BUG 9 FIX: Không cho vote sau khi game kết thúc
+      if (room.game?.winner) return cb?.({ ok: false, error: "Trò chơi đã kết thúc." });
       const result = gameCtrl.finalVote(room, player.id, decision);
+      // BUG 5 FIX: Broadcast để người chơi khác thấy ai đã vote real-time
+      if (result.ok) gameCtrl.broadcast(room);
       cb?.(result);
     });
   });
