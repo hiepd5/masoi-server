@@ -1,4 +1,4 @@
-import { assignCustomRoles } from "./roles.js";
+import { assignCustomRoles, ROLE_LABELS } from "./roles.js";
 
 // ============ HẰNG SỐ THỜI GIAN (giây) ============
 export const TIMERS = {
