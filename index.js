@@ -194,7 +194,7 @@ io.on("connection", (socket) => {
       const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
         identity: player.id,
         name: player.name,
-        ttl: '6h',
+        ttl: '2h', // OPT 5: 2h đủ cho 1 ván, giảm từ 6h
       });
       at.addGrant({ roomJoin: true, room: code, canPublish: true, canSubscribe: true });
       cb?.({ token: await at.toJwt(), url: LIVEKIT_URL });
