@@ -17,10 +17,40 @@ import {
 
 import { createGameController } from "./gameController.js";
 import { AccessToken } from "livekit-server-sdk";
+import https from "https";
 
 const LIVEKIT_URL = process.env.LIVEKIT_URL || "wss://ma-soi-online-rac6j8ri.livekit.cloud";
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || "APIQ2WP9w5JhSKX";
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || "ivTQhkkUZ3otV7XepsCnBdPmHTP6RIFhJRRsn1d28jI";
+
+// LiveKit health check cache (60s TTL)
+let livekitHealthCache = { ok: true, checkedAt: 0, message: null };
+const LIVEKIT_HEALTH_TTL = 60_000;
+
+function checkLivekitHealth() {
+  return new Promise((resolve) => {
+    const now = Date.now();
+    if (now - livekitHealthCache.checkedAt < LIVEKIT_HEALTH_TTL) {
+      return resolve(livekitHealthCache);
+    }
+    const httpUrl = LIVEKIT_URL.replace(/^wss?:\/\//, "https://") + "/rtc?access_token=probe&protocol=11";
+    const req = https.get(httpUrl, { timeout: 5000 }, (res) => {
+      const is429 = res.statusCode === 429;
+      let body = "";
+      res.on("data", (d) => (body += d));
+      res.on("end", () => {
+        livekitHealthCache = { ok: !is429, checkedAt: Date.now(), message: is429 ? body.trim() : null };
+        resolve(livekitHealthCache);
+      });
+    });
+    req.on("error", () => {
+      // Network error — still let client try; don't block
+      livekitHealthCache = { ok: true, checkedAt: Date.now(), message: null };
+      resolve(livekitHealthCache);
+    });
+    req.on("timeout", () => { req.destroy(); resolve({ ok: true, checkedAt: Date.now(), message: null }); });
+  });
+}
 
 const app = express();
 app.use(cors({ origin: "*" }));
@@ -153,6 +183,12 @@ io.on("connection", (socket) => {
     const player = room.players.find((p) => p.socketId === socket.id)
                 || room.players.find((p) => p.id === socket.data.playerId);
     if (!player) return cb?.({ error: "Không tìm thấy người chơi." });
+
+    // Kiểm tra LiveKit Cloud còn hoạt động không (cached 60s)
+    const health = await checkLivekitHealth();
+    if (!health.ok) {
+      return cb?.({ error: "LIVEKIT_QUOTA_EXCEEDED" });
+    }
 
     try {
       const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
