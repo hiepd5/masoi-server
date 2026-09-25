@@ -1,0 +1,15 @@
+﻿services:
+  - type: web
+    name: masoi-server
+    runtime: node
+    region: singapore
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: LIVEKIT_URL
+        value: wss://ma-soi-online-rac6j8ri.livekit.cloud
+      - key: LIVEKIT_API_KEY
+        value: APIQ2WP9w5JhSKX
+      - key: LIVEKIT_API_SECRET
+        value: ivTQhkkUZ3otV7XepsCnBdPmHTP6RIFhJRRsn1d28jI
