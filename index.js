@@ -54,6 +54,10 @@ function checkLivekitHealth() {
 
 const app = express();
 app.use(cors({ origin: "*" }));
+
+// Health check — Render dùng để verify server alive
+app.get("/", (req, res) => res.json({ status: "ok", game: "Ma Soi Online", uptime: process.uptime() }));
+
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] },
