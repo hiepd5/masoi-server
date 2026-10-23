@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "nodemon index.js",
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node scripts/sim_test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

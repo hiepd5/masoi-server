@@ -36,6 +36,8 @@ function setRoomTimer(code, ms, fn) {
 }
 
 export function createGameController(io) {
+  let phaseHook = null;
+
   function broadcast(room) {
     // PHẢI dùng p.socketId (socket hiện tại sau reconnect), KHÔNG dùng p.id (socket cũ có thể đã chết)
     room.players.forEach((p) => {
@@ -43,6 +45,13 @@ export function createGameController(io) {
         io.to(p.socketId).emit("room:update", publicRoomView(room, p.socketId));
       }
     });
+    if (phaseHook) {
+      try {
+        phaseHook(room);
+      } catch (err) {
+        console.error("[DevSandbox Hook Error]:", err);
+      }
+    }
   }
 
   function announce(room, message) {
@@ -74,6 +83,23 @@ export function createGameController(io) {
     }
 
     GE.initGameState(room);
+
+    // [LOCAL DEV ONLY] Áp dụng vai trò ép trước từ DevSandbox (hoán đổi giữ nguyên tổng vai)
+    if (!process.env.RENDER && process.env.NODE_ENV !== "production" && room.devForcedRoles) {
+      Object.entries(room.devForcedRoles).forEach(([pid, desiredRole]) => {
+        if (!desiredRole) return;
+        const me = room.players.find((p) => p.id === pid);
+        if (!me || me.role === desiredRole) return;
+        const donor = room.players.find((p) => p.id !== pid && p.role === desiredRole);
+        if (donor) {
+          donor.role = me.role;
+          me.role = desiredRole;
+        } else {
+          me.role = desiredRole;
+        }
+      });
+    }
+
     room.phase = "playing";
     announce(room, `Trò chơi bắt đầu với ${room.players.length} người chơi. Đêm đầu tiên buông xuống...`);
     // Delay nhỏ rồi gọi Bảo Vệ thức dậy
@@ -243,11 +269,31 @@ export function createGameController(io) {
   }
 
 
+  function advanceCurrentPhase(room) {
+    if (!room?.game || room.game.winner) return { ok: false, error: "Ván đấu chưa chạy hoặc đã kết thúc." };
+    clearRoomTimer(room.code);
+    const p = room.game.phase;
+    if (p === "night_guard") advanceFromGuard(room);
+    else if (p === "night_wolf") advanceFromWolf(room);
+    else if (p === "night_witch") advanceFromWitch(room);
+    else if (p === "night_seer") advanceFromSeer(room);
+    else if (p === "day_reveal") beginDiscussion(room);
+    else if (p === "day_discuss") beginNomination(room);
+    else if (p === "day_nominate") finalizeNominationPhase(room);
+    else if (p === "day_defense") finishDefenseTurn(room);
+    else if (p === "day_final_vote") finishFinalVoteTurn(room);
+    else if (p === "day_no_nomination") goToNextNight(room);
+    else return { ok: false, error: `Không thể tua phase: ${p}` };
+    return { ok: true, fromPhase: p, toPhase: room.game.phase };
+  }
+
   // ============ EXPORT HANDLERS CHO index.js ============
   return {
     startGame,
     broadcast,
     announce,
+    setPhaseHook: (fn) => { phaseHook = fn; },
+    advanceCurrentPhase,
     guardProtect: (room, id, targetId) => GE.guardProtect(room, id, targetId),
     wolfPick: (room, id, targetId) => GE.wolfPick(room, id, targetId),
     witchDecide: (room, id, payload) => GE.witchDecide(room, id, payload),

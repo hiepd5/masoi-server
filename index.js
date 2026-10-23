@@ -16,6 +16,7 @@ import {
 } from "./rooms.js";
 
 import { createGameController } from "./gameController.js";
+import { setupDevPhaseHook, registerDevSocketHandlers } from "./devSandbox.js";
 import { AccessToken } from "livekit-server-sdk";
 import https from "https";
 
@@ -73,6 +74,7 @@ function broadcastRoom(room) {
 }
 
 const gameCtrl = createGameController(io);
+setupDevPhaseHook(gameCtrl);
 
 io.on("connection", (socket) => {
   console.log("Kết nối mới:", socket.id);
@@ -257,11 +259,17 @@ io.on("connection", (socket) => {
       room.game = null;
       room.phase = "lobby";
 
+      if (room.devBotTimer) {
+        clearTimeout(room.devBotTimer);
+        room.devBotTimer = null;
+      }
+      room.lastAutoPhaseKey = null;
+
       // BUG E FIX: Reset trạng thái người chơi để không lộ role/alive từ ván cũ vào lobby
       room.players.forEach((p) => {
         p.alive = true;
         p.role = null;
-        p.ready = p.isHost; // Host luôn sẵn sàng, member phải bấm Ready lại
+        p.ready = p.isHost || Boolean(p.isBot); // Host & Bot luôn sẵn sàng, member thật bấm Ready lại
       });
 
       broadcastRoom(room);
@@ -413,6 +421,9 @@ io.on("connection", (socket) => {
     if (updatedRoom) broadcastRoom(updatedRoom);
     cb?.({ ok: true });
   });
+
+  // [LOCAL DEV ONLY] Đăng ký bộ công cụ DevSandbox (tự khóa cứng trên Render/Production)
+  registerDevSocketHandlers(socket, gameCtrl, broadcastRoom);
 });
 
 const PORT = process.env.PORT || 3001;

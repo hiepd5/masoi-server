@@ -124,15 +124,17 @@ export function removePlayer(code, socketId) {
   const room = getRoom(code);
   if (!room) return null;
   
-  const player = room.players.find((p) => p.socketId === socketId);
+  const player = room.players.find((p) => p.socketId === socketId || p.id === socketId);
   if (!player) return room;
 
   if (room.phase === "lobby") {
     room.players = room.players.filter((p) => p.id !== player.id);
-    // Chuyển host
+    // Chuyển host (ưu tiên người thật hơn Bot)
     if (room.players.length > 0 && !room.players.some((p) => p.isHost)) {
-      room.players[0].isHost = true;
-      room.hostId = room.players[0].id;
+      const nextHost = room.players.find((p) => !p.isBot) || room.players[0];
+      nextHost.isHost = true;
+      nextHost.ready = true;
+      room.hostId = nextHost.id;
     }
   } else {
     // Đang chơi, chỉ set connected = false (giữ lại dữ liệu để reconnect)
@@ -140,12 +142,10 @@ export function removePlayer(code, socketId) {
     player.disconnectedAt = Date.now();
   }
 
-  // BUG 2 FIX: Chỉ xóa phòng khi:
-  // - Đang lobby và không còn ai
-  // - Game đã kết thúc (ended) và tất cả đều offline
-  // KHÔNG BAO GIỜ xóa phòng khi đang chơi (playing) chỉ vì tất cả tạm thời offline
-  const allDisconnected = room.players.every((p) => !p.connected);
-  const isLobbyEmpty = room.phase === "lobby" && room.players.length === 0;
+  // BUG 2 FIX: Chỉ xóa phòng khi không còn người chơi thật (bỏ qua Bot ảo)
+  const realPlayers = room.players.filter((p) => !p.isBot);
+  const allDisconnected = realPlayers.every((p) => !p.connected);
+  const isLobbyEmpty = room.phase === "lobby" && realPlayers.length === 0;
   const isEndedAndEmpty = room.phase === "ended" && allDisconnected;
 
   if (isLobbyEmpty || isEndedAndEmpty) {
@@ -168,7 +168,7 @@ export function renamePlayer(code, socketId, newName, avatarSeed = null, avatarU
   );
   if (taken) return { error: "Tên này đã có người dùng trong phòng." };
 
-  const player = room.players.find((p) => p.socketId === socketId);
+  const player = room.players.find((p) => p.socketId === socketId || p.id === socketId);
   if (!player) return { error: "Không tìm thấy người chơi." };
   player.name = trimmed;
   player.avatar = avatarUrl
@@ -181,7 +181,7 @@ export function renamePlayer(code, socketId, newName, avatarSeed = null, avatarU
 export function toggleReady(code, socketId) {
   const room = getRoom(code);
   if (!room) return { error: "Phòng không tồn tại." };
-  const player = room.players.find((p) => p.socketId === socketId);
+  const player = room.players.find((p) => p.socketId === socketId || p.id === socketId);
   if (!player) return { error: "Không tìm thấy người chơi." };
 
   if (player.isHost) {
@@ -237,16 +237,25 @@ export function publicRoomView(room, forSocketId) {
   const gameOver = g?.winner;
   const me = room.players.find((p) => p.socketId === forSocketId);
 
+  const isLocalDev = !process.env.RENDER && process.env.NODE_ENV !== "production";
+
   const base = {
     code: room.code,
     phase: room.phase, // 'lobby' | 'playing' | 'ended'
     rolesConfig: room.rolesConfig || generateDefaultRoles(room.players.length),
     lobbyMessages: room.lobbyMessages || [],
+    devSandbox: isLocalDev
+      ? {
+          autoBot: room.devAutoBot !== false,
+          forcedRole: (me && room.devForcedRoles?.[me.id]) || null,
+        }
+      : undefined,
     players: room.players.map((p) => ({
       id: p.id,
       name: p.name,
       avatar: p.avatar,
       isHost: p.isHost,
+      isBot: Boolean(p.isBot),
       ready: p.isHost ? true : Boolean(p.ready),
       alive: p.alive,
       connected: p.connected,
