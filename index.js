@@ -19,6 +19,14 @@ import { createGameController } from "./gameController.js";
 import { setupDevPhaseHook, registerDevSocketHandlers } from "./devSandbox.js";
 import { AccessToken } from "livekit-server-sdk";
 import https from "https";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const VILLAGE_LAYOUT_PATH = path.resolve(__dirname, "../client/public/config/village_layout.json");
+const VILLAGE_LAYOUT_BACKUP_PATH = path.resolve(__dirname, "../client/public/config/village_layout.backup.json");
 
 const LIVEKIT_URL = process.env.LIVEKIT_URL || "wss://ma-soi-online-rac6j8ri.livekit.cloud";
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || "APIQ2WP9w5JhSKX";
@@ -55,9 +63,63 @@ function checkLivekitHealth() {
 
 const app = express();
 app.use(cors({ origin: "*" }));
+app.use(express.json({ limit: "2mb" }));
+
+function isLocalDevRequest(req) {
+  if (process.env.NODE_ENV === "production") return false;
+  const ip = String(req.ip || req.socket?.remoteAddress || "");
+  const host = String(req.headers.host || "").toLowerCase();
+  return (
+    ip === "127.0.0.1" ||
+    ip === "::1" ||
+    ip === "::ffff:127.0.0.1" ||
+    host.startsWith("localhost") ||
+    host.startsWith("127.0.0.1")
+  );
+}
 
 // Health check — Render dùng để verify server alive
 app.get("/", (req, res) => res.json({ status: "ok", game: "Ma Soi Online", uptime: process.uptime() }));
+
+// API Nội Bộ Dev (D5 Architect Studio): Lưu cố định bố cục cảnh quan vào client/public/config/village_layout.json
+app.post("/api/dev/village-layout", (req, res) => {
+  if (!isLocalDevRequest(req)) {
+    return res.status(403).json({ ok: false, error: "Chỉ cho phép lưu bố cục trên máy Dev Local." });
+  }
+  try {
+    const body = req.body;
+    if (!body || !Array.isArray(body.nodes) || body.nodes.length === 0) {
+      return res.status(400).json({ ok: false, error: "Dữ liệu nodes[] không hợp lệ." });
+    }
+    // Chặn tuyệt đối trường hợp có prop_chair lọt vào file bố cục ngoại cảnh
+    const safeNodes = body.nodes.filter((n) => n && n.type && n.type !== "prop_chair");
+
+    fs.mkdirSync(path.dirname(VILLAGE_LAYOUT_PATH), { recursive: true });
+    if (fs.existsSync(VILLAGE_LAYOUT_PATH)) {
+      fs.copyFileSync(VILLAGE_LAYOUT_PATH, VILLAGE_LAYOUT_BACKUP_PATH);
+    }
+
+    const doc = {
+      schemaVersion: Number(body.schemaVersion || 1),
+      updatedAtMs: Date.now(),
+      updatedAtIso: new Date().toISOString(),
+      note:
+        body.note ||
+        "Bố cục không gian Làng Ma Sói 3D được dàn dựng bằng D5 Architect Studio (Không tác động ghế ngồi người chơi)",
+      totalNodes: safeNodes.length,
+      nodes: safeNodes,
+    };
+
+    fs.writeFileSync(VILLAGE_LAYOUT_PATH, JSON.stringify(doc, null, 2) + "\n", "utf8");
+    return res.json({
+      ok: true,
+      savedCount: safeNodes.length,
+      filePath: "client/public/config/village_layout.json",
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {

@@ -17,8 +17,11 @@ export function initGameState(room) {
   const alivePlayerIds = room.players.map((p) => p.id);
   const { assignment, counts } = assignCustomRoles(alivePlayerIds, room.rolesConfig);
 
-  room.players.forEach((p) => {
-    p.role = assignment.get(p.id);
+  room.players.forEach((p, idx) => {
+    const assignedRole = assignment.get(p.id);
+    p.role = assignedRole;
+    p.initialRole = assignedRole;
+    p.seatIndex = idx;
     p.alive = true;
   });
 

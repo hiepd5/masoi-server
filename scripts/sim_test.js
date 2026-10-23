@@ -39,6 +39,7 @@ function makeTestRoom(roleMap) {
   // Ép đúng vai cố định để kiểm thử tất định 100%
   entries.forEach(([, role], idx) => {
     room.players[idx].role = role;
+    room.players[idx].initialRole = role;
     room.players[idx].alive = true;
   });
   return room;
@@ -355,6 +356,30 @@ runScenario("11. DevSandbox Solo: +5 Bot tự Ready, Ép vai Phù Thủy, Tua Ph
   assert.equal(Object.values(room.game.finalVotes).filter((v) => v === "hang").length, 5);
 
   gameCtrl.clearRoomTimer(room.code);
+});
+
+// 12. Kiểm chứng Ngày 1 3D: Cố định seatIndex khi Reconnect, deadWolfCount chuẩn & bảo mật initialRole
+runScenario("12. 3D Stage Ready: seatIndex cố định, deadWolfCount chuẩn & ẩn initialRole trước cuối trận", () => {
+  const room = makeTestRoom({
+    w1: "wolf", w2: "wolf", g1: "guard", wt: "witch", cs: "cursed", v1: "villager"
+  });
+  const villager = room.players.find((p) => p.role === "villager");
+  const w1 = room.players.find((p) => p.name === "Player_w1");
+
+  // Kiểm tra seatIndex 0..5 liên tục & initialRole bị ẩn khi đang chơi
+  const viewStart = publicRoomView(room, villager.socketId);
+  assert.deepEqual(
+    viewStart.players.map((p) => p.seatIndex),
+    [0, 1, 2, 3, 4, 5],
+    "seatIndex phải tuần tự 0..5 cho vòng ghế 3D"
+  );
+  assert.equal(viewStart.players[0].initialRole, undefined, "Không lộ initialRole khi trận chưa kết thúc");
+  assert.equal(viewStart.game.deadWolfCount, 0);
+
+  // Khi 1 Sói chết -> deadWolfCount tăng lên 1 để HUD Phe Dân đếm chuẩn Sói còn lại
+  w1.alive = false;
+  const viewMid = publicRoomView(room, villager.socketId);
+  assert.equal(viewMid.game.deadWolfCount, 1, "deadWolfCount phải tăng lên 1 khi 1 Sói chết");
 });
 
 const totalMs = (performance.now() - startTime).toFixed(1);

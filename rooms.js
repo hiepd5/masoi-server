@@ -86,6 +86,7 @@ export function addPlayer(code, socketId, requestedName, avatarSeed = null, avat
         : getAvatarUrl(name + "-" + socketId.slice(0, 4))),
     isHost: room.players.length === 0,
     ready: room.players.length === 0,
+    seatIndex: room.players.length,
     alive: true,
     role: null,
   };
@@ -129,6 +130,9 @@ export function removePlayer(code, socketId) {
 
   if (room.phase === "lobby") {
     room.players = room.players.filter((p) => p.id !== player.id);
+    room.players.forEach((p, idx) => {
+      p.seatIndex = idx;
+    });
     // Chuyển host (ưu tiên người thật hơn Bot)
     if (room.players.length > 0 && !room.players.some((p) => p.isHost)) {
       const nextHost = room.players.find((p) => !p.isBot) || room.players[0];
@@ -250,10 +254,11 @@ export function publicRoomView(room, forSocketId) {
           forcedRole: (me && room.devForcedRoles?.[me.id]) || null,
         }
       : undefined,
-    players: room.players.map((p) => ({
+    players: room.players.map((p, idx) => ({
       id: p.id,
       name: p.name,
       avatar: p.avatar,
+      seatIndex: typeof p.seatIndex === "number" ? p.seatIndex : idx,
       isHost: p.isHost,
       isBot: Boolean(p.isBot),
       ready: p.isHost ? true : Boolean(p.ready),
@@ -262,6 +267,7 @@ export function publicRoomView(room, forSocketId) {
       sessionToken: p.id === me?.id ? p.sessionToken : undefined,
       // chỉ trả về role của chính người xem, hoặc nếu game đã kết thúc, hoặc đã chết (lộ bài)
       role: p.id === me?.id || gameOver || !p.alive ? p.role : null,
+      initialRole: gameOver ? (p.initialRole || p.role) : undefined,
     })),
   };
 
@@ -274,6 +280,7 @@ export function publicRoomView(room, forSocketId) {
       dayNumber: g.dayNumber,
       nightDayPhase: g.phase,
       roleCounts: g.roleCounts,
+      deadWolfCount: room.players.filter((p) => !p.alive && p.role === "wolf").length,
       nightDeaths: ["day_reveal", "day_discuss", "day_nominate", "day_defense", "day_final_vote", "day_no_nomination"].includes(
         g.phase
       )

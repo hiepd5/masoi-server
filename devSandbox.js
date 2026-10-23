@@ -154,6 +154,7 @@ export function registerDevSocketHandlers(socket, gameCtrl, broadcastRoom) {
           avatar: `https://api.dicebear.com/7.x/bottts/svg?seed=${seed}&backgroundColor=b6e3f4,c0aede,d1d4f9`,
           isHost: false,
           ready: true,
+          seatIndex: room.players.length,
           alive: true,
           role: null,
         });
