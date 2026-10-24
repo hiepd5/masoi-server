@@ -26,6 +26,7 @@ export function createRoom(hostSocketId) {
     code,
     hostId: hostSocketId,
     phase: "lobby",
+    scenePresetId: "nordic_village_v3",
     players: [],
     rolesConfig: generateDefaultRoles(6),
     lobbyMessages: [],
@@ -210,6 +211,28 @@ export function setRolesConfig(code, requesterSocketId, newConfig) {
   return { ok: true, room };
 }
 
+export function setScenePreset(code, requesterSocketId, presetId) {
+  const room = getRoom(code);
+  if (!room) return { error: "Phòng không tồn tại." };
+  if (room.phase !== "lobby") {
+    return { error: "Chỉ có thể đổi bối cảnh khi đang ở phòng chờ." };
+  }
+  const player = room.players.find(
+    (p) => p.socketId === requesterSocketId || p.id === requesterSocketId
+  );
+  if (!player || !player.isHost) {
+    return { error: "Chỉ chủ phòng mới có quyền chọn bối cảnh không gian." };
+  }
+  const safeId = String(presetId || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, "");
+  if (!safeId) {
+    return { error: "Mã bối cảnh không hợp lệ." };
+  }
+  room.scenePresetId = safeId;
+  return { ok: true, room, scenePresetId: safeId };
+}
+
 export function addLobbyMessage(code, senderSocketId, text) {
   const room = getRoom(code);
   if (!room) return null;
@@ -246,6 +269,7 @@ export function publicRoomView(room, forSocketId) {
   const base = {
     code: room.code,
     phase: room.phase, // 'lobby' | 'playing' | 'ended'
+    scenePresetId: room.scenePresetId || "nordic_village_v3",
     rolesConfig: room.rolesConfig || generateDefaultRoles(room.players.length),
     lobbyMessages: room.lobbyMessages || [],
     devSandbox: isLocalDev
@@ -299,6 +323,7 @@ export function publicRoomView(room, forSocketId) {
       finalVotes: g.phase === "day_final_vote" ? g.finalVotes : {},
       winner: g.winner,
       history: gameOver ? g.history : [],
+      replayTimeline: gameOver ? (g.replayTimeline || []) : [],
       awards: gameOver ? (g.awards || []) : [],
       skipDiscussVotes: g.phase === 'day_discuss' ? g.skipDiscussVotes : {},
 

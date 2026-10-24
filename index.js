@@ -11,6 +11,7 @@ import {
   renamePlayer,
   toggleReady,
   setRolesConfig,
+  setScenePreset,
   addLobbyMessage,
   publicRoomView,
 } from "./rooms.js";
@@ -21,12 +22,94 @@ import { AccessToken } from "livekit-server-sdk";
 import https from "https";
 import fs from "fs";
 import path from "path";
+import { execFile } from "child_process";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const VILLAGE_LAYOUT_PATH = path.resolve(__dirname, "../client/public/config/village_layout.json");
-const VILLAGE_LAYOUT_BACKUP_PATH = path.resolve(__dirname, "../client/public/config/village_layout.backup.json");
+const CONFIG_DIR = path.resolve(__dirname, "../client/public/config");
+const VILLAGE_LAYOUT_PATH = path.join(CONFIG_DIR, "village_layout.json");
+const PRESETS_DIR = path.join(CONFIG_DIR, "presets");
+const PRESETS_INDEX_PATH = path.join(CONFIG_DIR, "scene_presets_index.json");
+const LAYOUT_BACKUPS_DIR = path.resolve(__dirname, "../data/layout_backups");
+const VILLAGE_LAYOUT_BACKUP_PATH = path.join(LAYOUT_BACKUPS_DIR, "village_layout.backup.json");
+const LEGACY_PUBLIC_BACKUP_PATH = path.join(CONFIG_DIR, "village_layout.backup.json");
+const SYNC_TRIPO_SCRIPT_PATH = path.resolve(__dirname, "../scripts/sync_tripo_models.mjs");
+const CONCEPTS_MANIFEST_PATH = path.resolve(
+  __dirname,
+  "../client/public/models/props/concepts_manifest.json"
+);
+
+// Tự động dọn file .backup.json cũ ra khỏi client/public/config/ sang data/layout_backups/ để thư mục Web sạch 100%
+try {
+  if (fs.existsSync(LEGACY_PUBLIC_BACKUP_PATH)) {
+    fs.mkdirSync(LAYOUT_BACKUPS_DIR, { recursive: true });
+    fs.copyFileSync(LEGACY_PUBLIC_BACKUP_PATH, VILLAGE_LAYOUT_BACKUP_PATH);
+    fs.unlinkSync(LEGACY_PUBLIC_BACKUP_PATH);
+  }
+} catch {
+  // ignore
+}
+
+function readScenePresetsIndexSafe() {
+  const defaultBuiltIn = {
+    id: "nordic_village_v3",
+    name: "🌲 Làng Bắc Âu V3 (Chuẩn 141 thực thể)",
+    description: "Bối cảnh rừng thông Bắc Âu sương mù, nhà gỗ & lửa trại mặc định (Bản Lề V3)",
+    url: "/config/village_layout.json",
+    builtIn: true,
+    nodeCount: 141,
+    moodHint: "auto",
+  };
+  try {
+    if (fs.existsSync(PRESETS_INDEX_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(PRESETS_INDEX_PATH, "utf8"));
+      const list = Array.isArray(raw?.presets) ? raw.presets : [];
+      if (!list.some((p) => p.id === "nordic_village_v3")) {
+        list.unshift(defaultBuiltIn);
+      }
+      return {
+        schemaVersion: 1,
+        defaultPresetId: raw?.defaultPresetId || "nordic_village_v3",
+        updatedAtIso: new Date().toISOString(),
+        presets: list,
+      };
+    }
+  } catch {
+    // fallback below
+  }
+  return {
+    schemaVersion: 1,
+    defaultPresetId: "nordic_village_v3",
+    updatedAtIso: new Date().toISOString(),
+    presets: [defaultBuiltIn],
+  };
+}
+
+function writeScenePresetsIndexSafe(indexDoc) {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  const payload = {
+    schemaVersion: 1,
+    defaultPresetId: indexDoc.defaultPresetId || "nordic_village_v3",
+    updatedAtIso: new Date().toISOString(),
+    presets: indexDoc.presets || [],
+  };
+  fs.writeFileSync(PRESETS_INDEX_PATH, JSON.stringify(payload, null, 2) + "\n", "utf8");
+  return payload;
+}
+
+function slugifyPresetId(raw) {
+  const cleaned = String(raw || "custom_scene")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 44);
+  const base = cleaned || `scene_${Date.now().toString(36).slice(-5)}`;
+  return base.startsWith("preset_") ? base : `preset_${base}`;
+}
 
 const LIVEKIT_URL = process.env.LIVEKIT_URL || "wss://ma-soi-online-rac6j8ri.livekit.cloud";
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || "APIQ2WP9w5JhSKX";
@@ -81,6 +164,68 @@ function isLocalDevRequest(req) {
 // Health check — Render dùng để verify server alive
 app.get("/", (req, res) => res.json({ status: "ok", game: "Ma Soi Online", uptime: process.uptime() }));
 
+// API Tự động quét kho phụ kiện/tạo hình .GLB 8 Vai từ Tripo AI (0 lỗi 404 console!)
+const ROLE_MODELS_DIR = path.resolve(__dirname, "../client/public/models/roles");
+const ROLE_MANIFEST_PATH = path.join(ROLE_MODELS_DIR, "roles_manifest.json");
+
+app.get("/api/role-models", (req, res) => {
+  try {
+    fs.mkdirSync(ROLE_MODELS_DIR, { recursive: true });
+    const files = fs.readdirSync(ROLE_MODELS_DIR);
+    const roles = {};
+    files.forEach((f) => {
+      const m = /^role_([a-z0-9_]+)\.glb$/i.exec(f);
+      if (m) {
+        const key = m[1].toLowerCase();
+        roles[key] = `/models/roles/${f}`;
+      }
+    });
+    if (isLocalDevRequest(req)) {
+      const manifestDoc = {
+        schemaVersion: 1,
+        updatedAtIso: new Date().toISOString(),
+        note: "Thả file role_<key>.glb từ Tripo AI vào cùng thư mục này — Hệ thống sẽ tự động nhận diện và gắn lên nhân vật 3D!",
+        roles,
+      };
+      fs.writeFileSync(ROLE_MANIFEST_PATH, JSON.stringify(manifestDoc, null, 2) + "\n", "utf8");
+    }
+    return res.json({ ok: true, roles });
+  } catch (err) {
+    return res.json({ ok: true, roles: {} });
+  }
+});
+
+// API Tự động quét Kho 9 Nhân Vật Có Xương Auto-Rig .GLB từ Tripo AI (1 Dân Làng Ẩn Danh + 8 Vai Thật — 0 lỗi 404 console!)
+const CHARACTER_MODELS_DIR = path.resolve(__dirname, "../client/public/models/characters");
+const CHARACTER_MANIFEST_PATH = path.join(CHARACTER_MODELS_DIR, "characters_manifest.json");
+
+app.get("/api/character-models", (req, res) => {
+  try {
+    fs.mkdirSync(CHARACTER_MODELS_DIR, { recursive: true });
+    const files = fs.readdirSync(CHARACTER_MODELS_DIR);
+    const characters = {};
+    files.forEach((f) => {
+      const m = /^char_([a-z0-9_]+)\.glb$/i.exec(f);
+      if (m) {
+        const key = m[1].toLowerCase();
+        characters[key] = `/models/characters/${f}`;
+      }
+    });
+    if (isLocalDevRequest(req)) {
+      const manifestDoc = {
+        schemaVersion: 1,
+        updatedAtIso: new Date().toISOString(),
+        note: "Thả 9 file char_<key>.glb có xương Auto-Rig từ Tripo AI vào thư mục này — Engine tự động gập chân ngồi ghế 0.48m và diễn hoạt Đầu/Lưng/Tay!",
+        characters,
+      };
+      fs.writeFileSync(CHARACTER_MANIFEST_PATH, JSON.stringify(manifestDoc, null, 2) + "\n", "utf8");
+    }
+    return res.json({ ok: true, characters });
+  } catch (err) {
+    return res.json({ ok: true, characters: {} });
+  }
+});
+
 // API Nội Bộ Dev (D5 Architect Studio): Lưu cố định bố cục cảnh quan vào client/public/config/village_layout.json
 app.post("/api/dev/village-layout", (req, res) => {
   if (!isLocalDevRequest(req)) {
@@ -95,6 +240,7 @@ app.post("/api/dev/village-layout", (req, res) => {
     const safeNodes = body.nodes.filter((n) => n && n.type && n.type !== "prop_chair");
 
     fs.mkdirSync(path.dirname(VILLAGE_LAYOUT_PATH), { recursive: true });
+    fs.mkdirSync(LAYOUT_BACKUPS_DIR, { recursive: true });
     if (fs.existsSync(VILLAGE_LAYOUT_PATH)) {
       fs.copyFileSync(VILLAGE_LAYOUT_PATH, VILLAGE_LAYOUT_BACKUP_PATH);
     }
@@ -111,14 +257,186 @@ app.post("/api/dev/village-layout", (req, res) => {
     };
 
     fs.writeFileSync(VILLAGE_LAYOUT_PATH, JSON.stringify(doc, null, 2) + "\n", "utf8");
+
+    const indexDoc = readScenePresetsIndexSafe();
+    indexDoc.presets = indexDoc.presets.map((p) =>
+      p.id === "nordic_village_v3"
+        ? { ...p, nodeCount: safeNodes.length, updatedAtIso: doc.updatedAtIso }
+        : p
+    );
+    writeScenePresetsIndexSafe(indexDoc);
+
     return res.json({
       ok: true,
       savedCount: safeNodes.length,
       filePath: "client/public/config/village_layout.json",
+      presetsIndex: indexDoc,
     });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
+});
+
+// API Nội Bộ Dev: Lưu / Tạo mới / Đổi tên / Đặt mặc định Bối Cảnh Tùy Chọn (Multi-Scene Presets)
+app.post("/api/dev/scene-presets", (req, res) => {
+  if (!isLocalDevRequest(req)) {
+    return res.status(403).json({ ok: false, error: "Chỉ cho phép quản lý bối cảnh trên máy Dev Local." });
+  }
+  try {
+    const body = req.body || {};
+    if (!Array.isArray(body.nodes) || body.nodes.length === 0) {
+      return res.status(400).json({ ok: false, error: "Danh sách nodes[] của bối cảnh không được rỗng." });
+    }
+    const safeNodes = body.nodes.filter((n) => n && n.type && n.type !== "prop_chair");
+    const isBuiltInV3 = body.presetId === "nordic_village_v3";
+    const finalId = isBuiltInV3
+      ? "nordic_village_v3"
+      : slugifyPresetId(body.presetId || body.name || "boi_canh_moi");
+
+    const targetFilePath = isBuiltInV3
+      ? VILLAGE_LAYOUT_PATH
+      : path.join(PRESETS_DIR, `${finalId}.json`);
+    const publicUrl = isBuiltInV3
+      ? "/config/village_layout.json"
+      : `/config/presets/${finalId}.json`;
+
+    fs.mkdirSync(path.dirname(targetFilePath), { recursive: true });
+    fs.mkdirSync(LAYOUT_BACKUPS_DIR, { recursive: true });
+    if (fs.existsSync(targetFilePath)) {
+      fs.copyFileSync(
+        targetFilePath,
+        path.join(LAYOUT_BACKUPS_DIR, `${finalId}.backup.json`)
+      );
+    }
+
+    const indexDoc = readScenePresetsIndexSafe();
+    const existingMeta = indexDoc.presets.find((p) => p.id === finalId) || null;
+    const finalName =
+      (typeof body.name === "string" && body.name.trim()) ||
+      existingMeta?.name ||
+      `🗺️ Bối cảnh ${finalId.replace(/^preset_/, "")}`;
+    const finalDescription =
+      (typeof body.description === "string" && body.description.trim()) ||
+      existingMeta?.description ||
+      "Bối cảnh tùy chọn dàn dựng bằng D5 Studio & Kho Concept Tripo";
+    const finalMoodHint = body.moodHint || existingMeta?.moodHint || "auto";
+
+    const doc = {
+      schemaVersion: Number(body.schemaVersion || 1),
+      presetId: finalId,
+      name: finalName,
+      description: finalDescription,
+      moodHint: finalMoodHint,
+      updatedAtMs: Date.now(),
+      updatedAtIso: new Date().toISOString(),
+      note: "Bối cảnh không gian 3D Làng Ma Sói dàn dựng bằng D5 Architect Studio (Không tác động ghế người chơi)",
+      totalNodes: safeNodes.length,
+      nodes: safeNodes,
+    };
+
+    fs.writeFileSync(targetFilePath, JSON.stringify(doc, null, 2) + "\n", "utf8");
+
+    const upsertedMeta = {
+      id: finalId,
+      name: finalName,
+      description: finalDescription,
+      url: publicUrl,
+      builtIn: isBuiltInV3,
+      nodeCount: safeNodes.length,
+      moodHint: finalMoodHint,
+      updatedAtIso: doc.updatedAtIso,
+    };
+
+    if (existingMeta) {
+      indexDoc.presets = indexDoc.presets.map((p) => (p.id === finalId ? upsertedMeta : p));
+    } else {
+      indexDoc.presets.push(upsertedMeta);
+    }
+
+    if (body.setAsDefault === true) {
+      indexDoc.defaultPresetId = finalId;
+    }
+
+    const savedIndex = writeScenePresetsIndexSafe(indexDoc);
+    return res.json({
+      ok: true,
+      savedCount: safeNodes.length,
+      preset: upsertedMeta,
+      presetsIndex: savedIndex,
+      filePath: isBuiltInV3
+        ? "client/public/config/village_layout.json"
+        : `client/public/config/presets/${finalId}.json`,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// API Nội Bộ Dev: Xóa 1 Bối Cảnh Tùy Chọn (Khóa cứng bảo vệ Bản Lề V3 gốc!)
+app.delete("/api/dev/scene-presets/:presetId", (req, res) => {
+  if (!isLocalDevRequest(req)) {
+    return res.status(403).json({ ok: false, error: "Chỉ cho phép xóa bối cảnh trên máy Dev Local." });
+  }
+  try {
+    const rawId = String(req.params.presetId || "").trim();
+    if (!rawId || rawId === "nordic_village_v3") {
+      return res.status(400).json({
+        ok: false,
+        error: "Bản Lề V3 gốc (nordic_village_v3) được bảo vệ bất khả xâm phạm, không thể xóa!",
+      });
+    }
+    const safeId = rawId.replace(/[^a-zA-Z0-9_-]/g, "");
+    const targetFilePath = path.join(PRESETS_DIR, `${safeId}.json`);
+    if (fs.existsSync(targetFilePath)) {
+      fs.mkdirSync(LAYOUT_BACKUPS_DIR, { recursive: true });
+      fs.copyFileSync(targetFilePath, path.join(LAYOUT_BACKUPS_DIR, `${safeId}.deleted.json`));
+      fs.unlinkSync(targetFilePath);
+    }
+
+    const indexDoc = readScenePresetsIndexSafe();
+    indexDoc.presets = indexDoc.presets.filter((p) => p.id !== safeId);
+    if (indexDoc.defaultPresetId === safeId) {
+      indexDoc.defaultPresetId = "nordic_village_v3";
+    }
+    const savedIndex = writeScenePresetsIndexSafe(indexDoc);
+    return res.json({ ok: true, deletedId: safeId, presetsIndex: savedIndex });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// API Nội Bộ Dev: Quét nóng thư mục "MODEL CONCEPT THEM" 1-Click ngay trong D5 Studio!
+app.post("/api/dev/sync-tripo-concepts", (req, res) => {
+  if (!isLocalDevRequest(req)) {
+    return res.status(403).json({ ok: false, error: "Chỉ cho phép quét kho Tripo trên máy Dev Local." });
+  }
+  execFile(
+    process.execPath,
+    [SYNC_TRIPO_SCRIPT_PATH],
+    { cwd: path.resolve(__dirname, ".."), timeout: 30000 },
+    (err, stdout, stderr) => {
+      if (err) {
+        return res.status(500).json({
+          ok: false,
+          error: stderr || err.message || "Lỗi chạy sync_tripo_models.mjs",
+        });
+      }
+      let manifest = { totalConcepts: 0, items: [] };
+      try {
+        if (fs.existsSync(CONCEPTS_MANIFEST_PATH)) {
+          manifest = JSON.parse(fs.readFileSync(CONCEPTS_MANIFEST_PATH, "utf8"));
+        }
+      } catch {
+        // ignore
+      }
+      return res.json({
+        ok: true,
+        totalConcepts: manifest.totalConcepts || 0,
+        items: manifest.items || [],
+        log: String(stdout || "").trim(),
+      });
+    }
+  );
 });
 
 const httpServer = createServer(app);
@@ -232,6 +550,15 @@ io.on("connection", (socket) => {
     if (result.error) return cb?.({ ok: false, error: result.error });
     broadcastRoom(result.room);
     cb?.({ ok: true });
+  });
+
+  socket.on("room:setScenePreset", ({ presetId } = {}, cb) => {
+    const code = socket.data.roomCode;
+    if (!code) return cb?.({ ok: false, error: "Bạn chưa ở trong phòng." });
+    const result = setScenePreset(code, socket.id, presetId);
+    if (result.error) return cb?.({ ok: false, error: result.error });
+    broadcastRoom(result.room);
+    cb?.({ ok: true, scenePresetId: result.scenePresetId });
   });
 
   socket.on("room:lobbyChat", ({ message }, cb) => {
@@ -358,6 +685,18 @@ io.on("connection", (socket) => {
   socket.on("action:wolfChat", ({ message }, cb) => {
     withPlayer((room, player) => {
       if (player.role !== "wolf") return;
+      const cleanMsg = String(message || "").trim();
+      if (cleanMsg && room.game && !room.game.winner) {
+        const myTargetId = room.game.wolfPicks?.[player.id]?.targetId || null;
+        gameCtrl.recordReplayEvent?.(room, {
+          kind: "wolf_chat",
+          actorId: player.id,
+          actorRole: "wolf",
+          targetId: myTargetId,
+          chatText: cleanMsg,
+          caption: `🐺 [Mật đàm Sói] ${player.name}: "${cleanMsg.slice(0, 90)}"`,
+        });
+      }
       room.players.forEach(p => {
         if (p.role === "wolf" && p.id !== player.id && p.connected && p.socketId) {
           io.to(p.socketId).emit("wolf:chat", { senderId: player.id, message });
@@ -373,6 +712,16 @@ io.on("connection", (socket) => {
       
       // BUG 10 FIX: Thêm optional chaining để tránh crash khi room.game là null
       if (room.game?.phase?.startsWith("night_")) return cb?.({ ok: false, error: "Ban đêm không được chat ồn ào!" });
+
+      const cleanMsg = String(message || "").trim();
+      if (cleanMsg && room.game && !room.game.winner) {
+        gameCtrl.recordReplayEvent?.(room, {
+          kind: "village_chat",
+          actorId: player.id,
+          chatText: cleanMsg,
+          caption: `💬 ${player.name}: "${cleanMsg.slice(0, 90)}"`,
+        });
+      }
 
       io.to(room.code).emit("village:chat", { 
         senderId: player.id, 
@@ -449,6 +798,20 @@ io.on("connection", (socket) => {
   socket.on('reaction', ({ emoji, name }) => {
     const code = socket.data.roomCode;
     if (!code) return;
+    const room = getRoom(code);
+    if (room?.game && !room.game.winner && emoji) {
+      const sender =
+        room.players.find((p) => p.socketId === socket.id) ||
+        room.players.find((p) => p.id === socket.data.playerId);
+      if (sender) {
+        gameCtrl.recordReplayEvent?.(room, {
+          kind: "reaction",
+          actorId: sender.id,
+          emoji: String(emoji).slice(0, 8),
+          caption: `${emoji} ${sender.name} thả biểu cảm giữa vòng tròn làng.`,
+        });
+      }
+    }
     io.to(code).emit('reaction:broadcast', { emoji, name, senderId: socket.id });
   });
 

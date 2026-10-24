@@ -70,11 +70,89 @@ export function initGameState(room) {
 
     winner: null, // 'wolf' | 'village' | 'tanner' | null
 
-    // Lịch sử hành động cho Recap
+    // Lịch sử hành động cho Recap & Băng ghi hình không gian 3D (Zero-Leak khi đang chơi)
     history: [], // [{ type, day, sourceId, targetId, text }]
+    replayTimeline: [], // [{ seq, ts, elapsedMs, day, phase, isNight, kind, actorId, actorRole, targetId, ... }]
+    _replaySeq: 0,
   };
 
   return room;
+}
+
+// ============ MÁY QUAY SỰ THẬT NGẦM (SHADOW REALITY RECORDER) ============
+const MILESTONE_REPLAY_KINDS = new Set([
+  "wolf_strike",
+  "shield_block",
+  "witch_save",
+  "witch_poison",
+  "seer_scan",
+  "cursed_turn",
+  "tough_endure",
+  "night_death",
+  "day_defense",
+  "day_verdict",
+]);
+
+export function recordReplayEvent(room, evt = {}) {
+  const g = room?.game;
+  if (!g) return null;
+  if (!Array.isArray(g.replayTimeline)) g.replayTimeline = [];
+  if (typeof g._replaySeq !== "number") g._replaySeq = g.replayTimeline.length;
+
+  const now = Date.now();
+  const phase = evt.phase || g.phase || "night_guard";
+  const actor = evt.actorId ? getPlayer(room, evt.actorId) : null;
+  const target = evt.targetId ? getPlayer(room, evt.targetId) : null;
+
+  const frame = {
+    seq: ++g._replaySeq,
+    ts: now,
+    elapsedMs: Math.max(0, now - (g.gameStartedAt || now)),
+    day: g.dayNumber || 1,
+    phase,
+    isNight: String(phase).startsWith("night_"),
+    kind: evt.kind || "event",
+    actorId: evt.actorId || null,
+    actorRole: evt.actorRole || actor?.initialRole || actor?.role || null,
+    coActorIds: Array.isArray(evt.coActorIds) ? evt.coActorIds : [],
+    targetId: evt.targetId || null,
+    prevTargetId: evt.prevTargetId || null,
+    targetRole: evt.targetRole || target?.initialRole || target?.role || null,
+    chatText: evt.chatText ? String(evt.chatText).trim().slice(0, 120) : null,
+    emoji: evt.emoji || null,
+    decision: evt.decision || null,
+    votesSnapshot: evt.votesSnapshot || null,
+    aliveIds: (room.players || []).filter((p) => p.alive).map((p) => p.id),
+    wolfIdsNow: (room.players || []).filter((p) => p.role === "wolf").map((p) => p.id),
+    caption: evt.caption || "",
+  };
+
+  const last = g.replayTimeline[g.replayTimeline.length - 1];
+  if (
+    last &&
+    !MILESTONE_REPLAY_KINDS.has(frame.kind) &&
+    last.kind === frame.kind &&
+    last.actorId === frame.actorId &&
+    last.day === frame.day &&
+    now - last.ts < 250
+  ) {
+    frame.seq = last.seq;
+    frame.prevTargetId = last.prevTargetId || last.targetId || frame.prevTargetId;
+    g.replayTimeline[g.replayTimeline.length - 1] = frame;
+    return frame;
+  }
+
+  if (g.replayTimeline.length >= 260) {
+    const dropIdx = g.replayTimeline.findIndex((item) => !MILESTONE_REPLAY_KINDS.has(item.kind));
+    if (dropIdx >= 0) {
+      g.replayTimeline.splice(dropIdx, 1);
+    } else {
+      g.replayTimeline.shift();
+    }
+  }
+
+  g.replayTimeline.push(frame);
+  return frame;
 }
 
 // ============ HELPER ============
@@ -105,7 +183,23 @@ export function guardProtect(room, guardId, targetId) {
   const target = getPlayer(room, targetId);
   if (!target?.alive) return { error: "Người chơi này đã chết." };
 
+  const prevTargetId = g.guardedIdTonight || null;
   g.guardedIdTonight = targetId;
+
+  const prevName = prevTargetId ? getPlayer(room, prevTargetId)?.name : null;
+  recordReplayEvent(room, {
+    kind: "guard_pick",
+    phase: "night_guard",
+    actorId: guardId,
+    actorRole: "guard",
+    targetId,
+    prevTargetId,
+    caption:
+      prevTargetId && prevTargetId !== targetId
+        ? `🛡️ ${guard.name} đổi ý, chuyển khiên sang canh gác cho ${target.name} (trước đó chọn ${prevName})!`
+        : `🛡️ ${guard.name} lặng lẽ giương khiên sồi che chở cho ${target.name} trong đêm.`,
+  });
+
   return { ok: true };
 }
 
@@ -147,7 +241,23 @@ export function wolfPick(room, wolfId, targetId) {
   // Không thể cắn đồng đội Sói
   if (target.role === "wolf") return { error: "Không thể cắn đồng loại." };
 
+  const prevTargetId = g.wolfPicks[wolfId]?.targetId || null;
   g.wolfPicks[wolfId] = { targetId, timestamp: Date.now() };
+
+  const prevName = prevTargetId ? getPlayer(room, prevTargetId)?.name : null;
+  recordReplayEvent(room, {
+    kind: "wolf_aim",
+    phase: "night_wolf",
+    actorId: wolfId,
+    actorRole: "wolf",
+    targetId,
+    prevTargetId,
+    caption:
+      prevTargetId && prevTargetId !== targetId
+        ? `🐺 ${wolf.name} chần chừ rồi đổi móng vuốt từ ${prevName} sang ${target.name}!`
+        : `🐺 ${wolf.name} nhe nanh chỉ móng vuốt nhắm vào ${target.name}...`,
+  });
+
   return { ok: true };
 }
 
@@ -185,18 +295,46 @@ export function resolveWolfVictim(room) {
 export function endWolfPhase(room) {
   resolveWolfVictim(room);
   const g = room.game;
+  const aliveWolves = aliveByRole(room, "wolf");
+  const wolfIds = aliveWolves.map((w) => w.id);
+
+  // Tìm con Sói đã chốt mục tiêu này sớm nhất (hoặc Sói đầu đàn) để làm ghế xuất phát tia VFX 3D
+  let leadWolfId = wolfIds[0] || null;
+  if (g.wolfVictimId && g.wolfPicks) {
+    let minTs = Infinity;
+    Object.entries(g.wolfPicks).forEach(([wId, pick]) => {
+      if (pick?.targetId === g.wolfVictimId && pick.timestamp < minTs) {
+        minTs = pick.timestamp;
+        leadWolfId = wId;
+      }
+    });
+  }
+
   if (g.wolfVictimId) {
     const targetName = getPlayer(room, g.wolfVictimId)?.name;
     g.history.push({
       type: "wolf",
       day: g.dayNumber,
+      sourceId: leadWolfId,
+      wolfIds,
       targetId: g.wolfVictimId,
       text: `Đàn sói đã thống nhất cắn ${targetName}.`
+    });
+    recordReplayEvent(room, {
+      kind: "wolf_strike",
+      phase: "night_wolf",
+      actorId: leadWolfId,
+      actorRole: "wolf",
+      coActorIds: wolfIds,
+      targetId: g.wolfVictimId,
+      caption: `🐺 Bầy Sói thống nhất lao tới tung đòn chí mạng vào ${targetName}!`,
     });
   } else {
     g.history.push({
       type: "wolf",
       day: g.dayNumber,
+      sourceId: leadWolfId,
+      wolfIds,
       text: "Đêm nay đàn sói không cắn ai."
     });
   }
@@ -217,6 +355,15 @@ export function witchDecide(room, witchId, { save, poisonTargetId }) {
     if (!g.wolfVictimId) return { error: "Không có ai để cứu đêm nay." };
     g.witchSaveTonight = true;
     g.witchUsedSave = true;
+    const victimName = getPlayer(room, g.wolfVictimId)?.name || "nạn nhân";
+    recordReplayEvent(room, {
+      kind: "witch_save",
+      phase: "night_witch",
+      actorId: witchId,
+      actorRole: "witch",
+      targetId: g.wolfVictimId,
+      caption: `🧪 ${witch.name} ném Bình Dược Lục Bảo cứu mạng ${victimName} ngay trước lưỡi hái tử thần!`,
+    });
   }
 
   if (poisonTargetId) {
@@ -226,6 +373,14 @@ export function witchDecide(room, witchId, { save, poisonTargetId }) {
     if (!poisonTarget?.alive) return { error: "Người chơi này đã chết." };
     g.witchPoisonTargetId = poisonTargetId;
     g.witchUsedPoison = true;
+    recordReplayEvent(room, {
+      kind: "witch_poison",
+      phase: "night_witch",
+      actorId: witchId,
+      actorRole: "witch",
+      targetId: poisonTargetId,
+      caption: `☠️ ${witch.name} tung Bình Độc Dược Tím hạ sát ${poisonTarget.name} trong màn sương!`,
+    });
   }
 
   return { ok: true };
@@ -233,11 +388,13 @@ export function witchDecide(room, witchId, { save, poisonTargetId }) {
 
 export function endWitchPhase(room) {
   const g = room.game;
+  const witchId = room.players.find((p) => p.role === "witch")?.id || null;
   if (g.witchSaveTonight) {
     const targetName = getPlayer(room, g.wolfVictimId)?.name;
     g.history.push({
       type: "witch_save",
       day: g.dayNumber,
+      sourceId: witchId,
       targetId: g.wolfVictimId,
       text: `Phù thủy đã dùng bình cứu để cứu ${targetName}.`
     });
@@ -247,6 +404,7 @@ export function endWitchPhase(room) {
     g.history.push({
       type: "witch_poison",
       day: g.dayNumber,
+      sourceId: witchId,
       targetId: g.witchPoisonTargetId,
       text: `Phù thủy đã dùng bình độc để giết ${targetName}.`
     });
@@ -266,6 +424,19 @@ export function seerCheck(room, seerId, targetId) {
   const target = getPlayer(room, targetId);
   const result = target?.role === "wolf" ? "wolf" : "not_wolf";
   g.seerChecksLog.push({ seerId, targetId, dayNumber: g.dayNumber, result });
+
+  recordReplayEvent(room, {
+    kind: "seer_scan",
+    phase: "night_seer",
+    actorId: seerId,
+    actorRole: "seer",
+    targetId,
+    decision: result,
+    caption: `🔮 ${seer.name} khai mở Mắt Thần soi thấu ${target?.name || ""}: ${
+      result === "wolf" ? "PHÁT HIỆN MA SÓI!" : "Tâm hồn trong sạch (Phe Dân)."
+    }`,
+  });
+
   return { ok: true, result };
 }
 
@@ -307,6 +478,22 @@ export function resolveNightDeaths(room) {
     }
   }
 
+  const guardPlayer = room.players.find((p) => p.role === "guard");
+  const leadWolfPlayer = room.players.find((p) => p.role === "wolf" && p.alive) || room.players.find((p) => p.role === "wolf");
+
+  if (g.wolfVictimId && g.wolfVictimId === g.guardedIdTonight) {
+    const savedTarget = getPlayer(room, g.wolfVictimId);
+    recordReplayEvent(room, {
+      kind: "shield_block",
+      phase: "night_resolve",
+      actorId: guardPlayer?.id || null,
+      actorRole: "guard",
+      coActorIds: leadWolfPlayer ? [leadWolfPlayer.id] : [],
+      targetId: g.wolfVictimId,
+      caption: `🛡️ KENG!! Khiên của ${guardPlayer?.name || "Hộ Vệ"} chấn bật đòn vồ của Sói, cứu sống ${savedTarget?.name || ""}!`,
+    });
+  }
+
   const victimSaved =
     g.wolfVictimId && (g.wolfVictimId === g.guardedIdTonight || g.witchSaveTonight);
 
@@ -322,6 +509,15 @@ export function resolveNightDeaths(room) {
         targetId: victim.id,
         text: `Kẻ Bị Nguyền [${victim.name}] đã bị Sói cắn nhưng không chết, mà dòng máu Sói đã thức tỉnh!`,
       });
+      recordReplayEvent(room, {
+        kind: "cursed_turn",
+        phase: "night_resolve",
+        actorId: leadWolfPlayer?.id || null,
+        actorRole: "wolf",
+        targetId: victim.id,
+        targetRole: "wolf",
+        caption: `🩸 Huyết nguyền bùng cháy! ${victim.name} không chết sau cú cắn mà thức tỉnh thành Ma Sói mới!`,
+      });
     } else if (victim?.role === "tough_guy") {
       // Người Cứng Cỏi: Bị Sói cắn -> Không chết ngay đêm nay, đánh dấu để đêm sau chết
       if (!g.toughGuyPoisonedDay) {
@@ -331,6 +527,15 @@ export function resolveNightDeaths(room) {
           day: g.dayNumber,
           targetId: victim.id,
           text: `Người Cứng Cỏi [${victim.name}] bị Sói tấn công nhưng đã kiên cường chịu đựng vết thương để sống sót qua ngày hôm nay!`,
+        });
+        recordReplayEvent(room, {
+          kind: "tough_endure",
+          phase: "night_resolve",
+          actorId: leadWolfPlayer?.id || null,
+          actorRole: "wolf",
+          targetId: victim.id,
+          targetRole: "tough_guy",
+          caption: `💪 ${victim.name} nghiến răng chịu đựng vết cắn sâu của Sói, gồng mình trụ vững đón bình minh!`,
         });
       }
     } else {
@@ -354,6 +559,13 @@ export function resolveNightDeaths(room) {
         targetRole: p.role,
         text: `${p.name} không qua khỏi đêm đẫm máu.`,
       });
+      recordReplayEvent(room, {
+        kind: "night_death",
+        phase: "day_reveal",
+        targetId: id,
+        targetRole: p.initialRole || p.role,
+        caption: `💀 Bình minh Ngày ${g.dayNumber} nhuốm máu — ${p.name} (${ROLE_LABELS[p.initialRole || p.role] || p.role}) gục ngã!`,
+      });
     }
   });
 
@@ -362,6 +574,11 @@ export function resolveNightDeaths(room) {
       type: "peaceful_night",
       day: g.dayNumber,
       text: "Đêm qua là một đêm bình yên, không ai chết!",
+    });
+    recordReplayEvent(room, {
+      kind: "peaceful_dawn",
+      phase: "day_reveal",
+      caption: `🌅 Bình minh Ngày ${g.dayNumber} thanh bình — cả ngôi làng vẫn toàn mạng!`,
     });
   }
 
@@ -447,7 +664,28 @@ export function nominationVote(room, voterId, targetId) {
   // Không thể tự đề cử mình
   if (voterId === targetId) return { error: "Không thể tự đề cử bản thân." };
 
+  const prevTargetId = g.nominationVotes[voterId]?.targetId || null;
   g.nominationVotes[voterId] = { targetId, timestamp: Date.now() };
+
+  const prevName = prevTargetId ? getPlayer(room, prevTargetId)?.name : null;
+  const votesSnap = {};
+  Object.entries(g.nominationVotes).forEach(([k, v]) => {
+    if (v?.targetId) votesSnap[k] = v.targetId;
+  });
+
+  recordReplayEvent(room, {
+    kind: "day_nominate",
+    phase: "day_nominate",
+    actorId: voterId,
+    targetId,
+    prevTargetId,
+    votesSnapshot: votesSnap,
+    caption:
+      prevTargetId && prevTargetId !== targetId
+        ? `👉 ${voter.name} quay ngoắt tay, đổi mũi dùi từ ${prevName} sang chỉ mặt ${target.name}!`
+        : `👉 ${voter.name} thẳng tay chỉ mặt đề cử ${target.name} lên ghế nóng!`,
+  });
+
   return { ok: true };
 }
 
@@ -498,6 +736,13 @@ export function finalizeNomination(room) {
       text: `Cả làng đã đề cử ${candidateNames.join(", ")} lên ghế nóng!`,
       votesDetail: { ...g.nominationVotes },
     });
+    recordReplayEvent(room, {
+      kind: "day_defense",
+      phase: "day_defense",
+      targetId: topCandidates[0].playerId,
+      coActorIds: topCandidates.map((c) => c.playerId),
+      caption: `⚖️ Cả làng vây quanh chất vấn ${candidateNames.join(", ")} trên Ghế Nóng!`,
+    });
   }
 
   return { nominees: topCandidates };
@@ -527,6 +772,19 @@ export function finalVote(room, voterId, decision) {
   if (!["hang", "spare"].includes(decision)) return { error: "Lựa chọn không hợp lệ." };
 
   g.finalVotes[voterId] = decision;
+  const defendantId = g.hotSeatQueue[g.hotSeatIndex] || null;
+  const defendant = defendantId ? getPlayer(room, defendantId) : null;
+  recordReplayEvent(room, {
+    kind: "day_final_vote",
+    phase: "day_final_vote",
+    actorId: voterId,
+    targetId: defendantId,
+    decision,
+    votesSnapshot: { ...g.finalVotes },
+    caption: `${decision === "hang" ? "👎" : "🕊️"} ${voter.name} giơ tay chọn ${
+      decision === "hang" ? "TREO CỔ" : "THA MẠNG"
+    } cho ${defendant?.name || "bị cáo"}!`,
+  });
   return { ok: true };
 }
 
@@ -561,6 +819,15 @@ export function resolveFinalVote(room) {
         tannerWin = true;
         g.winner = "tanner";
       }
+      recordReplayEvent(room, {
+        kind: "day_verdict",
+        phase: "day_final_vote",
+        targetId: defendantId,
+        targetRole: defendant.initialRole || defendant.role,
+        decision: "hang",
+        votesSnapshot: { ...g.finalVotes },
+        caption: `🪢 Phán quyết định đoạt! ${defendant.name} (${roleName}) bị treo cổ giữa pháp trường (${hangCount} Treo vs ${spareCount} Tha)!`,
+      });
     }
   } else {
     const defendant = getPlayer(room, defendantId);
@@ -575,6 +842,15 @@ export function resolveFinalVote(room) {
         spareCount,
         votesDetail: { ...g.finalVotes },
         text: `${defendant.name} đã được tha bổng (${spareCount} phiếu Tha vs ${hangCount} phiếu Treo).`
+      });
+      recordReplayEvent(room, {
+        kind: "day_verdict",
+        phase: "day_final_vote",
+        targetId: defendantId,
+        targetRole: defendant.initialRole || defendant.role,
+        decision: "spare",
+        votesSnapshot: { ...g.finalVotes },
+        caption: `🕊️ Làng mở đường sống! ${defendant.name} được tha bổng (${spareCount} Tha vs ${hangCount} Treo).`,
       });
     }
   }

@@ -98,6 +98,10 @@ export function createGameController(io) {
           me.role = desiredRole;
         }
       });
+      // Bảo toàn initialRole khớp vai gốc ban đầu kể cả khi ép vai bằng DevSandbox
+      room.players.forEach((p) => {
+        p.initialRole = p.role;
+      });
     }
 
     room.phase = "playing";
@@ -307,6 +311,7 @@ export function createGameController(io) {
     forceEndDiscussion: (room) => { beginNomination(room); },
     nominationVote: (room, id, targetId) => GE.nominationVote(room, id, targetId),
     finalVote: (room, id, decision) => GE.finalVote(room, id, decision),
+    recordReplayEvent: (room, evt) => GE.recordReplayEvent(room, evt),
     clearRoomTimer,
   };
 }

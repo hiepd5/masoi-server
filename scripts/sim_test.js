@@ -337,12 +337,14 @@ runScenario("11. DevSandbox Solo: +5 Bot tự Ready, Ép vai Phù Thủy, Tua Ph
   handlers["dev:skipPhase"]({}, () => {}); // day_reveal -> day_discuss
   assert.equal(room.game.phase, "day_discuss");
 
-  // Bot đồng loạt bấm Skip thảo luận + Host skip -> tự sang day_nominate
+  // Bot đồng loạt bấm Skip thảo luận + Host skip (nếu còn sống sau đêm Sói săn) -> tự sang day_nominate
   handlers["dev:botVote"]({ action: "skip_discuss" }, () => {});
-  const hostSkip = gameCtrl.voteSkipDiscussion(room, host.id);
-  if (hostSkip.allSkipped) {
-    gameCtrl.clearRoomTimer(room.code);
-    gameCtrl.forceEndDiscussion(room);
+  if (host.alive && room.game.phase === "day_discuss") {
+    const hostSkip = gameCtrl.voteSkipDiscussion(room, host.id);
+    if (hostSkip.allSkipped) {
+      gameCtrl.clearRoomTimer(room.code);
+      gameCtrl.forceEndDiscussion(room);
+    }
   }
   assert.equal(room.game.phase, "day_nominate");
 
@@ -353,7 +355,12 @@ runScenario("11. DevSandbox Solo: +5 Bot tự Ready, Ép vai Phù Thủy, Tua Ph
   handlers["dev:skipPhase"]({}, () => {}); // finishDefenseTurn -> day_final_vote
   assert.equal(room.game.phase, "day_final_vote");
   handlers["dev:botVote"]({ action: "vote_hang" }, () => {});
-  assert.equal(Object.values(room.game.finalVotes).filter((v) => v === "hang").length, 5);
+  const expectedAliveBots = room.players.filter((p) => p.isBot && p.alive).length;
+  assert.equal(Object.values(room.game.finalVotes).filter((v) => v === "hang").length, expectedAliveBots);
+  assert.ok(
+    room.game.replayTimeline.length >= 4,
+    "Khi bấm Tua Nhanh Phase (dev:skipPhase), hệ thống vẫn phải ghi đầy đủ băng Replay tương tác Bot"
+  );
 
   gameCtrl.clearRoomTimer(room.code);
 });
@@ -380,6 +387,104 @@ runScenario("12. 3D Stage Ready: seatIndex cố định, deadWolfCount chuẩn &
   w1.alive = false;
   const viewMid = publicRoomView(room, villager.socketId);
   assert.equal(viewMid.game.deadWolfCount, 1, "deadWolfCount phải tăng lên 1 khi 1 Sói chết");
+});
+
+// 13. Kiểm chứng Shadow Reality Recorder & Khóa Bảo Mật Zero-Leak Kết Game 100vw
+runScenario("13. Shadow Reality Recorder: ghi trọn tương tác Đêm/Ngày (kể cả đổi ý) & khóa Zero-Leak 100%", () => {
+  const room = makeTestRoom({
+    w1: "wolf", g1: "guard", wt: "witch", sr: "seer", v1: "villager", v2: "villager"
+  });
+  const wolf = room.players.find((p) => p.role === "wolf");
+  const guard = room.players.find((p) => p.role === "guard");
+  const witch = room.players.find((p) => p.role === "witch");
+  const seer = room.players.find((p) => p.role === "seer");
+  const v1 = room.players.find((p) => p.name === "Player_v1");
+  const v2 = room.players.find((p) => p.name === "Player_v2");
+
+  // Đêm 1: Bảo vệ gác v1; Sói nhắm v1 rồi đổi ý sang v2; Phù thủy cứu v2; Tiên tri soi trúng Sói
+  GE.guardProtect(room, guard.id, v1.id);
+  GE.endGuardPhase(room);
+
+  GE.wolfPick(room, wolf.id, v1.id);
+  room.game.replayTimeline[room.game.replayTimeline.length - 1].ts -= 400; // mô phỏng cách nhau >250ms
+  GE.recordReplayEvent(room, {
+    kind: "wolf_chat",
+    phase: "night_wolf",
+    actorId: wolf.id,
+    actorRole: "wolf",
+    targetId: v2.id,
+    chatText: "Khoan, v1 có Bảo Vệ gác rồi, chuyển sang cắn v2 đi!",
+  });
+  GE.wolfPick(room, wolf.id, v2.id);
+  GE.endWolfPhase(room);
+
+  GE.witchDecide(room, witch.id, { save: true });
+  GE.endWitchPhase(room);
+
+  GE.seerCheck(room, seer.id, wolf.id);
+  GE.endSeerPhase(room);
+  GE.resolveNightDeaths(room);
+
+  // KIỂM TRA BẢO MẬT ZERO-LEAK GIỮA VÁN: Người chơi tuyệt đối nhận replayTimeline = []
+  const midLiveView = publicRoomView(room, v1.socketId);
+  assert.deepEqual(
+    midLiveView.game.replayTimeline,
+    [],
+    "Zero-Leak: cấm rò rỉ dù chỉ 1 byte replayTimeline khi ván đấu chưa kết thúc!"
+  );
+
+  // Ban ngày: Dân làng chat + v1 chỉ tay v2 rồi quay ngoắt đổi sang chỉ mặt Sói -> Treo cổ Sói -> Phe Dân thắng!
+  GE.startDiscussion(room);
+  GE.recordReplayEvent(room, {
+    kind: "village_chat",
+    phase: "day_discuss",
+    actorId: seer.id,
+    chatText: "Đêm qua tôi đã soi thấy Sói rồi, mọi người theo tôi!",
+  });
+  GE.startNomination(room);
+  GE.nominationVote(room, v1.id, v2.id);
+  room.game.replayTimeline[room.game.replayTimeline.length - 1].ts -= 400;
+  GE.nominationVote(room, v1.id, wolf.id);
+  GE.nominationVote(room, seer.id, wolf.id);
+  GE.finalizeNomination(room);
+  GE.nextDefenseOrFinalVote(room); // day_defense
+  GE.nextDefenseOrFinalVote(room); // day_final_vote
+  GE.finalVote(room, v1.id, "hang");
+  GE.finalVote(room, seer.id, "hang");
+  GE.finalVote(room, guard.id, "hang");
+  GE.resolveFinalVote(room);
+  const win = GE.checkWinCondition(room);
+  assert.equal(win, "village");
+
+  // KIỂM TRA SAU KHI CÓ WINNER: publicRoomView mở khóa toàn bộ băng ghi hình không gian thật!
+  const endGameView = publicRoomView(room, v1.socketId);
+  const tl = endGameView.game.replayTimeline;
+  assert.ok(tl.length >= 10, `Phải ghi lại đầy đủ >=10 cảnh tương tác thật (thực tế: ${tl.length})`);
+
+  const kinds = new Set(tl.map((f) => f.kind));
+  for (const requiredKind of [
+    "guard_pick",
+    "wolf_aim",
+    "wolf_chat",
+    "wolf_strike",
+    "witch_save",
+    "seer_scan",
+    "peaceful_dawn",
+    "village_chat",
+    "day_nominate",
+    "day_defense",
+    "day_final_vote",
+    "day_verdict",
+  ]) {
+    assert.ok(kinds.has(requiredKind), `Thiếu loại khung hình Replay bắt buộc: ${requiredKind}`);
+  }
+
+  // Kiểm tra bắt trọn khoảnh khắc Sói đổi ý & Dân đổi mũi dùi chỉ tay (prevTargetId)
+  const wolfSwitchFrame = tl.find((f) => f.kind === "wolf_aim" && f.prevTargetId === v1.id && f.targetId === v2.id);
+  assert.ok(wolfSwitchFrame, "Phải ghi lại đúng khoảnh khắc Sói đổi móng vuốt từ v1 sang v2");
+
+  const daySwitchFrame = tl.find((f) => f.kind === "day_nominate" && f.prevTargetId === v2.id && f.targetId === wolf.id);
+  assert.ok(daySwitchFrame, "Phải ghi lại đúng khoảnh khắc người chơi đổi tay đề cử từ v2 sang Sói");
 });
 
 const totalMs = (performance.now() - startTime).toFixed(1);
