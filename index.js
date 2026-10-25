@@ -34,7 +34,7 @@ const PRESETS_INDEX_PATH = path.join(CONFIG_DIR, "scene_presets_index.json");
 const LAYOUT_BACKUPS_DIR = path.resolve(__dirname, "../data/layout_backups");
 const VILLAGE_LAYOUT_BACKUP_PATH = path.join(LAYOUT_BACKUPS_DIR, "village_layout.backup.json");
 const LEGACY_PUBLIC_BACKUP_PATH = path.join(CONFIG_DIR, "village_layout.backup.json");
-const SYNC_TRIPO_SCRIPT_PATH = path.resolve(__dirname, "../scripts/sync_tripo_models.mjs");
+const SYNC_TRIPO_SCRIPT_PATH = path.resolve(__dirname, "../scripts/optimize_tripo_web.mjs");
 const CONCEPTS_MANIFEST_PATH = path.resolve(
   __dirname,
   "../client/public/models/props/concepts_manifest.json"
@@ -226,6 +226,37 @@ app.get("/api/character-models", (req, res) => {
   }
 });
 
+// API Tự động quét Kho 6 Đạo Cụ Cầm Tay Gắn Xương .GLB từ Tripo AI (0 lỗi 404 console!)
+const HAND_PROPS_DIR = path.resolve(__dirname, "../client/public/models/hand_props");
+const HAND_PROPS_MANIFEST_PATH = path.join(HAND_PROPS_DIR, "hand_props_manifest.json");
+
+app.get("/api/hand-prop-models", (req, res) => {
+  try {
+    fs.mkdirSync(HAND_PROPS_DIR, { recursive: true });
+    const files = fs.readdirSync(HAND_PROPS_DIR);
+    const handProps = {};
+    files.forEach((f) => {
+      const m = /^prop_hand_([a-z0-9_]+)\.glb$/i.exec(f);
+      if (m) {
+        const key = m[1].toLowerCase();
+        handProps[key] = `/models/hand_props/${f}`;
+      }
+    });
+    if (isLocalDevRequest(req)) {
+      const manifestDoc = {
+        schemaVersion: 1,
+        updatedAtIso: new Date().toISOString(),
+        note: "6 Dao cu cam tay gan xuong nhan vat (Khiên, Bình Cứu, Bình Độc, Cầu Tiên Tri, Đuốc, Thừng)!",
+        handProps,
+      };
+      fs.writeFileSync(HAND_PROPS_MANIFEST_PATH, JSON.stringify(manifestDoc, null, 2) + "\n", "utf8");
+    }
+    return res.json({ ok: true, handProps });
+  } catch (err) {
+    return res.json({ ok: true, handProps: {} });
+  }
+});
+
 // API Nội Bộ Dev (D5 Architect Studio): Lưu cố định bố cục cảnh quan vào client/public/config/village_layout.json
 app.post("/api/dev/village-layout", (req, res) => {
   if (!isLocalDevRequest(req)) {
@@ -413,7 +444,7 @@ app.post("/api/dev/sync-tripo-concepts", (req, res) => {
   execFile(
     process.execPath,
     [SYNC_TRIPO_SCRIPT_PATH],
-    { cwd: path.resolve(__dirname, ".."), timeout: 30000 },
+    { cwd: path.resolve(__dirname, ".."), timeout: 90000 },
     (err, stdout, stderr) => {
       if (err) {
         return res.status(500).json({
