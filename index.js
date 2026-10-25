@@ -586,13 +586,20 @@ io.on("connection", (socket) => {
     }
 
     try {
+      const canPublishAudio = player.alive !== false;
       const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
         identity: player.id,
         name: player.name,
         ttl: '2h', // OPT 5: 2h đủ cho 1 ván, giảm từ 6h
       });
-      at.addGrant({ roomJoin: true, room: code, canPublish: true, canSubscribe: true });
-      cb?.({ token: await at.toJwt(), url: LIVEKIT_URL });
+      at.addGrant({
+        roomJoin: true,
+        room: code,
+        canPublish: canPublishAudio,
+        canPublishData: false,
+        canSubscribe: true,
+      });
+      cb?.({ token: await at.toJwt(), url: LIVEKIT_URL, canPublish: canPublishAudio });
 
     } catch (e) {
       cb?.({ error: e.message });
