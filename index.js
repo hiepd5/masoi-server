@@ -1183,3 +1183,74 @@ const PORT = process.env.PORT || 3001;
 httpServer.listen(PORT, () => {
   console.log(`Server ma sói đang chạy tại http://localhost:${PORT}`);
 });
+
+// ── TTS Batch: Pre-generate toan bo cau MC truoc khi game bat dau ──
+// Client gui 1 request voi mang phrases -> server generate tung cai -> tra base64 JSON
+app.post("/api/tts-batch", async (req, res) => {
+  const isLocalEnv = !process.env.RENDER && process.env.NODE_ENV !== "production";
+  const defaultVsUrl = isLocalEnv
+    ? "http://localhost:3900"
+    : "https://cassette-letter-paralegal.ngrok-free.dev";
+  const vsUrl = (process.env.VOICESTUDIO_URL || defaultVsUrl).trim();
+  const ttsVoice = process.env.VOICESTUDIO_VOICE_ID || "b5d182f3";
+
+  const { phrases, speed } = req.body || {};
+  if (!Array.isArray(phrases) || phrases.length === 0) {
+    return res.status(400).json({ error: "Missing phrases array" });
+  }
+  if (phrases.length > 120) {
+    return res.status(400).json({ error: "Too many phrases (max 120)" });
+  }
+  const ttsSpeed = typeof speed === "number" && speed > 0 && speed <= 2 ? speed : 0.82;
+
+  async function generateOne(text) {
+    const payload = JSON.stringify({
+      model: "omnivoice",
+      voice: ttsVoice,
+      input: text.trim(),
+      response_format: "mp3",
+      speed: ttsSpeed,
+    });
+    return new Promise(async (resolve) => {
+      try {
+        const targetUrl = new URL("/v1/audio/speech", vsUrl);
+        const httpLib = targetUrl.protocol === "https:"
+          ? (await import("https")).default
+          : (await import("http")).default;
+        const chunks = [];
+        const proxyReq = httpLib.request(targetUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer local",
+            "ngrok-skip-browser-warning": "true",
+            "Content-Length": Buffer.byteLength(payload),
+          },
+          timeout: 20000,
+        }, (r) => {
+          const ct = String(r.headers["content-type"] || "").toLowerCase();
+          if (r.statusCode !== 200 || (!ct.includes("audio") && !ct.includes("octet"))) {
+            r.resume(); return resolve(null);
+          }
+          r.on("data", (c) => chunks.push(c));
+          r.on("end", () => resolve(Buffer.concat(chunks)));
+        });
+        proxyReq.on("error", () => resolve(null));
+        proxyReq.on("timeout", () => { proxyReq.destroy(); resolve(null); });
+        proxyReq.write(payload);
+        proxyReq.end();
+      } catch { resolve(null); }
+    });
+  }
+
+  // Generate tuan tu de khong overload VoiceStudio GPU
+  const results = {};
+  for (const text of phrases) {
+    if (!text || typeof text !== "string" || text.trim().length === 0) continue;
+    const key = text.trim();
+    const buf = await generateOne(key);
+    results[key] = buf ? buf.toString("base64") : null;
+  }
+
+  res.json({ ok: true, count: Object.keys(results).length, results });
+});
