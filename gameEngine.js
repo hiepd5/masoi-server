@@ -1,11 +1,13 @@
-import { assignCustomRoles, ROLE_LABELS } from "./roles.js";
+import { assignCustomRoles, isWolfTeamRole, ROLE_LABELS } from "./roles.js";
 
 // ============ HẰNG SỐ THỜI GIAN (giây) ============
 export const TIMERS = {
+  cupid: 20,
   guard: 20,
   wolf: 30,
   witch: 25,
   seer: 20,
+  hunterRevenge: 15,
   dayDiscuss: 180, // 3 phút mặc định
   dayDiscussExtend: 120, // +2 phút mỗi lần gia hạn
   defense: 60,
@@ -25,12 +27,17 @@ export function initGameState(room) {
     p.alive = true;
   });
 
+  const hasCupid = room.players.some((p) => p.role === "cupid" && p.alive);
+
   room.game = {
     dayNumber: 1,
-    phase: "night_guard", // xem danh sách phase bên dưới
+    phase: hasCupid ? "night_cupid" : "night_guard", // Đêm 1 mở night_cupid nếu có Thần Tình Yêu
     gameStartedAt: Date.now(), // Thời gian bắt đầu ván đấu
     phaseEndsAt: null, // Thời gian kết thúc phase hiện tại
     roleCounts: counts,
+
+    // Cặp đôi sinh tử do Cupid ghép ở Đêm 1: [playerIdA, playerIdB] | null
+    lovers: null,
 
     // Lịch sử bảo vệ để check "không trùng 2 đêm liên tiếp"
     lastGuardedId: null,
@@ -38,6 +45,10 @@ export function initGameState(room) {
 
     wolfPicks: {}, // { wolfPlayerId: { targetId, timestamp } }
     wolfVictimId: null, // kết quả cuối cùng đêm nay (trước khi phù thủy can thiệp)
+
+    // Kỹ năng Huyết Nguyệt Đồng Hóa của Sói Đầu Đàn (1 lần/ván)
+    alphaUsedConvert: false,
+    alphaConvertTonight: false,
 
     witchUsedSave: false,
     witchUsedPoison: false,
@@ -50,7 +61,10 @@ export function initGameState(room) {
 
     // Trạng thái nhân vật đặc biệt
     toughGuyPoisonedDay: null, // Ngày Người Cứng Cỏi bị cắn (đêm sau mới chết)
-
+    mayorRevealedId: null, // ID Trưởng Làng đã giơ Quyền Trượng công bố (phiếu x2)
+    hunterUsedShot: false, // Thợ Săn đã bóp cò trả thù chưa
+    hunterPendingId: null, // ID Thợ Săn vừa ngã xuống đang chờ bắn 15s
+    hunterReturnContext: null, // 'dawn' | 'hang_queue'
 
     // Thảo luận ban ngày
     discussEndsAt: null,
@@ -58,7 +72,7 @@ export function initGameState(room) {
     skipDiscussVotes: {}, // { playerId: true } — tất cả đồng ý thì kết thúc sớm
 
     // Đề cử
-    nominationVotes: {}, // { voterId: targetId }
+    nominationVotes: {}, // { voterId: { targetId, timestamp } }
     nominees: [], // [{ playerId, votesReceived, reachedAt }] danh sách người đạt đủ để lên ghế nóng
     hotSeatQueue: [], // thứ tự biện hộ
     hotSeatIndex: 0,
@@ -68,7 +82,7 @@ export function initGameState(room) {
     finalVotes: {}, // { voterId: 'hang' | 'spare' }
     finalVoteEndsAt: null,
 
-    winner: null, // 'wolf' | 'village' | 'tanner' | null
+    winner: null, // 'wolf' | 'village' | 'tanner' | 'lovers' | null
 
     // Lịch sử hành động cho Recap & Băng ghi hình không gian 3D (Zero-Leak khi đang chơi)
     history: [], // [{ type, day, sourceId, targetId, text }]
@@ -79,15 +93,35 @@ export function initGameState(room) {
   return room;
 }
 
+// Đồng bộ lại phase mở màn Đêm 1 & roleCounts sau khi DevSandbox ép vai (hoặc test thủ công)
+export function syncInitialRoleState(room) {
+  const g = room?.game;
+  if (!g) return;
+  const counts = {};
+  (room.players || []).forEach((p) => {
+    if (p.role) counts[p.role] = (counts[p.role] || 0) + 1;
+  });
+  g.roleCounts = counts;
+  if (g.dayNumber === 1 && (g.phase === "night_guard" || g.phase === "night_cupid")) {
+    const hasCupid = room.players.some((p) => p.role === "cupid" && p.alive);
+    g.phase = hasCupid ? "night_cupid" : "night_guard";
+  }
+}
+
 // ============ MÁY QUAY SỰ THẬT NGẦM (SHADOW REALITY RECORDER) ============
 const MILESTONE_REPLAY_KINDS = new Set([
+  "cupid_link",
   "wolf_strike",
+  "alpha_convert",
   "shield_block",
   "witch_save",
   "witch_poison",
   "seer_scan",
   "cursed_turn",
   "tough_endure",
+  "lover_heartbreak",
+  "hunter_shot",
+  "mayor_reveal",
   "night_death",
   "day_defense",
   "day_verdict",
@@ -123,7 +157,7 @@ export function recordReplayEvent(room, evt = {}) {
     decision: evt.decision || null,
     votesSnapshot: evt.votesSnapshot || null,
     aliveIds: (room.players || []).filter((p) => p.alive).map((p) => p.id),
-    wolfIdsNow: (room.players || []).filter((p) => p.role === "wolf").map((p) => p.id),
+    wolfIdsNow: (room.players || []).filter((p) => isWolfTeamRole(p.role)).map((p) => p.id),
     caption: evt.caption || "",
   };
 
@@ -164,8 +198,151 @@ function aliveByRole(room, role) {
   return alivePlayers(room).filter((p) => p.role === role);
 }
 
+function aliveWolfTeam(room) {
+  return alivePlayers(room).filter((p) => isWolfTeamRole(p.role));
+}
+
 function getPlayer(room, id) {
   return room.players.find((p) => p.id === id);
+}
+
+export function getVoterWeight(room, voterId) {
+  return room?.game?.mayorRevealedId && room.game.mayorRevealedId === voterId ? 2 : 1;
+}
+
+// Kiểm tra Cặp Đôi do Cupid ghép có thuộc 2 chiến tuyến đối lập (Sói - Dân / Trung lập) hay không
+export function isCrossTeamLovers(room) {
+  const g = room?.game;
+  if (!Array.isArray(g?.lovers) || g.lovers.length !== 2) return false;
+  const pA = getPlayer(room, g.lovers[0]);
+  const pB = getPlayer(room, g.lovers[1]);
+  if (!pA || !pB) return false;
+  const aWolf = isWolfTeamRole(pA.role);
+  const bWolf = isWolfTeamRole(pB.role);
+  if (aWolf !== bWolf) return true;
+  if (pA.role === "tanner" || pB.role === "tanner") return true;
+  return false;
+}
+
+// Dây chuyền Tình Nhân đứt ruột (chống lặp đệ quy 100% bằng Set)
+function applyLoverCascade(room, initialDeadIds, phaseLabel = "day_reveal") {
+  const g = room.game;
+  const processed = new Set(initialDeadIds);
+  const queue = [...initialDeadIds];
+  const cascadedIds = [];
+
+  while (queue.length > 0) {
+    const deadId = queue.shift();
+    if (!Array.isArray(g.lovers) || !g.lovers.includes(deadId)) continue;
+    const partnerId = g.lovers[0] === deadId ? g.lovers[1] : g.lovers[0];
+    if (processed.has(partnerId)) continue;
+    processed.add(partnerId);
+
+    const deadPlayer = getPlayer(room, deadId);
+    const partner = getPlayer(room, partnerId);
+    if (partner && partner.alive) {
+      partner.alive = false;
+      cascadedIds.push(partnerId);
+      queue.push(partnerId);
+
+      const partnerRoleLabel = ROLE_LABELS[partner.role] || partner.role;
+      g.history.push({
+        type: "lover_heartbreak",
+        day: g.dayNumber,
+        sourceId: deadId,
+        targetId: partnerId,
+        targetName: partner.name,
+        targetRole: partner.role,
+        text: `💔 Vì người thương ${deadPlayer?.name || ""} ngã xuống, ${partner.name} (${partnerRoleLabel}) đau đớn quyên sinh theo!`,
+      });
+      recordReplayEvent(room, {
+        kind: "lover_heartbreak",
+        phase: phaseLabel,
+        actorId: deadId,
+        targetId: partnerId,
+        targetRole: partner.initialRole || partner.role,
+        caption: `💔 Tơ hồng đứt đoạn! ${partner.name} (${partnerRoleLabel}) gục ngã theo người thương ${deadPlayer?.name || ""}!`,
+      });
+    }
+  }
+
+  return cascadedIds;
+}
+
+// Kiểm tra xem trong nhóm người vừa ngã xuống có Thợ Săn chưa bắn trả thù hay không
+function armHunterRevengeIfEligible(room, newlyDeadIds, returnContext) {
+  const g = room.game;
+  if (g.hunterUsedShot || g.hunterPendingId) return null;
+  if (alivePlayers(room).length === 0) return null;
+
+  const deadHunterId = newlyDeadIds.find((id) => {
+    const p = getPlayer(room, id);
+    return p && !p.alive && p.role === "hunter";
+  });
+  if (!deadHunterId) return null;
+
+  g.hunterPendingId = deadHunterId;
+  g.hunterReturnContext = returnContext;
+  g.phase = "hunter_revenge";
+  g.phaseEndsAt = Date.now() + TIMERS.hunterRevenge * 1000;
+  return deadHunterId;
+}
+
+// ============ ĐÊM 1: THẦN TÌNH YÊU (CUPID) ============
+export function cupidLink(room, cupidId, targetIds) {
+  const g = room.game;
+  const cupid = getPlayer(room, cupidId);
+  if (!cupid || cupid.role !== "cupid" || !cupid.alive) {
+    return { error: "Bạn không phải Thần Tình Yêu hoặc đã chết." };
+  }
+  if (g.phase !== "night_cupid") return { error: "Chỉ ghép đôi ở Đêm đầu tiên." };
+  if (!Array.isArray(targetIds) || targetIds.length !== 2 || targetIds[0] === targetIds[1]) {
+    return { error: "Hãy chọn đúng 2 người chơi khác nhau để ghép đôi." };
+  }
+
+  const pA = getPlayer(room, targetIds[0]);
+  const pB = getPlayer(room, targetIds[1]);
+  if (!pA?.alive || !pB?.alive) {
+    return { error: "Chỉ có thể ghép đôi những người đang sống." };
+  }
+
+  g.lovers = [pA.id, pB.id];
+
+  recordReplayEvent(room, {
+    kind: "cupid_link",
+    phase: "night_cupid",
+    actorId: cupidId,
+    actorRole: "cupid",
+    targetId: pA.id,
+    coActorIds: [pB.id],
+    caption: `💘 ${cupid.name} giương cung vàng kết tơ hồng sinh tử giữa ${pA.name} và ${pB.name}!`,
+  });
+
+  return { ok: true, lovers: g.lovers };
+}
+
+export function endCupidPhase(room) {
+  const g = room.game;
+  const cupid = room.players.find((p) => p.role === "cupid");
+  if (Array.isArray(g.lovers) && g.lovers.length === 2) {
+    const pA = getPlayer(room, g.lovers[0]);
+    const pB = getPlayer(room, g.lovers[1]);
+    g.history.push({
+      type: "cupid_link",
+      day: g.dayNumber,
+      sourceId: cupid?.id || null,
+      targetId: pA?.id || null,
+      partnerId: pB?.id || null,
+      text: `💘 Thần Tình Yêu đã se duyên sinh tử cho ${pA?.name || ""} và ${pB?.name || ""}.`,
+    });
+  } else {
+    g.history.push({
+      type: "cupid_link",
+      day: g.dayNumber,
+      text: "Đêm đầu tiên Thần Tình Yêu không ghép đôi ai.",
+    });
+  }
+  g.phase = "night_guard";
 }
 
 // ============ ĐÊM: BẢO VỆ ============
@@ -227,19 +404,19 @@ export function endGuardPhase(room) {
   g.wolfPicks = {};
 }
 
-// ============ ĐÊM: SÓI ============
+// ============ ĐÊM: SÓI & SÓI ĐẦU ĐÀN ============
 export function wolfPick(room, wolfId, targetId) {
   const g = room.game;
   const wolf = getPlayer(room, wolfId);
-  if (!wolf || wolf.role !== "wolf" || !wolf.alive) {
-    return { error: "Bạn không phải Sói hoặc đã chết." };
+  if (!wolf || !isWolfTeamRole(wolf.role) || !wolf.alive) {
+    return { error: "Bạn không thuộc Phe Sói hoặc đã chết." };
   }
   if (g.phase !== "night_wolf") return { error: "Không phải lượt Sói." };
   // BUG F FIX: Không thể cắn người đã chết
   const target = getPlayer(room, targetId);
   if (!target?.alive) return { error: "Người chơi này đã chết." };
   // Không thể cắn đồng đội Sói
-  if (target.role === "wolf") return { error: "Không thể cắn đồng loại." };
+  if (isWolfTeamRole(target.role)) return { error: "Không thể cắn đồng loại." };
 
   const prevTargetId = g.wolfPicks[wolfId]?.targetId || null;
   g.wolfPicks[wolfId] = { targetId, timestamp: Date.now() };
@@ -249,7 +426,7 @@ export function wolfPick(room, wolfId, targetId) {
     kind: "wolf_aim",
     phase: "night_wolf",
     actorId: wolfId,
-    actorRole: "wolf",
+    actorRole: wolf.role,
     targetId,
     prevTargetId,
     caption:
@@ -261,12 +438,26 @@ export function wolfPick(room, wolfId, targetId) {
   return { ok: true };
 }
 
+export function wolfAlphaToggle(room, alphaId, enabled) {
+  const g = room.game;
+  const alpha = getPlayer(room, alphaId);
+  if (!alpha || alpha.role !== "alpha_wolf" || !alpha.alive) {
+    return { error: "Chỉ Sói Đầu Đàn còn sống mới dùng được Huyết Nguyệt." };
+  }
+  if (g.phase !== "night_wolf") return { error: "Chỉ kích hoạt trong lượt Sói ban đêm." };
+  if (g.alphaUsedConvert) {
+    return { error: "Quyền Huyết Nguyệt Đồng Hóa chỉ dùng được 1 lần duy nhất mỗi ván." };
+  }
+  g.alphaConvertTonight = Boolean(enabled);
+  return { ok: true, alphaConvertTonight: g.alphaConvertTonight };
+}
+
 // Quyết định nạn nhân theo luật: cùng chọn 1 người -> giết người đó
 // Chọn khác nhau -> giết người được pick SỚM NHẤT (theo timestamp đầu tiên mỗi mục tiêu được chọn)
 export function resolveWolfVictim(room) {
   const g = room.game;
   const picks = Object.values(g.wolfPicks);
-  const aliveWolves = aliveByRole(room, "wolf");
+  const aliveWolves = aliveWolfTeam(room);
 
   if (picks.length === 0) {
     g.wolfVictimId = null; // không ai cắn
@@ -295,11 +486,12 @@ export function resolveWolfVictim(room) {
 export function endWolfPhase(room) {
   resolveWolfVictim(room);
   const g = room.game;
-  const aliveWolves = aliveByRole(room, "wolf");
+  const aliveWolves = aliveWolfTeam(room);
   const wolfIds = aliveWolves.map((w) => w.id);
 
   // Tìm con Sói đã chốt mục tiêu này sớm nhất (hoặc Sói đầu đàn) để làm ghế xuất phát tia VFX 3D
-  let leadWolfId = wolfIds[0] || null;
+  const alphaAlive = aliveWolves.find((w) => w.role === "alpha_wolf");
+  let leadWolfId = alphaAlive?.id || wolfIds[0] || null;
   if (g.wolfVictimId && g.wolfPicks) {
     let minTs = Infinity;
     Object.entries(g.wolfPicks).forEach(([wId, pick]) => {
@@ -312,30 +504,36 @@ export function endWolfPhase(room) {
 
   if (g.wolfVictimId) {
     const targetName = getPlayer(room, g.wolfVictimId)?.name;
+    const leadRole = getPlayer(room, leadWolfId)?.role || "wolf";
     g.history.push({
       type: "wolf",
       day: g.dayNumber,
       sourceId: leadWolfId,
       wolfIds,
       targetId: g.wolfVictimId,
-      text: `Đàn sói đã thống nhất cắn ${targetName}.`
+      alphaConvertAttempt: Boolean(g.alphaConvertTonight && !g.alphaUsedConvert),
+      text:
+        g.alphaConvertTonight && !g.alphaUsedConvert
+          ? `Sói Đầu Đàn dẫn bầy nhắm Huyết Nguyệt vào ${targetName}.`
+          : `Đàn sói đã thống nhất cắn ${targetName}.`,
     });
     recordReplayEvent(room, {
       kind: "wolf_strike",
       phase: "night_wolf",
       actorId: leadWolfId,
-      actorRole: "wolf",
+      actorRole: leadRole,
       coActorIds: wolfIds,
       targetId: g.wolfVictimId,
       caption: `🐺 Bầy Sói thống nhất lao tới tung đòn chí mạng vào ${targetName}!`,
     });
   } else {
+    g.alphaConvertTonight = false;
     g.history.push({
       type: "wolf",
       day: g.dayNumber,
       sourceId: leadWolfId,
       wolfIds,
-      text: "Đêm nay đàn sói không cắn ai."
+      text: "Đêm nay đàn sói không cắn ai.",
     });
   }
   room.game.phase = "night_witch";
@@ -422,7 +620,7 @@ export function seerCheck(room, seerId, targetId) {
   if (g.phase !== "night_seer") return { error: "Không phải lượt Tiên Tri." };
 
   const target = getPlayer(room, targetId);
-  const result = target?.role === "wolf" ? "wolf" : "not_wolf";
+  const result = isWolfTeamRole(target?.role) ? "wolf" : "not_wolf";
   g.seerChecksLog.push({ seerId, targetId, dayNumber: g.dayNumber, result });
 
   recordReplayEvent(room, {
@@ -479,7 +677,11 @@ export function resolveNightDeaths(room) {
   }
 
   const guardPlayer = room.players.find((p) => p.role === "guard");
-  const leadWolfPlayer = room.players.find((p) => p.role === "wolf" && p.alive) || room.players.find((p) => p.role === "wolf");
+  const alphaAlive = room.players.find((p) => p.role === "alpha_wolf" && p.alive);
+  const leadWolfPlayer =
+    alphaAlive ||
+    room.players.find((p) => isWolfTeamRole(p.role) && p.alive) ||
+    room.players.find((p) => isWolfTeamRole(p.role));
 
   if (g.wolfVictimId && g.wolfVictimId === g.guardedIdTonight) {
     const savedTarget = getPlayer(room, g.wolfVictimId);
@@ -497,10 +699,37 @@ export function resolveNightDeaths(room) {
   const victimSaved =
     g.wolfVictimId && (g.wolfVictimId === g.guardedIdTonight || g.witchSaveTonight);
 
+  if (g.wolfVictimId && victimSaved && g.alphaConvertTonight && !g.alphaUsedConvert) {
+    // Đã tung Huyết Nguyệt nhưng bị Bảo Vệ / Phù Thủy chặn đứng
+    g.alphaUsedConvert = true;
+    g.alphaConvertTonight = false;
+  }
+
   if (g.wolfVictimId && !victimSaved) {
     const victim = getPlayer(room, g.wolfVictimId);
 
-    if (victim?.role === "cursed") {
+    if (g.alphaConvertTonight && !g.alphaUsedConvert && alphaAlive && victim) {
+      // Sói Đầu Đàn kích hoạt Huyết Nguyệt Đồng Hóa: biến con mồi thành Sói thay vì chết!
+      g.alphaUsedConvert = true;
+      g.alphaConvertTonight = false;
+      victim.role = "wolf";
+      g.history.push({
+        type: "alpha_converted",
+        day: g.dayNumber,
+        sourceId: alphaAlive.id,
+        targetId: victim.id,
+        text: `🐺👑 Huyết Nguyệt Đồng Hóa! Sói Đầu Đàn [${alphaAlive.name}] đã biến [${victim.name}] thành Ma Sói mới!`,
+      });
+      recordReplayEvent(room, {
+        kind: "alpha_convert",
+        phase: "night_resolve",
+        actorId: alphaAlive.id,
+        actorRole: "alpha_wolf",
+        targetId: victim.id,
+        targetRole: "wolf",
+        caption: `🩸 Huyết Nguyệt giáng lâm! Sói Đầu Đàn ${alphaAlive.name} khắc ấn máu biến ${victim.name} thành Ma Sói!`,
+      });
+    } else if (victim?.role === "cursed") {
       // Kẻ Bị Nguyền: Bị Sói cắn -> Không chết mà HÓA THÀNH SÓI!
       victim.role = "wolf";
       g.history.push({
@@ -513,7 +742,7 @@ export function resolveNightDeaths(room) {
         kind: "cursed_turn",
         phase: "night_resolve",
         actorId: leadWolfPlayer?.id || null,
-        actorRole: "wolf",
+        actorRole: leadWolfPlayer?.role || "wolf",
         targetId: victim.id,
         targetRole: "wolf",
         caption: `🩸 Huyết nguyền bùng cháy! ${victim.name} không chết sau cú cắn mà thức tỉnh thành Ma Sói mới!`,
@@ -532,7 +761,7 @@ export function resolveNightDeaths(room) {
           kind: "tough_endure",
           phase: "night_resolve",
           actorId: leadWolfPlayer?.id || null,
-          actorRole: "wolf",
+          actorRole: leadWolfPlayer?.role || "wolf",
           targetId: victim.id,
           targetRole: "tough_guy",
           caption: `💪 ${victim.name} nghiến răng chịu đựng vết cắn sâu của Sói, gồng mình trụ vững đón bình minh!`,
@@ -543,11 +772,14 @@ export function resolveNightDeaths(room) {
     }
   }
 
+  g.alphaConvertTonight = false;
+
   if (g.witchPoisonTargetId) {
     deaths.add(g.witchPoisonTargetId);
   }
 
-  deaths.forEach((id) => {
+  const primaryDeadIds = Array.from(deaths);
+  primaryDeadIds.forEach((id) => {
     const p = getPlayer(room, id);
     if (p) {
       p.alive = false;
@@ -569,7 +801,12 @@ export function resolveNightDeaths(room) {
     }
   });
 
-  if (deaths.size === 0) {
+  // Kích hoạt dây chuyền Tình Nhân quyên sinh nếu 1 trong 2 người bị hạ sát đêm qua
+  const loverCascadedIds =
+    primaryDeadIds.length > 0 ? applyLoverCascade(room, primaryDeadIds, "day_reveal") : [];
+  const allNightDeaths = [...primaryDeadIds, ...loverCascadedIds];
+
+  if (allNightDeaths.length === 0) {
     g.history.push({
       type: "peaceful_night",
       day: g.dayNumber,
@@ -582,8 +819,11 @@ export function resolveNightDeaths(room) {
     });
   }
 
-  g.nightDeaths = Array.from(deaths);
+  g.nightDeaths = allNightDeaths;
   g.phase = "day_reveal";
+
+  // Nếu trong số người chết rạng sáng (trực tiếp hoặc vỡ tim Tình Nhân) có Thợ Săn -> mở 15s bắn trả thù!
+  armHunterRevengeIfEligible(room, allNightDeaths, "dawn");
 
   return g.nightDeaths;
 }
@@ -631,6 +871,23 @@ export function voteSkipDiscussion(room, playerId) {
     delete g.skipDiscussVotes[playerId];
   } else {
     g.skipDiscussVotes[playerId] = true;
+  }
+
+  // Hỗ trợ Chơi 1 mình / Thiếu người có AI Bot:
+  // Khi TẤT CẢ người chơi thật còn sống đồng thuận Bỏ qua -> đàn AI Bot còn sống tự động đồng thuận theo ngay!
+  const aliveHumans = alive.filter((p) => !p.isBot);
+  const aliveBots = alive.filter((p) => p.isBot);
+  if (aliveBots.length > 0 && aliveHumans.length > 0) {
+    const allHumansSkipped = aliveHumans.every((p) => Boolean(g.skipDiscussVotes[p.id]));
+    if (allHumansSkipped) {
+      aliveBots.forEach((b) => {
+        g.skipDiscussVotes[b.id] = true;
+      });
+    } else if (!voter.isBot && !g.skipDiscussVotes[playerId]) {
+      aliveBots.forEach((b) => {
+        delete g.skipDiscussVotes[b.id];
+      });
+    }
   }
 
   const skipCount = Object.keys(g.skipDiscussVotes).length;
@@ -689,22 +946,133 @@ export function nominationVote(room, voterId, targetId) {
   return { ok: true };
 }
 
-// Gọi khi hết giờ đề cử -> tính người lên ghế nóng
+// ============ BAN NGÀY: TRƯỞNG LÀNG CÔNG BỐ QUYỀN TRƯỢNG (PHIẾU x2) ============
+export function mayorReveal(room, mayorId) {
+  const g = room.game;
+  const mayor = getPlayer(room, mayorId);
+  if (!mayor || mayor.role !== "mayor" || !mayor.alive) {
+    return { error: "Chỉ Trưởng Làng còn sống mới có thể công bố Quyền Trượng." };
+  }
+  const dayPhases = ["day_reveal", "day_discuss", "day_nominate", "day_defense", "day_final_vote"];
+  if (!dayPhases.includes(g.phase)) {
+    return { error: "Chỉ được công bố Quyền Trượng vào ban ngày." };
+  }
+  if (g.mayorRevealedId) {
+    return { error: "Trưởng Làng đã công bố thân phận trước đó rồi." };
+  }
+
+  g.mayorRevealedId = mayorId;
+  g.history.push({
+    type: "mayor_reveal",
+    day: g.dayNumber,
+    sourceId: mayorId,
+    text: `👑 ${mayor.name} giơ cao Quyền Trượng công bố thân phận Trưởng Làng — mọi lá phiếu từ nay tính gấp đôi (x2)!`,
+  });
+  recordReplayEvent(room, {
+    kind: "mayor_reveal",
+    phase: g.phase,
+    actorId: mayorId,
+    actorRole: "mayor",
+    caption: `👑 ${mayor.name} dậm Quyền Trượng Vàng uy quyền giữa làng, chính thức kích hoạt lá phiếu x2!`,
+  });
+
+  return { ok: true, mayorId };
+}
+
+// ============ HƠI THỞ CUỐI CÙNG CỦA THỢ SĂN (15 GIÂY BẮN TRẢ THÙ) ============
+export function hunterShoot(room, hunterId, targetId) {
+  const g = room.game;
+  const hunter = getPlayer(room, hunterId);
+  if (!hunter || hunter.role !== "hunter") {
+    return { error: "Bạn không phải Thợ Săn." };
+  }
+  if (g.phase !== "hunter_revenge" || g.hunterPendingId !== hunterId || g.hunterUsedShot) {
+    return { error: "Không trong thời gian bắn trả thù của Thợ Săn." };
+  }
+  const target = getPlayer(room, targetId);
+  if (!target?.alive) {
+    return { error: "Mục tiêu không hợp lệ hoặc đã chết." };
+  }
+
+  const returnContext = g.hunterReturnContext || "dawn";
+  g.hunterUsedShot = true;
+  g.hunterPendingId = null;
+  g.hunterReturnContext = null;
+
+  target.alive = false;
+  const targetRoleLabel = ROLE_LABELS[target.role] || target.role;
+  g.history.push({
+    type: "hunter_shot",
+    day: g.dayNumber,
+    sourceId: hunterId,
+    targetId: target.id,
+    targetName: target.name,
+    targetRole: target.role,
+    text: `🏹 Trước lúc gục ngã, Thợ Săn ${hunter.name} bóp cò bắn gục ${target.name} (${targetRoleLabel})!`,
+  });
+  recordReplayEvent(room, {
+    kind: "hunter_shot",
+    phase: "hunter_revenge",
+    actorId: hunterId,
+    actorRole: "hunter",
+    targetId: target.id,
+    targetRole: target.initialRole || target.role,
+    caption: `🏹 ĐOÀNG!! Đạn bạc cuối cùng của Thợ Săn ${hunter.name} xuyên thủng ${target.name} (${targetRoleLabel})!`,
+  });
+
+  // Nếu viên đạn bắn trúng 1 Tình Nhân còn sống -> nửa kia cũng quyên sinh theo!
+  const cascadedIds = applyLoverCascade(room, [target.id], "hunter_revenge");
+  const killedIds = [target.id, ...cascadedIds];
+
+  if (returnContext === "dawn") {
+    g.nightDeaths = Array.from(new Set([...(g.nightDeaths || []), ...killedIds]));
+    g.phase = "day_reveal";
+  } else {
+    g.phase = "day_final_vote";
+  }
+
+  return { ok: true, killedIds, cascadedIds, returnContext };
+}
+
+export function skipHunterRevenge(room) {
+  const g = room.game;
+  const hunterId = g.hunterPendingId;
+  const returnContext = g.hunterReturnContext || "dawn";
+  g.hunterUsedShot = true;
+  g.hunterPendingId = null;
+  g.hunterReturnContext = null;
+
+  if (hunterId) {
+    const hunter = getPlayer(room, hunterId);
+    g.history.push({
+      type: "hunter_skip",
+      day: g.dayNumber,
+      sourceId: hunterId,
+      text: `🏹 Thợ Săn ${hunter?.name || ""} hạ nỏ xuống mà không bắn ai.`,
+    });
+  }
+
+  g.phase = returnContext === "dawn" ? "day_reveal" : "day_final_vote";
+  return { ok: true, returnContext };
+}
+
+// Gọi khi hết giờ đề cử -> tính người lên ghế nóng (có tính trọng số phiếu x2 của Trưởng Làng)
 export function finalizeNomination(room) {
   const g = room.game;
-  const votes = Object.values(g.nominationVotes);
+  const entries = Object.entries(g.nominationVotes || {});
 
-  if (votes.length === 0) {
+  if (entries.length === 0) {
     g.phase = "day_no_nomination";
     return { nominees: [] };
   }
 
   const tally = {}; // targetId -> { count, earliestTimestamp }
-  votes.forEach((v) => {
+  entries.forEach(([voterId, v]) => {
+    if (!v?.targetId) return;
     if (!tally[v.targetId]) {
       tally[v.targetId] = { count: 0, earliestTimestamp: v.timestamp };
     }
-    tally[v.targetId].count += 1;
+    tally[v.targetId].count += getVoterWeight(room, voterId);
     tally[v.targetId].earliestTimestamp = Math.min(
       tally[v.targetId].earliestTimestamp,
       v.timestamp
@@ -788,16 +1156,22 @@ export function finalVote(room, voterId, decision) {
   return { ok: true };
 }
 
-// Xử lý kết quả cho người đang trên ghế nóng hiện tại
+// Xử lý kết quả cho người đang trên ghế nóng hiện tại (có tính phiếu x2 Trưởng Làng + dây chuyền Tình Nhân & Thợ Săn)
 export function resolveFinalVote(room) {
   const g = room.game;
   const defendantId = g.hotSeatQueue[g.hotSeatIndex];
-  const votes = Object.values(g.finalVotes);
-  const hangCount = votes.filter((v) => v === "hang").length;
-  const spareCount = votes.filter((v) => v === "spare").length;
+  let hangCount = 0;
+  let spareCount = 0;
+  Object.entries(g.finalVotes || {}).forEach(([voterId, decision]) => {
+    const w = getVoterWeight(room, voterId);
+    if (decision === "hang") hangCount += w;
+    else if (decision === "spare") spareCount += w;
+  });
 
   const hanged = hangCount > spareCount;
   let tannerWin = false;
+  let cascadedIds = [];
+  let hunterPendingId = null;
 
   if (hanged) {
     const defendant = getPlayer(room, defendantId);
@@ -813,7 +1187,7 @@ export function resolveFinalVote(room) {
         hangCount,
         spareCount,
         votesDetail: { ...g.finalVotes },
-        text: `${defendant.name} (${roleName}) đã bị treo cổ (${hangCount} phiếu Treo vs ${spareCount} phiếu Tha).`
+        text: `${defendant.name} (${roleName}) đã bị treo cổ (${hangCount} phiếu Treo vs ${spareCount} phiếu Tha).`,
       });
       if (defendant.role === "tanner") {
         tannerWin = true;
@@ -828,6 +1202,21 @@ export function resolveFinalVote(room) {
         votesSnapshot: { ...g.finalVotes },
         caption: `🪢 Phán quyết định đoạt! ${defendant.name} (${roleName}) bị treo cổ giữa pháp trường (${hangCount} Treo vs ${spareCount} Tha)!`,
       });
+
+      if (!tannerWin) {
+        cascadedIds = applyLoverCascade(room, [defendantId], "day_final_vote");
+        // Nếu người vừa chết không còn nằm trong hàng ghế nóng phía sau thì loại khỏi queue để tránh vote người chết
+        if (cascadedIds.length > 0) {
+          g.hotSeatQueue = g.hotSeatQueue.filter(
+            (qId, idx) => idx <= g.hotSeatIndex || !cascadedIds.includes(qId)
+          );
+        }
+        hunterPendingId = armHunterRevengeIfEligible(
+          room,
+          [defendantId, ...cascadedIds],
+          "hang_queue"
+        );
+      }
     }
   } else {
     const defendant = getPlayer(room, defendantId);
@@ -841,7 +1230,7 @@ export function resolveFinalVote(room) {
         hangCount,
         spareCount,
         votesDetail: { ...g.finalVotes },
-        text: `${defendant.name} đã được tha bổng (${spareCount} phiếu Tha vs ${hangCount} phiếu Treo).`
+        text: `${defendant.name} đã được tha bổng (${spareCount} phiếu Tha vs ${hangCount} phiếu Treo).`,
       });
       recordReplayEvent(room, {
         kind: "day_verdict",
@@ -855,22 +1244,44 @@ export function resolveFinalVote(room) {
     }
   }
 
-  return { defendantId, hanged, hangCount, spareCount, tannerWin };
+  return { defendantId, hanged, hangCount, spareCount, tannerWin, cascadedIds, hunterPendingId };
 }
 
 // ============ KIỂM TRA ĐIỀU KIỆN THẮNG ============
 export function checkWinCondition(room) {
   const g = room.game;
-  if (g.winner) return g.winner; // Chán Đời đã thắng trước đó
+  if (g.winner) return g.winner; // Chán Đời hoặc Phe khác đã thắng trước đó
+  // Nếu Thợ Săn đang ngậm nỏ chờ bóp cò 15s thì chưa kết sổ thắng thua!
+  if (g.phase === "hunter_revenge" && g.hunterPendingId) return null;
 
-  const aliveWolves = aliveByRole(room, "wolf").length;
-  const aliveOthers = alivePlayers(room).length - aliveWolves;
+  const alive = alivePlayers(room);
+
+  // Điều kiện thắng riêng Phe Thứ 3 của Cặp Đôi Khác Chiến Tuyến (Sói - Dân / Trung Lập): trụ lại đúng 2 người cuối cùng!
+  if (alive.length === 2 && Array.isArray(g.lovers) && g.lovers.length === 2) {
+    const bothLoversAlive = alive.every((p) => g.lovers.includes(p.id));
+    if (bothLoversAlive && isCrossTeamLovers(room)) {
+      g.winner = "lovers";
+      return "lovers";
+    }
+  }
+
+  const aliveWolves = aliveWolfTeam(room).length;
+  const aliveOthers = alive.length - aliveWolves;
 
   if (aliveWolves === 0) {
     g.winner = "village";
     return "village";
   }
   if (aliveWolves >= aliveOthers) {
+    // Nếu còn 1 Cặp Đôi Sói-Dân đang cùng sống nhưng vẫn còn người ngoài cuộc (alive.length > 2),
+    // Sói chưa thể tự sát người thương để thắng ngay mà ván đấu tiếp diễn đến khi hạ nốt người ngoài cuộc!
+    if (Array.isArray(g.lovers) && g.lovers.length === 2 && isCrossTeamLovers(room)) {
+      const bothAlive = g.lovers.every((id) => getPlayer(room, id)?.alive);
+      if (bothAlive && alive.length > 2 && aliveOthers === 1) {
+        // Ví dụ: 2 Sói (1 Sói thường + 1 Sói Tình Nhân) vs 1 Dân Tình Nhân -> nếu Sói cắn Dân Tình Nhân thì Sói Tình Nhân chết theo -> 1 Sói thường thắng!
+        // Trường hợp này Sói vẫn áp đảo hoàn toàn nên Phe Sói thắng hợp lệ.
+      }
+    }
     g.winner = "wolf";
     return "wolf";
   }
@@ -953,12 +1364,27 @@ export function computeMatchAwards(room) {
       const witch = players.find((p) => p.role === "witch");
       const target = players.find((p) => p.id === ev.targetId);
       if (witch && target) {
-        if (target.role === "wolf") {
+        if (isWolfTeamRole(target.role)) {
           scores[witch.id] += 25;
         } else {
           scores[witch.id] -= 10;
         }
       }
+    }
+
+    if (ev.type === "hunter_shot" && ev.sourceId && ev.targetId) {
+      const target = players.find((p) => p.id === ev.targetId);
+      if (scores[ev.sourceId] !== undefined && target) {
+        scores[ev.sourceId] += isWolfTeamRole(target.role) ? 35 : -8;
+      }
+    }
+
+    if (ev.type === "alpha_converted" && ev.sourceId) {
+      if (scores[ev.sourceId] !== undefined) scores[ev.sourceId] += 28;
+    }
+
+    if (ev.type === "mayor_reveal" && ev.sourceId) {
+      if (scores[ev.sourceId] !== undefined) scores[ev.sourceId] += 12;
     }
 
     if (ev.type === "seer" && ev.sourceId) {
@@ -984,7 +1410,7 @@ export function computeMatchAwards(room) {
 
     if (ev.type === "hang") {
       const defendant = players.find((p) => p.id === ev.targetId);
-      const isWolf = defendant?.role === "wolf";
+      const isWolf = isWolfTeamRole(defendant?.role);
       if (ev.votesDetail) {
         Object.entries(ev.votesDetail).forEach(([voterId, vote]) => {
           if (vote === "hang" && scores[voterId] !== undefined) {
@@ -1001,11 +1427,14 @@ export function computeMatchAwards(room) {
 
   // Cộng điểm chiến thắng và sống sót
   players.forEach((p) => {
-    const isWolfTeam = p.role === "wolf";
-    const isVillageTeam = p.role !== "wolf" && p.role !== "tanner";
+    const isWolfTeam = isWolfTeamRole(p.role);
+    const isVillageTeam = !isWolfTeam && p.role !== "tanner";
     const isTanner = p.role === "tanner";
+    const isInLovers = Array.isArray(g.lovers) && g.lovers.includes(p.id);
 
-    if (winner === "wolf" && isWolfTeam) {
+    if (winner === "lovers" && isInLovers) {
+      scores[p.id] += 42;
+    } else if (winner === "wolf" && isWolfTeam) {
       scores[p.id] += 20;
     } else if (winner === "village" && isVillageTeam) {
       scores[p.id] += 15;
@@ -1033,10 +1462,18 @@ export function computeMatchAwards(room) {
 
   if (mvpPlayer) {
     let mvpReason = "Có đóng góp xuất sắc nhất trận đấu!";
-    if (mvpPlayer.role === "wolf") {
+    if (winner === "lovers" && Array.isArray(g.lovers) && g.lovers.includes(mvpPlayer.id)) {
+      mvpReason = "Tình yêu vượt chiến tuyến! Cặp đôi định mệnh nắm tay nhau chiến thắng cả ngôi làng!";
+    } else if (isWolfTeamRole(mvpPlayer.role)) {
       mvpReason = mvpPlayer.alive
-        ? "Bầy Sói tinh quái dẫn dắt thế trận và sống sót đến phút cuối!"
+        ? "Thủ lĩnh Bầy Sói tinh quái dẫn dắt thế trận và sống sót đến phút cuối!"
         : "Đóng góp chiến thuật then chốt cho chiến thắng của Bầy Sói!";
+    } else if (mvpPlayer.role === "hunter") {
+      mvpReason = "Xạ thủ máu lạnh với phát đạn bạc quyết định cục diện ván đấu!";
+    } else if (mvpPlayer.role === "mayor") {
+      mvpReason = "Quyền Trượng uy nghiêm dẫn dắt lá phiếu phán quyết của cả ngôi làng!";
+    } else if (mvpPlayer.role === "cupid") {
+      mvpReason = "Mũi tên Tơ Hồng tạo nên bước ngoặt định mệnh cho ván đấu!";
     } else if (mvpPlayer.role === "guard") {
       mvpReason = `Bảo vệ thần thánh với ${stats[mvpPlayer.id].saves} lần cứu người chuẩn xác!`;
     } else if (mvpPlayer.role === "seer") {

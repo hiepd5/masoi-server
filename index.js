@@ -12,13 +12,22 @@ import {
   toggleReady,
   setRolesConfig,
   setScenePreset,
+  setRoomAccess,
+  setSoloPracticeRole,
+  addBotsToRoom,
+  clearBotsFromRoom,
+  getPublicRoomsList,
   addLobbyMessage,
   publicRoomView,
 } from "./rooms.js";
 
 import { createGameController } from "./gameController.js";
-import { isWolfTeamRole } from "./roles.js";
-import { setupDevPhaseHook, registerDevSocketHandlers } from "./devSandbox.js";
+import { isWolfTeamRole, generateExpandedV33Roles } from "./roles.js";
+import {
+  setupDevPhaseHook,
+  registerDevSocketHandlers,
+  checkBotVoteConsensus,
+} from "./devSandbox.js";
 import { AccessToken } from "livekit-server-sdk";
 import https from "https";
 import fs from "fs";
@@ -171,8 +180,11 @@ app.get("/", (req, res) => res.json({ status: "ok", game: "Ma Soi Online", uptim
 //   VOICESTUDIO_URL  = https://xxxx.ngrok-free.app   (URL ngrok tunnel đến localhost:3900)
 //   VOICESTUDIO_VOICE_ID = prof_xxxxx                 (profile id sau khi clone giọng)
 app.post("/api/tts", async (req, res) => {
-  const vsUrl = process.env.VOICESTUDIO_URL;
-  if (!vsUrl) return res.status(503).json({ error: "VoiceStudio URL not configured. Set VOICESTUDIO_URL env var on Render." });
+  const isLocalEnv = !process.env.RENDER && process.env.NODE_ENV !== "production";
+  const defaultVsUrl = isLocalEnv
+    ? "http://localhost:3900"
+    : "https://cassette-letter-paralegal.ngrok-free.dev";
+  const vsUrl = (process.env.VOICESTUDIO_URL || defaultVsUrl).trim();
 
   const { text, voice, speed } = req.body || {};
   if (!text || typeof text !== "string" || text.trim().length === 0) {
@@ -195,7 +207,6 @@ app.post("/api/tts", async (req, res) => {
 
   try {
     const targetUrl = new URL("/v1/audio/speech", vsUrl);
-    // Dùng https hoặc http tùy protocol của VoiceStudio URL
     const httpLib = targetUrl.protocol === "https:"
       ? (await import("https")).default
       : (await import("http")).default;
@@ -207,15 +218,23 @@ app.post("/api/tts", async (req, res) => {
         headers: {
           "Content-Type": "application/json",
           "Authorization": "Bearer local",
+          "ngrok-skip-browser-warning": "true",
+          "User-Agent": "MaSoiOnline-ServerProxy/3.4",
           "Content-Length": Buffer.byteLength(payload),
         },
-        timeout: 30000,
+        timeout: 12000,
       },
       (proxyRes) => {
-        if (proxyRes.statusCode !== 200) {
-          // Drain response body trước khi gửi lỗi
+        const contentType = String(proxyRes.headers["content-type"] || "").toLowerCase();
+        const isAudioPayload =
+          proxyRes.statusCode === 200 &&
+          (contentType.includes("audio") || contentType.includes("octet-stream"));
+        if (!isAudioPayload) {
+          // Chặn đứng trang HTML cảnh báo/lỗi của ngrok khi cổng 3900 chưa mở xong
           proxyRes.resume();
-          return res.status(502).json({ error: `VoiceStudio returned HTTP ${proxyRes.statusCode}` });
+          return res.status(502).json({
+            error: `VoiceStudio not ready (HTTP ${proxyRes.statusCode}, type=${contentType || "unknown"})`,
+          });
         }
         res.setHeader("Content-Type", "audio/mpeg");
         res.setHeader("Cache-Control", "no-store");
@@ -230,7 +249,7 @@ app.post("/api/tts", async (req, res) => {
 
     proxyReq.on("timeout", () => {
       proxyReq.destroy();
-      if (!res.headersSent) res.status(504).json({ error: "VoiceStudio timeout (30s)" });
+      if (!res.headersSent) res.status(504).json({ error: "VoiceStudio timeout (12s)" });
     });
 
     proxyReq.write(payload);
@@ -551,6 +570,10 @@ const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
+function broadcastRoomsList() {
+  io.emit("lobby:roomsUpdate", getPublicRoomsList());
+}
+
 function broadcastRoom(room) {
   // Mỗi client nhận view riêng (role của chính họ), nên emit riêng từng socket
   room.players.forEach((p) => {
@@ -558,13 +581,20 @@ function broadcastRoom(room) {
       io.to(p.socketId).emit("room:update", publicRoomView(room, p.socketId));
     }
   });
+  broadcastRoomsList();
 }
 
 const gameCtrl = createGameController(io);
-setupDevPhaseHook(gameCtrl);
+setupDevPhaseHook(gameCtrl, io);
+gameCtrl.setRoomListHook(() => broadcastRoomsList());
 
 io.on("connection", (socket) => {
   console.log("Kết nối mới:", socket.id);
+  socket.emit("lobby:roomsUpdate", getPublicRoomsList());
+
+  socket.on("lobby:getRooms", (_, cb) => {
+    cb?.({ ok: true, rooms: getPublicRoomsList() });
+  });
 
   // Heartbeat: ping mỗi 30s, kick sau 60s không pong
   let missedPings = 0;
@@ -583,13 +613,46 @@ io.on("connection", (socket) => {
     missedPings = 0; // reset khi nhận pong
   });
 
-  socket.on("room:create", (_, cb) => {
-    const room = createRoom(socket.id);
-    const { room: joinedRoom, player } = addPlayer(room.code, socket.id);
-    socket.join(room.code);
-    socket.data.roomCode = room.code;
+  socket.on("room:create", (payload = {}, cb) => {
+    const {
+      name,
+      avatarSeed,
+      avatarUrl,
+      roomTitle,
+      accessMode = "public",
+      password = "",
+      soloQuickStart = false,
+    } = payload || {};
+
+    if (accessMode === "password" && !String(password || "").trim()) {
+      cb?.({ ok: false, error: "Vui lòng nhập mật khẩu cho phòng khóa!" });
+      return;
+    }
+
+    const room = createRoom(socket.id, { roomTitle, accessMode, password });
+    const { room: joinedRoom, player } = addPlayer(
+      room.code,
+      socket.id,
+      name || null,
+      avatarSeed || null,
+      avatarUrl || null,
+      password
+    );
+
+    if (soloQuickStart) {
+      joinedRoom.rolesConfig = generateExpandedV33Roles(8);
+      addBotsToRoom(joinedRoom.code, 7);
+    }
+
+    socket.join(joinedRoom.code);
+    socket.data.roomCode = joinedRoom.code;
     socket.data.playerId = player.id;
-    cb?.({ ok: true, roomCode: room.code, playerId: player.id });
+    cb?.({
+      ok: true,
+      roomCode: joinedRoom.code,
+      playerId: player.id,
+      sessionToken: player.sessionToken,
+    });
     broadcastRoom(joinedRoom);
   });
 
@@ -602,21 +665,113 @@ io.on("connection", (socket) => {
     socket.join(result.room.code);
     socket.data.roomCode = result.room.code;
     socket.data.playerId = result.player.id;
-    cb?.({ ok: true, roomCode: result.room.code, playerId: result.player.id });
+    cb?.({
+      ok: true,
+      roomCode: result.room.code,
+      playerId: result.player.id,
+      sessionToken: result.player.sessionToken,
+    });
     broadcastRoom(result.room);
   });
 
-  socket.on("room:join", ({ roomCode, name, avatarSeed, avatarUrl }, cb) => {
-    const result = addPlayer(roomCode, socket.id, name, avatarSeed || null, avatarUrl || null);
+  socket.on("room:join", ({ roomCode, name, avatarSeed, avatarUrl, password } = {}, cb) => {
+    const result = addPlayer(
+      roomCode,
+      socket.id,
+      name,
+      avatarSeed || null,
+      avatarUrl || null,
+      password || ""
+    );
     if (result.error) {
-      cb?.({ ok: false, error: result.error });
+      cb?.({
+        ok: false,
+        error: result.error,
+        requirePassword: Boolean(result.requirePassword),
+        phase: result.phase || null,
+      });
       return;
     }
     socket.join(result.room.code);
     socket.data.roomCode = result.room.code;
-    socket.data.playerId = result.player.id;  // ← lưu stable playerId
-    cb?.({ ok: true, roomCode: result.room.code, playerId: result.player.id });
+    socket.data.playerId = result.player.id; // ← lưu stable playerId
+    cb?.({
+      ok: true,
+      roomCode: result.room.code,
+      playerId: result.player.id,
+      sessionToken: result.player.sessionToken,
+    });
     broadcastRoom(result.room);
+  });
+
+  socket.on("room:setAccess", ({ roomTitle, accessMode, password } = {}, cb) => {
+    const code = socket.data.roomCode;
+    if (!code) return cb?.({ ok: false, error: "Bạn chưa ở trong phòng." });
+    const result = setRoomAccess(code, socket.id, { roomTitle, accessMode, password });
+    if (result.error) return cb?.({ ok: false, error: result.error });
+    broadcastRoom(result.room);
+    cb?.({ ok: true });
+  });
+
+  socket.on("room:setSoloRole", ({ role } = {}, cb) => {
+    const code = socket.data.roomCode;
+    if (!code) return cb?.({ ok: false, error: "Bạn chưa ở trong phòng." });
+    const result = setSoloPracticeRole(code, socket.id, role || null);
+    if (result.error) return cb?.({ ok: false, error: result.error });
+    broadcastRoom(result.room);
+    cb?.({ ok: true, role: result.role });
+  });
+
+  socket.on("room:manageBots", ({ action = "add", count = 1 } = {}, cb) => {
+    const code = socket.data.roomCode;
+    if (!code) return cb?.({ ok: false, error: "Bạn chưa ở trong phòng." });
+    const room = getRoom(code);
+    if (!room) return cb?.({ ok: false, error: "Phòng không tồn tại." });
+    if (room.phase !== "lobby") {
+      return cb?.({ ok: false, error: "Chỉ chỉnh số ghế AI Bot khi đang ở sảnh chờ." });
+    }
+    const requester = room.players.find(
+      (p) => p.socketId === socket.id || p.id === socket.data.playerId
+    );
+    if (!requester?.isHost) {
+      return cb?.({ ok: false, error: "Chỉ chủ phòng mới có quyền chỉnh AI Bot." });
+    }
+
+    if (action === "clear") {
+      const res = clearBotsFromRoom(code, { syncRoles: true });
+      if (res.error) return cb?.({ ok: false, error: res.error });
+      broadcastRoom(res.room);
+      return cb?.({ ok: true, total: res.total });
+    }
+
+    if (action === "fill_v33_8") {
+      const realHumans = room.players.filter((p) => !p.isBot).length;
+      const targetSeats = Math.max(8, realHumans);
+      room.rolesConfig = generateExpandedV33Roles(targetSeats);
+      const needed = Math.max(0, targetSeats - room.players.length);
+      const res = addBotsToRoom(code, needed);
+      if (res.error) return cb?.({ ok: false, error: res.error });
+      broadcastRoom(res.room);
+      return cb?.({ ok: true, added: res.added, total: res.total });
+    }
+
+    if (action === "fill_roles") {
+      const totalRoles = Object.values(room.rolesConfig || {}).reduce(
+        (s, v) => s + (Number(v) || 0),
+        0
+      );
+      const targetSeats = Math.max(6, totalRoles);
+      const needed = Math.max(0, targetSeats - room.players.length);
+      const res = addBotsToRoom(code, needed);
+      if (res.error) return cb?.({ ok: false, error: res.error });
+      broadcastRoom(res.room);
+      return cb?.({ ok: true, added: res.added, total: res.total });
+    }
+
+    const res = addBotsToRoom(code, count, { syncRolesMode: "match" });
+    if (res.error) return cb?.({ ok: false, error: res.error });
+    broadcastRoom(res.room);
+    cb?.({ ok: true, added: res.added, total: res.total });
   });
 
   socket.on("room:rename", ({ newName, avatarSeed, avatarUrl }, cb) => {
@@ -634,11 +789,16 @@ io.on("connection", (socket) => {
   socket.on("room:leave", () => {
     const code = socket.data.roomCode;
     if (!code) return;
-    const room = removePlayer(code, socket.id);
+    const room = removePlayer(code, socket.id, { explicitLeave: true });
     socket.leave(code);
     socket.data.roomCode = null;
     socket.data.playerId = null;
-    if (room) broadcastRoom(room);
+    if (room) {
+      broadcastRoom(room);
+    } else {
+      gameCtrl.clearRoomTimer(code);
+      broadcastRoomsList();
+    }
   });
 
   socket.on("room:toggleReady", (_, cb) => {
@@ -717,8 +877,19 @@ io.on("connection", (socket) => {
     clearInterval(heartbeatInterval);
     const code = socket.data.roomCode;
     if (!code) return;
-    const room = removePlayer(code, socket.id);
-    if (room) broadcastRoom(room);
+    const room = removePlayer(code, socket.id, {
+      explicitLeave: false,
+      onOrphanExpire: (expiredCode) => {
+        gameCtrl.clearRoomTimer(expiredCode);
+        broadcastRoomsList();
+      },
+    });
+    if (room) {
+      broadcastRoom(room);
+    } else {
+      gameCtrl.clearRoomTimer(code);
+      broadcastRoomsList();
+    }
     console.log("Ngắt kết nối:", socket.id);
   });
 
@@ -926,7 +1097,10 @@ io.on("connection", (socket) => {
       // BUG 9 FIX: Không cho vote sau khi game kết thúc
       if (room.game?.winner) return cb?.({ ok: false, error: "Trò chơi đã kết thúc." });
       const result = gameCtrl.nominationVote(room, player.id, targetId);
-      if (result.ok) gameCtrl.broadcast(room);
+      if (result.ok) {
+        gameCtrl.broadcast(room);
+        checkBotVoteConsensus(room, gameCtrl);
+      }
       cb?.(result);
     });
   });
@@ -937,7 +1111,10 @@ io.on("connection", (socket) => {
       if (room.game?.winner) return cb?.({ ok: false, error: "Trò chơi đã kết thúc." });
       const result = gameCtrl.finalVote(room, player.id, decision);
       // BUG 5 FIX: Broadcast để người chơi khác thấy ai đã vote real-time
-      if (result.ok) gameCtrl.broadcast(room);
+      if (result.ok) {
+        gameCtrl.broadcast(room);
+        checkBotVoteConsensus(room, gameCtrl);
+      }
       cb?.(result);
     });
   });
@@ -981,8 +1158,8 @@ io.on("connection", (socket) => {
     if (!target) return cb?.({ ok: false, error: 'Không tìm thấy người chơi.' });
     if (target.isHost) return cb?.({ ok: false, error: 'Không thể kick chủ phòng.' });
 
-    // Gửi thông báo bị kick
-    const targetSocket = io.sockets.sockets.get(target.socketId);
+    // Gửi thông báo bị kick (nếu là người thật có socket)
+    const targetSocket = target.socketId ? io.sockets.sockets.get(target.socketId) : null;
     if (targetSocket) {
       targetSocket.emit('room:kicked', { reason: `Bạn đã bị kick khỏi phòng bởi chủ phòng.` });
       targetSocket.leave(code);
@@ -990,7 +1167,11 @@ io.on("connection", (socket) => {
 
     // Xóa khỏi room
     const updatedRoom = removePlayer(code, target.socketId || target.id);
-    if (updatedRoom) broadcastRoom(updatedRoom);
+    if (updatedRoom) {
+      broadcastRoom(updatedRoom);
+    } else {
+      broadcastRoomsList();
+    }
     cb?.({ ok: true });
   });
 

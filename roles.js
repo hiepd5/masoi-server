@@ -1,15 +1,38 @@
-// Chia vai trò: wolf, seer, guard, witch, tough_guy, cursed, tanner, villager
+// Chia vai trò 12 vai chuẩn V3.3: wolf, alpha_wolf, seer, guard, witch, hunter, cupid, mayor, tough_guy, cursed, tanner, villager
+
+export const PLAYABLE_ROLE_KEYS = [
+  "wolf",
+  "alpha_wolf",
+  "guard",
+  "witch",
+  "seer",
+  "hunter",
+  "cupid",
+  "mayor",
+  "tough_guy",
+  "cursed",
+  "tanner",
+  "villager",
+];
 
 export const ROLE_LABELS = {
   wolf: "Sói",
+  alpha_wolf: "Sói Đầu Đàn",
   seer: "Tiên Tri",
   guard: "Bảo Vệ",
   witch: "Phù Thủy",
+  hunter: "Thợ Săn",
+  cupid: "Thần Tình Yêu",
+  mayor: "Trưởng Làng",
   tough_guy: "Người Cứng Cỏi",
   cursed: "Kẻ Bị Nguyền",
   tanner: "Chán Đời",
   villager: "Nông Dân",
 };
+
+export function isWolfTeamRole(role) {
+  return role === "wolf" || role === "alpha_wolf";
+}
 
 // Số lượng Sói chuẩn theo số người chơi
 export function calculateWolfCount(totalPlayers) {
@@ -36,9 +59,54 @@ export function generateDefaultRoles(totalPlayers) {
 
   return {
     wolf: wolfCount,
+    alpha_wolf: 0,
     seer: seerCount,
     guard: guardCount,
     witch: witchCount,
+    hunter: 0,
+    cupid: 0,
+    mayor: 0,
+    tough_guy: toughGuyCount,
+    cursed: cursedCount,
+    tanner: tannerCount,
+    villager: villagerCount,
+  };
+}
+
+// Sinh cấu hình Mở Rộng V3.3 (Thợ Săn · Thần Tình Yêu · Sói Đầu Đàn · Trưởng Làng)
+export function generateExpandedV33Roles(totalPlayers) {
+  const count = Math.max(6, totalPlayers || 6);
+  const totalWolves = calculateWolfCount(count);
+  const alphaWolfCount = 1;
+  const wolfCount = Math.max(0, totalWolves - alphaWolfCount);
+
+  let remaining = count - totalWolves;
+  const take = (want = 1) => {
+    const got = Math.min(want, Math.max(0, remaining));
+    remaining -= got;
+    return got;
+  };
+
+  const seerCount = take(1);
+  const hunterCount = take(1);
+  const cupidCount = take(1);
+  const mayorCount = take(1);
+  const guardCount = take(1);
+  const witchCount = take(1);
+  const tannerCount = count >= 10 ? take(1) : 0;
+  const cursedCount = count >= 12 ? take(1) : 0;
+  const toughGuyCount = count >= 13 ? take(1) : 0;
+  const villagerCount = Math.max(0, remaining);
+
+  return {
+    wolf: wolfCount,
+    alpha_wolf: alphaWolfCount,
+    seer: seerCount,
+    guard: guardCount,
+    witch: witchCount,
+    hunter: hunterCount,
+    cupid: cupidCount,
+    mayor: mayorCount,
     tough_guy: toughGuyCount,
     cursed: cursedCount,
     tanner: tannerCount,

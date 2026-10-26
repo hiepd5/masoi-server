@@ -1,46 +1,16 @@
-import { randomUUID } from "crypto";
-import { getRoom } from "./rooms.js";
-import { generateDefaultRoles, ROLE_LABELS } from "./roles.js";
+import {
+  getRoom,
+  addBotsToRoom,
+  clearBotsFromRoom,
+  ensureRoleInLobbyConfig,
+} from "./rooms.js";
+import { generateDefaultRoles, isWolfTeamRole, ROLE_LABELS } from "./roles.js";
 
 export const IS_LOCAL_DEV = !process.env.RENDER && process.env.NODE_ENV !== "production";
-
-const BOT_NAMES = [
-  "🤖 Bot Sói Xám", "🤖 Bot Cáo Đỏ", "🤖 Bot Cú Đêm", "🤖 Bot Thợ Săn",
-  "🤖 Bot Cổ Thụ", "🤖 Bot Ánh Trăng", "🤖 Bot Sương Mù", "🤖 Bot Hổ Phách",
-  "🤖 Bot Bão Tố", "🤖 Bot Lửa Trại", "🤖 Bot Bóng Đêm", "🤖 Bot Gió Bắc",
-];
-
-const BOT_SEEDS = [
-  "bot-wolf", "bot-fox", "bot-owl", "bot-hunter",
-  "bot-tree", "bot-moon", "bot-mist", "bot-amber",
-  "bot-storm", "bot-fire", "bot-shadow", "bot-wind",
-];
 
 function pickRandom(arr) {
   if (!arr || arr.length === 0) return null;
   return arr[Math.floor(Math.random() * arr.length)];
-}
-
-function ensureRoleInLobbyConfig(room, forcedRole) {
-  const targetTotal = Math.max(6, room.players.length);
-  const cfg = { ...(room.rolesConfig || generateDefaultRoles(targetTotal)) };
-  if (!forcedRole) return cfg;
-
-  if (!cfg[forcedRole] || cfg[forcedRole] < 1) {
-    cfg[forcedRole] = 1;
-    // Giảm 1 từ vai dư để giữ tổng số vai === targetTotal
-    const donorOrder = ["villager", "tough_guy", "cursed", "tanner", "guard", "witch", "seer", "wolf"];
-    for (const d of donorOrder) {
-      if (d === forcedRole) continue;
-      const minKeep = d === "wolf" ? 1 : 0;
-      if ((cfg[d] || 0) > minKeep) {
-        cfg[d] -= 1;
-        break;
-      }
-    }
-  }
-  room.rolesConfig = cfg;
-  return cfg;
 }
 
 const WOLF_BOT_WHISPERS = [
@@ -53,17 +23,86 @@ const WOLF_BOT_WHISPERS = [
 const VILLAGE_BOT_LINES = [
   (name) => `Tôi để ý ánh mắt của ${name} từ sáng giờ rất lạ!`,
   (name) => `Đêm qua bầy Sói hành động quá tính toán, khả nghi nhất là ${name}!`,
-  (name) => `Mọi người bình tĩnh suy xét kỹ trước khi chỉ tay đề cử nhé!`,
+  () => `Mọi người bình tĩnh suy xét kỹ trước khi chỉ tay đề cử nhé!`,
+  (name) => `${name} nãy giờ hơi im lặng, có ai soi thử chưa?`,
 ];
 
-export function flushBotInteractionsForCurrentPhase(room, gameCtrl, { includeDayActions = false } = {}) {
+const DEFENSE_BOT_LINES = [
+  "Mọi người bình tĩnh! Tôi thề mình là dân lương thiện, treo nhầm tôi là Sói cười thầm đấy!",
+  "Đừng nghe lời khích bác! Đêm qua tôi ngủ say, hãy tha cho tôi để ngày mai tìm đúng Sói!",
+  "Tôi vô tội thật sự! Nếu treo tôi hôm nay làng sẽ mất đi một lá phiếu quan trọng!",
+];
+
+export function checkBotVoteConsensus(room, gameCtrl) {
+  if (!room || room.phase !== "playing" || !room.game || room.game.winner) return;
+  if (room.devAutoBot === false) return;
+  if (!room.players.some((p) => p.isBot)) return;
+
+  const g = room.game;
+  const alive = room.players.filter((p) => p.alive);
+  if (alive.length === 0) return;
+
+  let everyoneVoted = false;
+  let delayMs = 2200;
+
+  if (g.phase === "day_nominate") {
+    everyoneVoted = alive.every((p) => Boolean(g.nominationVotes?.[p.id]?.targetId));
+    delayMs = 2600;
+  } else if (g.phase === "day_final_vote") {
+    everyoneVoted = alive.every((p) => Boolean(g.finalVotes?.[p.id]));
+    delayMs = 2000;
+  } else {
+    return;
+  }
+
+  if (!everyoneVoted) return;
+
+  const targetPhaseKey = `${g.dayNumber}:${g.phase}:${g.hotSeatIndex ?? -1}`;
+  if (room.devConsensusTimer) {
+    clearTimeout(room.devConsensusTimer);
+    room.devConsensusTimer = null;
+  }
+  room.devConsensusTimer = setTimeout(() => {
+    room.devConsensusTimer = null;
+    if (room.phase !== "playing" || !room.game || room.game.winner) return;
+    const nowKey = `${room.game.dayNumber}:${room.game.phase}:${room.game.hotSeatIndex ?? -1}`;
+    if (nowKey !== targetPhaseKey) return;
+    gameCtrl.advanceCurrentPhase(room);
+  }, delayMs);
+  room.devConsensusTimer.unref?.();
+}
+
+export function flushBotInteractionsForCurrentPhase(
+  room,
+  gameCtrl,
+  { includeDayActions = false, io = null } = {}
+) {
   if (!room || room.phase !== "playing" || !room.game || room.game.winner) return;
   const g = room.game;
   const alivePlayers = room.players.filter((p) => p.alive);
   const aliveBots = alivePlayers.filter((p) => p.isBot);
+
+  if (g.phase === "hunter_revenge" && g.hunterPendingId) {
+    const fallenHunter = room.players.find((p) => p.id === g.hunterPendingId);
+    if (fallenHunter?.isBot && alivePlayers.length > 0) {
+      const target = pickRandom(alivePlayers);
+      if (target) gameCtrl.hunterShoot(room, fallenHunter.id, target.id);
+    }
+    return;
+  }
+
   if (aliveBots.length === 0) return;
 
-  if (g.phase === "night_guard" && !g.guardedIdTonight) {
+  if (g.phase === "night_cupid" && !g.lovers) {
+    const botCupid = aliveBots.find((p) => p.role === "cupid");
+    if (botCupid && alivePlayers.length >= 2) {
+      const first = pickRandom(alivePlayers);
+      const second = pickRandom(alivePlayers.filter((p) => p.id !== first.id));
+      if (first && second) {
+        gameCtrl.cupidLink(room, botCupid.id, [first.id, second.id]);
+      }
+    }
+  } else if (g.phase === "night_guard" && !g.guardedIdTonight) {
     const botGuard = aliveBots.find((p) => p.role === "guard");
     if (botGuard) {
       const validTargets = alivePlayers.filter((p) => p.id !== g.lastGuardedId);
@@ -71,17 +110,19 @@ export function flushBotInteractionsForCurrentPhase(room, gameCtrl, { includeDay
       if (target) gameCtrl.guardProtect(room, botGuard.id, target.id);
     }
   } else if (g.phase === "night_wolf" && Object.keys(g.wolfPicks || {}).length === 0) {
-    const botWolves = aliveBots.filter((p) => p.role === "wolf");
-    const nonWolves = alivePlayers.filter((p) => p.role !== "wolf");
+    const botWolves = aliveBots.filter((p) => isWolfTeamRole(p.role));
+    const nonWolves = alivePlayers.filter((p) => !isWolfTeamRole(p.role));
     if (botWolves.length > 0 && nonWolves.length > 0) {
+      const botAlpha = botWolves.find((p) => p.role === "alpha_wolf");
+      if (botAlpha && !g.alphaUsedConvert && g.dayNumber >= 2 && Math.random() < 0.45) {
+        gameCtrl.wolfAlphaToggle(room, botAlpha.id, true);
+      }
       const finalTarget = pickRandom(nonWolves);
-      // Nếu có >= 2 mục tiêu, Sói đầu đàn nhá thử mục tiêu phụ rồi bàn bạc đổi sang mục tiêu chốt (cực kỳ kịch tính trên băng Replay!)
       if (nonWolves.length >= 2) {
         const decoy = nonWolves.find((p) => p.id !== finalTarget.id);
         if (decoy) {
           gameCtrl.wolfPick(room, botWolves[0].id, decoy.id);
           if (botWolves[0].id && g.replayTimeline?.length) {
-            // Lùi nhẹ timestamp 300ms để không bị gộp debounce với cú chốt sau đó
             g.replayTimeline[g.replayTimeline.length - 1].ts -= 320;
           }
         }
@@ -92,7 +133,7 @@ export function flushBotInteractionsForCurrentPhase(room, gameCtrl, { includeDay
         kind: "wolf_chat",
         phase: "night_wolf",
         actorId: botWolves[0].id,
-        actorRole: "wolf",
+        actorRole: botWolves[0].role,
         targetId: finalTarget.id,
         chatText: whisperText,
         caption: `🐺 [Mật đàm Sói] ${botWolves[0].name}: "${whisperText}"`,
@@ -123,6 +164,10 @@ export function flushBotInteractionsForCurrentPhase(room, gameCtrl, { includeDay
       if (target) gameCtrl.seerCheck(room, botSeer.id, target.id);
     }
   } else if (includeDayActions && g.phase === "day_discuss") {
+    const botMayor = aliveBots.find((p) => p.role === "mayor");
+    if (botMayor && !g.mayorRevealedId && (g.dayNumber >= 2 || Math.random() < 0.35)) {
+      gameCtrl.mayorReveal(room, botMayor.id);
+    }
     const hasChatToday = (g.replayTimeline || []).some(
       (f) => f.day === g.dayNumber && f.kind === "village_chat"
     );
@@ -139,21 +184,70 @@ export function flushBotInteractionsForCurrentPhase(room, gameCtrl, { includeDay
         chatText: text,
         caption: `💬 ${speaker.name}: "${text}"`,
       });
-    }
-  } else if (includeDayActions && g.phase === "day_nominate" && Object.keys(g.nominationVotes || {}).length === 0) {
-    const primarySuspect = pickRandom(alivePlayers);
-    if (primarySuspect) {
-      aliveBots.forEach((b) => {
-        if (b.id !== primarySuspect.id) {
-          gameCtrl.nominationVote(room, b.id, primarySuspect.id);
-        }
+      io?.to(room.code)?.emit("village:chat", {
+        senderId: speaker.id,
+        senderName: speaker.name,
+        message: text,
       });
     }
-  } else if (includeDayActions && g.phase === "day_final_vote" && Object.keys(g.finalVotes || {}).length === 0) {
+  } else if (includeDayActions && g.phase === "day_defense") {
     const defendantId = g.hotSeatQueue?.[g.hotSeatIndex];
+    const defendant = aliveBots.find((b) => b.id === defendantId);
+    if (defendant) {
+      const plea = pickRandom(DEFENSE_BOT_LINES);
+      gameCtrl.recordReplayEvent?.(room, {
+        kind: "village_chat",
+        phase: "day_defense",
+        actorId: defendant.id,
+        chatText: plea,
+        caption: `⚖️ ${defendant.name}: "${plea}"`,
+      });
+      io?.to(room.code)?.emit("village:chat", {
+        senderId: defendant.id,
+        senderName: defendant.name,
+        message: plea,
+      });
+    }
+  } else if (includeDayActions && g.phase === "day_nominate") {
+    const humanVotes = Object.entries(g.nominationVotes || {})
+      .filter(([vid]) => {
+        const p = room.players.find((x) => x.id === vid);
+        return p && !p.isBot;
+      })
+      .map(([, v]) => v?.targetId)
+      .filter(Boolean);
+
+    const primarySuspect =
+      (humanVotes[0] && alivePlayers.find((p) => p.id === humanVotes[0])) ||
+      pickRandom(alivePlayers);
+
+    aliveBots.forEach((b) => {
+      if (g.nominationVotes?.[b.id]?.targetId) return;
+      let target = null;
+      if (isWolfTeamRole(b.role)) {
+        const nonWolves = alivePlayers.filter((p) => p.id !== b.id && !isWolfTeamRole(p.role));
+        target = pickRandom(nonWolves);
+      } else {
+        if (primarySuspect && primarySuspect.id !== b.id && Math.random() < 0.6) {
+          target = primarySuspect;
+        } else {
+          target = pickRandom(alivePlayers.filter((p) => p.id !== b.id));
+        }
+      }
+      if (target) {
+        gameCtrl.nominationVote(room, b.id, target.id);
+      }
+    });
+  } else if (includeDayActions && g.phase === "day_final_vote") {
+    const defendantId = g.hotSeatQueue?.[g.hotSeatIndex];
+    const defendant = room.players.find((p) => p.id === defendantId);
     aliveBots.forEach((b, idx) => {
+      if (g.finalVotes?.[b.id]) return;
       if (b.id === defendantId) {
         gameCtrl.finalVote(room, b.id, "spare");
+      } else if (isWolfTeamRole(b.role)) {
+        const decision = isWolfTeamRole(defendant?.role) ? "spare" : "hang";
+        gameCtrl.finalVote(room, b.id, decision);
       } else {
         const decision = idx % 3 === 0 ? "spare" : "hang";
         gameCtrl.finalVote(room, b.id, decision);
@@ -162,24 +256,34 @@ export function flushBotInteractionsForCurrentPhase(room, gameCtrl, { includeDay
   }
 }
 
-export function setupDevPhaseHook(gameCtrl) {
-  if (!IS_LOCAL_DEV) return;
-
+// ============ ĐỘNG CƠ AI BOT CHÍNH THỨC (CHẠY CẢ LOCAL LẪN PRODUCTION KHI PHÒNG CÓ BOT) ============
+export function setupDevPhaseHook(gameCtrl, io = null) {
   gameCtrl.setPhaseHook((room) => {
     if (!room || room.phase !== "playing" || !room.game || room.game.winner) return;
     if (room.devAutoBot === false) return;
+    if (!room.players.some((p) => p.isBot)) return;
 
     const g = room.game;
-    const phaseRoleMap = {
+    const nightRoleMap = {
+      night_cupid: "cupid",
       night_guard: "guard",
-      night_wolf: "wolf",
+      night_wolf: "wolf_team",
       night_witch: "witch",
       night_seer: "seer",
+      hunter_revenge: "hunter_revenge",
     };
-    const activeRole = phaseRoleMap[g.phase];
-    if (!activeRole) return;
+    const dayBotPhases = new Set([
+      "day_discuss",
+      "day_nominate",
+      "day_defense",
+      "day_final_vote",
+    ]);
 
-    const phaseKey = `${g.dayNumber}:${g.phase}`;
+    const activeRole = nightRoleMap[g.phase];
+    const isDayBotPhase = dayBotPhases.has(g.phase);
+    if (!activeRole && !isDayBotPhase) return;
+
+    const phaseKey = `${g.dayNumber}:${g.phase}:${g.hunterPendingId || ""}:${g.hotSeatIndex ?? -1}`;
     if (room.lastAutoPhaseKey === phaseKey) return;
     room.lastAutoPhaseKey = phaseKey;
 
@@ -188,25 +292,75 @@ export function setupDevPhaseHook(gameCtrl) {
       room.devBotTimer = null;
     }
 
+    const delayMs = activeRole
+      ? 1200
+      : g.phase === "day_defense"
+        ? 1500
+        : g.phase === "day_discuss"
+          ? 2200
+          : 2600;
+
     room.devBotTimer = setTimeout(() => {
       room.devBotTimer = null;
       if (room.phase !== "playing" || !room.game || room.game.winner) return;
       if (room.devAutoBot === false) return;
-      if (`${room.game.dayNumber}:${room.game.phase}` !== phaseKey) return;
+      const currentKey = `${room.game.dayNumber}:${room.game.phase}:${room.game.hunterPendingId || ""}:${room.game.hotSeatIndex ?? -1}`;
+      if (currentKey !== phaseKey) return;
 
       const alivePlayers = room.players.filter((p) => p.alive);
-      const aliveHumansOfRole = alivePlayers.filter((p) => !p.isBot && p.role === activeRole);
+      const aliveHumans = alivePlayers.filter((p) => !p.isBot);
 
-      flushBotInteractionsForCurrentPhase(room, gameCtrl, { includeDayActions: false });
-
-      // Nếu người thật KHÔNG cầm vai ở lượt đêm này -> tự động tua qua để đến lượt người thật / Bình Minh siêu nhanh!
-      if (aliveHumansOfRole.length === 0) {
-        gameCtrl.advanceCurrentPhase(room);
-      } else {
-        // Nếu người thật có cầm vai (VD cùng là Sói với Bot), chỉ cập nhật UI và chờ người thật thao tác
-        gameCtrl.broadcast(room);
+      if (activeRole === "hunter_revenge") {
+        const pendingHunter = room.players.find((p) => p.id === room.game.hunterPendingId);
+        if (pendingHunter?.isBot) {
+          flushBotInteractionsForCurrentPhase(room, gameCtrl, { includeDayActions: false, io });
+        }
+        return;
       }
-    }, 1200);
+
+      if (activeRole) {
+        const aliveHumansOfRole = alivePlayers.filter(
+          (p) =>
+            !p.isBot &&
+            (activeRole === "wolf_team" ? isWolfTeamRole(p.role) : p.role === activeRole)
+        );
+        flushBotInteractionsForCurrentPhase(room, gameCtrl, { includeDayActions: false, io });
+        if (aliveHumansOfRole.length === 0 && room.game.phase === g.phase) {
+          gameCtrl.advanceCurrentPhase(room);
+        } else {
+          gameCtrl.broadcast(room);
+        }
+        return;
+      }
+
+      // Ban ngày (Thảo luận / Đề cử / Biện hộ / Bỏ phiếu cuối)
+      flushBotInteractionsForCurrentPhase(room, gameCtrl, { includeDayActions: true, io });
+      gameCtrl.broadcast(room);
+
+      if (g.phase === "day_discuss") {
+        // Nếu người chơi thật đã hy sinh (đang xem đàn AI Bot đấu nốt ván) -> tự chuyển sang Đề cử sau 3.2s!
+        if (aliveHumans.length === 0) {
+          const tNext = setTimeout(() => {
+            if (room.phase === "playing" && room.game?.phase === "day_discuss" && !room.game.winner) {
+              gameCtrl.advanceCurrentPhase(room);
+            }
+          }, 3200);
+          tNext.unref?.();
+        }
+      } else if (g.phase === "day_nominate" || g.phase === "day_final_vote") {
+        if (aliveHumans.length === 0) {
+          const tNext = setTimeout(() => {
+            if (room.phase === "playing" && room.game?.phase === g.phase && !room.game.winner) {
+              gameCtrl.advanceCurrentPhase(room);
+            }
+          }, 1800);
+          tNext.unref?.();
+        } else {
+          checkBotVoteConsensus(room, gameCtrl);
+        }
+      }
+    }, delayMs);
+    room.devBotTimer.unref?.();
   });
 }
 
@@ -226,63 +380,22 @@ export function registerDevSocketHandlers(socket, gameCtrl, broadcastRoom) {
 
   // 1. Bơm Bot vào sảnh chờ (lấp đủ 6 người hoặc thêm +N Bot)
   socket.on("dev:addBots", ({ count = 5, fillToMin = false } = {}, cb) => {
-    withDevRoom((room, player) => {
-      if (room.phase !== "lobby") {
-        return cb?.({ ok: false, error: "Chỉ thêm Bot khi đang ở Sảnh Chờ (Lobby)." });
-      }
+    withDevRoom((room) => {
       const needed = fillToMin ? Math.max(0, 6 - room.players.length) : Number(count) || 1;
-      const canAdd = Math.min(needed, 18 - room.players.length);
-      if (canAdd <= 0) {
-        return cb?.({ ok: true, added: 0, total: room.players.length });
-      }
-
-      const existingNames = new Set(room.players.map((p) => p.name));
-      for (let i = 0; i < canAdd; i++) {
-        const idx = room.players.filter((p) => p.isBot).length;
-        let botName = BOT_NAMES[idx % BOT_NAMES.length];
-        if (existingNames.has(botName)) botName = `${botName} #${idx + 1}`;
-        existingNames.add(botName);
-
-        const seed = BOT_SEEDS[idx % BOT_SEEDS.length] + "-" + idx;
-        room.players.push({
-          id: `bot_${randomUUID().slice(0, 8)}`,
-          socketId: null,
-          isBot: true,
-          connected: true,
-          sessionToken: null,
-          disconnectedAt: null,
-          name: botName,
-          avatar: `https://api.dicebear.com/7.x/bottts/svg?seed=${seed}&backgroundColor=b6e3f4,c0aede,d1d4f9`,
-          isHost: false,
-          ready: true,
-          seatIndex: room.players.length,
-          alive: true,
-          role: null,
-        });
-      }
-
-      room.rolesConfig = generateDefaultRoles(room.players.length);
-      const myForced = room.devForcedRoles?.[player.id];
-      if (myForced) ensureRoleInLobbyConfig(room, myForced);
-
+      const res = addBotsToRoom(room.code, needed, { syncRolesMode: "classic" });
+      if (res.error) return cb?.({ ok: false, error: res.error });
       broadcastRoom(room);
-      cb?.({ ok: true, added: canAdd, total: room.players.length });
+      cb?.({ ok: true, added: res.added, total: res.total });
     });
   });
 
   // 2. Xóa toàn bộ Bot khỏi sảnh chờ
   socket.on("dev:clearBots", (_, cb) => {
-    withDevRoom((room, player) => {
-      if (room.phase !== "lobby") {
-        return cb?.({ ok: false, error: "Hãy về Sảnh Chờ trước khi xóa Bot." });
-      }
-      room.players = room.players.filter((p) => !p.isBot);
-      room.rolesConfig = generateDefaultRoles(Math.max(6, room.players.length));
-      const myForced = room.devForcedRoles?.[player.id];
-      if (myForced) ensureRoleInLobbyConfig(room, myForced);
-
+    withDevRoom((room) => {
+      const res = clearBotsFromRoom(room.code, { syncRoles: true });
+      if (res.error) return cb?.({ ok: false, error: res.error });
       broadcastRoom(room);
-      cb?.({ ok: true, total: room.players.length });
+      cb?.({ ok: true, total: res.total });
     });
   });
 
@@ -386,7 +499,7 @@ export function registerDevSocketHandlers(socket, gameCtrl, broadcastRoom) {
 
       if (action === "nominate_wolf" && g.phase === "day_nominate") {
         const target =
-          room.players.find((p) => p.alive && p.role === "wolf" && p.id !== player.id) ||
+          room.players.find((p) => p.alive && isWolfTeamRole(p.role) && p.id !== player.id) ||
           aliveBots[0];
         if (!target) return cb?.({ ok: false, error: "Không tìm thấy mục tiêu để đề cử." });
         aliveBots.forEach((b) => {
