@@ -17,6 +17,7 @@ import {
 } from "./rooms.js";
 
 import { createGameController } from "./gameController.js";
+import { isWolfTeamRole } from "./roles.js";
 import { setupDevPhaseHook, registerDevSocketHandlers } from "./devSandbox.js";
 import { AccessToken } from "livekit-server-sdk";
 import https from "https";
@@ -163,6 +164,81 @@ function isLocalDevRequest(req) {
 
 // Health check — Render dùng để verify server alive
 app.get("/", (req, res) => res.json({ status: "ok", game: "Ma Soi Online", uptime: process.uptime() }));
+
+// ── TTS Proxy: Giải quyết CORS Mixed-Content khi production HTTPS cần gọi VoiceStudio ──
+// Client (masoi.hiepd5.com HTTPS) → POST /api/tts → Server Render HTTPS → VoiceStudio tunnel (ngrok)
+// Setup: Set env vars trên Render Dashboard:
+//   VOICESTUDIO_URL  = https://xxxx.ngrok-free.app   (URL ngrok tunnel đến localhost:3900)
+//   VOICESTUDIO_VOICE_ID = prof_xxxxx                 (profile id sau khi clone giọng)
+app.post("/api/tts", async (req, res) => {
+  const vsUrl = process.env.VOICESTUDIO_URL;
+  if (!vsUrl) return res.status(503).json({ error: "VoiceStudio URL not configured. Set VOICESTUDIO_URL env var on Render." });
+
+  const { text, voice, speed } = req.body || {};
+  if (!text || typeof text !== "string" || text.trim().length === 0) {
+    return res.status(400).json({ error: "Missing or empty text" });
+  }
+  if (text.length > 500) {
+    return res.status(400).json({ error: "Text too long (max 500 chars)" });
+  }
+
+  const ttsSpeed = typeof speed === "number" && speed > 0 && speed <= 2 ? speed : 0.88;
+  const ttsVoice = (typeof voice === "string" && voice.trim()) || process.env.VOICESTUDIO_VOICE_ID || "alloy";
+
+  const payload = JSON.stringify({
+    model: "omnivoice",
+    voice: ttsVoice,
+    input: text.trim(),
+    response_format: "mp3",
+    speed: ttsSpeed,
+  });
+
+  try {
+    const targetUrl = new URL("/v1/audio/speech", vsUrl);
+    // Dùng https hoặc http tùy protocol của VoiceStudio URL
+    const httpLib = targetUrl.protocol === "https:"
+      ? (await import("https")).default
+      : (await import("http")).default;
+
+    const proxyReq = httpLib.request(
+      targetUrl,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer local",
+          "Content-Length": Buffer.byteLength(payload),
+        },
+        timeout: 30000,
+      },
+      (proxyRes) => {
+        if (proxyRes.statusCode !== 200) {
+          // Drain response body trước khi gửi lỗi
+          proxyRes.resume();
+          return res.status(502).json({ error: `VoiceStudio returned HTTP ${proxyRes.statusCode}` });
+        }
+        res.setHeader("Content-Type", "audio/mpeg");
+        res.setHeader("Cache-Control", "no-store");
+        res.setHeader("X-TTS-Voice", ttsVoice);
+        proxyRes.pipe(res);
+      }
+    );
+
+    proxyReq.on("error", (err) => {
+      if (!res.headersSent) res.status(502).json({ error: "VoiceStudio unreachable", detail: err.message });
+    });
+
+    proxyReq.on("timeout", () => {
+      proxyReq.destroy();
+      if (!res.headersSent) res.status(504).json({ error: "VoiceStudio timeout (30s)" });
+    });
+
+    proxyReq.write(payload);
+    proxyReq.end();
+  } catch (err) {
+    if (!res.headersSent) res.status(500).json({ error: "Internal error", detail: err.message });
+  }
+});
 
 // API Tự động quét kho phụ kiện/tạo hình .GLB 8 Vai từ Tripo AI (0 lỗi 404 console!)
 const ROLE_MODELS_DIR = path.resolve(__dirname, "../client/public/models/roles");
@@ -704,6 +780,14 @@ io.on("connection", (socket) => {
     });
   });
 
+  socket.on("action:cupidLink", ({ targetIds }, cb) => {
+    withPlayer((room, player) => {
+      const result = gameCtrl.cupidLink(room, player.id, targetIds);
+      if (result.ok) gameCtrl.broadcast(room);
+      cb?.(result);
+    });
+  });
+
   socket.on("action:guardProtect", ({ targetId }, cb) => {
     withPlayer((room, player) => {
       const result = gameCtrl.guardProtect(room, player.id, targetId);
@@ -720,23 +804,48 @@ io.on("connection", (socket) => {
     });
   });
 
+  socket.on("action:wolfAlphaToggle", ({ enabled }, cb) => {
+    withPlayer((room, player) => {
+      const result = gameCtrl.wolfAlphaToggle(room, player.id, enabled);
+      if (result.ok) gameCtrl.broadcast(room);
+      cb?.(result);
+    });
+  });
+
+  socket.on("action:mayorReveal", (_, cb) => {
+    withPlayer((room, player) => {
+      if (room.game?.winner) return cb?.({ ok: false, error: "Trò chơi đã kết thúc." });
+      const result = gameCtrl.mayorReveal(room, player.id);
+      if (result.ok) gameCtrl.broadcast(room);
+      cb?.(result);
+    });
+  });
+
+  socket.on("action:hunterShoot", ({ targetId }, cb) => {
+    withPlayer((room, player) => {
+      if (room.game?.winner) return cb?.({ ok: false, error: "Trò chơi đã kết thúc." });
+      const result = gameCtrl.hunterShoot(room, player.id, targetId);
+      cb?.(result);
+    });
+  });
+
   socket.on("action:wolfChat", ({ message }, cb) => {
     withPlayer((room, player) => {
-      if (player.role !== "wolf") return;
+      if (!isWolfTeamRole(player.role)) return;
       const cleanMsg = String(message || "").trim();
       if (cleanMsg && room.game && !room.game.winner) {
         const myTargetId = room.game.wolfPicks?.[player.id]?.targetId || null;
         gameCtrl.recordReplayEvent?.(room, {
           kind: "wolf_chat",
           actorId: player.id,
-          actorRole: "wolf",
+          actorRole: player.role,
           targetId: myTargetId,
           chatText: cleanMsg,
           caption: `🐺 [Mật đàm Sói] ${player.name}: "${cleanMsg.slice(0, 90)}"`,
         });
       }
       room.players.forEach(p => {
-        if (p.role === "wolf" && p.id !== player.id && p.connected && p.socketId) {
+        if (isWolfTeamRole(p.role) && p.id !== player.id && p.connected && p.socketId) {
           io.to(p.socketId).emit("wolf:chat", { senderId: player.id, message });
         }
       });
