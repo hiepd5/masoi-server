@@ -24,6 +24,14 @@ import {
 import { createGameController } from "./gameController.js";
 import { isWolfTeamRole, generateExpandedV33Roles } from "./roles.js";
 import {
+  DEFAULT_VOICE_ID,
+  DEFAULT_TTS_SPEED,
+  getOrGenerateMp3,
+  getCachedMp3ByRawText,
+  checkVoiceStudioHealth,
+  getVoiceEngineStatus,
+} from "./storyVoiceEngine.js";
+import {
   setupDevPhaseHook,
   registerDevSocketHandlers,
   checkBotVoteConsensus,
@@ -174,89 +182,56 @@ function isLocalDevRequest(req) {
 // Health check — Render dùng để verify server alive
 app.get("/", (req, res) => res.json({ status: "ok", game: "Ma Soi Online", uptime: process.uptime() }));
 
-// ── TTS Proxy: Giải quyết CORS Mixed-Content khi production HTTPS cần gọi VoiceStudio ──
-// Client (masoi.hiepd5.com HTTPS) → POST /api/tts → Server Render HTTPS → VoiceStudio tunnel (ngrok)
-// Setup: Set env vars trên Render Dashboard:
-//   VOICESTUDIO_URL  = https://xxxx.ngrok-free.app   (URL ngrok tunnel đến localhost:3900)
-//   VOICESTUDIO_VOICE_ID = prof_xxxxx                 (profile id sau khi clone giọng)
-app.post("/api/tts", async (req, res) => {
-  const isLocalEnv = !process.env.RENDER && process.env.NODE_ENV !== "production";
-  const defaultVsUrl = isLocalEnv
-    ? "http://localhost:3900"
-    : "https://cassette-letter-paralegal.ngrok-free.dev";
-  const vsUrl = (process.env.VOICESTUDIO_URL || defaultVsUrl).trim();
+// Trạng thái VoiceStudio & bộ nhớ đệm StoryVoiceEngine (cho phép HUD báo chấm Online/Offline)
+app.get("/api/tts-status", async (req, res) => {
+  await checkVoiceStudioHealth(req.query?.force === "1");
+  return res.json(getVoiceEngineStatus());
+});
 
+// ── TTS Proxy + LRU RAM Cache: Giải quyết CORS Mixed-Content & phục vụ 0ms từ Cache cuốn chiếu ──
+app.post("/api/tts", async (req, res) => {
   const { text, voice, speed } = req.body || {};
   if (!text || typeof text !== "string" || text.trim().length === 0) {
     return res.status(400).json({ error: "Missing or empty text" });
   }
-  if (text.length > 500) {
-    return res.status(400).json({ error: "Text too long (max 500 chars)" });
+  if (text.length > 550) {
+    return res.status(400).json({ error: "Text too long (max 550 chars)" });
   }
 
-  const ttsSpeed = typeof speed === "number" && speed > 0 && speed <= 2 ? speed : 0.88;
-  const ttsVoice = (typeof voice === "string" && voice.trim()) || process.env.VOICESTUDIO_VOICE_ID || "alloy";
+  const ttsSpeed = typeof speed === "number" && speed > 0 && speed <= 2 ? speed : DEFAULT_TTS_SPEED;
+  const ttsVoice =
+    typeof voice === "string" && voice.trim() && voice.trim() !== "alloy"
+      ? voice.trim()
+      : DEFAULT_VOICE_ID;
 
-  const payload = JSON.stringify({
-    model: "omnivoice",
+  res.setHeader("Access-Control-Expose-Headers", "X-TTS-Voice, X-TTS-Cache");
+
+  const cachedNow = getCachedMp3ByRawText(text);
+  if (cachedNow) {
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-TTS-Voice", ttsVoice);
+    res.setHeader("X-TTS-Cache", "HIT");
+    return res.end(cachedNow);
+  }
+
+  const buf = await getOrGenerateMp3(text, {
     voice: ttsVoice,
-    input: text.trim(),
-    response_format: "mp3",
     speed: ttsSpeed,
+    priority: "urgent",
   });
-
-  try {
-    const targetUrl = new URL("/v1/audio/speech", vsUrl);
-    const httpLib = targetUrl.protocol === "https:"
-      ? (await import("https")).default
-      : (await import("http")).default;
-
-    const proxyReq = httpLib.request(
-      targetUrl,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": "Bearer local",
-          "ngrok-skip-browser-warning": "true",
-          "User-Agent": "MaSoiOnline-ServerProxy/3.4",
-          "Content-Length": Buffer.byteLength(payload),
-        },
-        timeout: 12000,
-      },
-      (proxyRes) => {
-        const contentType = String(proxyRes.headers["content-type"] || "").toLowerCase();
-        const isAudioPayload =
-          proxyRes.statusCode === 200 &&
-          (contentType.includes("audio") || contentType.includes("octet-stream"));
-        if (!isAudioPayload) {
-          // Chặn đứng trang HTML cảnh báo/lỗi của ngrok khi cổng 3900 chưa mở xong
-          proxyRes.resume();
-          return res.status(502).json({
-            error: `VoiceStudio not ready (HTTP ${proxyRes.statusCode}, type=${contentType || "unknown"})`,
-          });
-        }
-        res.setHeader("Content-Type", "audio/mpeg");
-        res.setHeader("Cache-Control", "no-store");
-        res.setHeader("X-TTS-Voice", ttsVoice);
-        proxyRes.pipe(res);
-      }
-    );
-
-    proxyReq.on("error", (err) => {
-      if (!res.headersSent) res.status(502).json({ error: "VoiceStudio unreachable", detail: err.message });
+  if (!buf) {
+    return res.status(502).json({
+      error: "VoiceStudio offline or not ready",
+      vsOnline: false,
     });
-
-    proxyReq.on("timeout", () => {
-      proxyReq.destroy();
-      if (!res.headersSent) res.status(504).json({ error: "VoiceStudio timeout (12s)" });
-    });
-
-    proxyReq.write(payload);
-    proxyReq.end();
-  } catch (err) {
-    if (!res.headersSent) res.status(500).json({ error: "Internal error", detail: err.message });
   }
+
+  res.setHeader("Content-Type", "audio/mpeg");
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("X-TTS-Voice", ttsVoice);
+  res.setHeader("X-TTS-Cache", "MISS");
+  return res.end(buf);
 });
 
 // API Tự động quét kho phụ kiện/tạo hình .GLB 8 Vai từ Tripo AI (0 lỗi 404 console!)
@@ -1184,73 +1159,49 @@ httpServer.listen(PORT, () => {
   console.log(`Server ma sói đang chạy tại http://localhost:${PORT}`);
 });
 
-// ── TTS Batch: Pre-generate toan bo cau MC truoc khi game bat dau ──
-// Client gui 1 request voi mang phrases -> server generate tung cai -> tra base64 JSON
+// ── TTS Batch: Tra LRU RAM Cache (~0ms nếu đã tạo cuốn chiếu trong trận) hoặc tạo tuần tự qua hàng đợi GPU ──
 app.post("/api/tts-batch", async (req, res) => {
-  const isLocalEnv = !process.env.RENDER && process.env.NODE_ENV !== "production";
-  const defaultVsUrl = isLocalEnv
-    ? "http://localhost:3900"
-    : "https://cassette-letter-paralegal.ngrok-free.dev";
-  const vsUrl = (process.env.VOICESTUDIO_URL || defaultVsUrl).trim();
-  const ttsVoice = process.env.VOICESTUDIO_VOICE_ID || "b5d182f3";
-
-  const { phrases, speed } = req.body || {};
+  const { phrases, speed, voice, urgent } = req.body || {};
   if (!Array.isArray(phrases) || phrases.length === 0) {
     return res.status(400).json({ error: "Missing phrases array" });
   }
-  if (phrases.length > 120) {
-    return res.status(400).json({ error: "Too many phrases (max 120)" });
-  }
-  const ttsSpeed = typeof speed === "number" && speed > 0 && speed <= 2 ? speed : 0.82;
-
-  async function generateOne(text) {
-    const payload = JSON.stringify({
-      model: "omnivoice",
-      voice: ttsVoice,
-      input: text.trim(),
-      response_format: "mp3",
-      speed: ttsSpeed,
-    });
-    return new Promise(async (resolve) => {
-      try {
-        const targetUrl = new URL("/v1/audio/speech", vsUrl);
-        const httpLib = targetUrl.protocol === "https:"
-          ? (await import("https")).default
-          : (await import("http")).default;
-        const chunks = [];
-        const proxyReq = httpLib.request(targetUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer local",
-            "ngrok-skip-browser-warning": "true",
-            "Content-Length": Buffer.byteLength(payload),
-          },
-          timeout: 20000,
-        }, (r) => {
-          const ct = String(r.headers["content-type"] || "").toLowerCase();
-          if (r.statusCode !== 200 || (!ct.includes("audio") && !ct.includes("octet"))) {
-            r.resume(); return resolve(null);
-          }
-          r.on("data", (c) => chunks.push(c));
-          r.on("end", () => resolve(Buffer.concat(chunks)));
-        });
-        proxyReq.on("error", () => resolve(null));
-        proxyReq.on("timeout", () => { proxyReq.destroy(); resolve(null); });
-        proxyReq.write(payload);
-        proxyReq.end();
-      } catch { resolve(null); }
-    });
+  if (phrases.length > 160) {
+    return res.status(400).json({ error: "Too many phrases (max 160)" });
   }
 
-  // Generate tuan tu de khong overload VoiceStudio GPU
+  const ttsSpeed = typeof speed === "number" && speed > 0 && speed <= 2 ? speed : DEFAULT_TTS_SPEED;
+  const ttsVoice =
+    typeof voice === "string" && voice.trim() && voice.trim() !== "alloy"
+      ? voice.trim()
+      : DEFAULT_VOICE_ID;
+
   const results = {};
+  let cacheHits = 0;
+
   for (const text of phrases) {
     if (!text || typeof text !== "string" || text.trim().length === 0) continue;
-    const key = text.trim();
-    const buf = await generateOne(key);
-    results[key] = buf ? buf.toString("base64") : null;
+    const rawKey = text.trim();
+    const cached = getCachedMp3ByRawText(rawKey);
+    if (cached) {
+      results[rawKey] = cached.toString("base64");
+      cacheHits += 1;
+      continue;
+    }
+    const buf = await getOrGenerateMp3(rawKey, {
+      voice: ttsVoice,
+      speed: ttsSpeed,
+      priority: urgent ? "urgent" : "normal",
+    });
+    results[rawKey] = buf ? buf.toString("base64") : null;
   }
 
-  res.json({ ok: true, count: Object.keys(results).length, results });
+  const status = getVoiceEngineStatus();
+  res.json({
+    ok: true,
+    count: Object.keys(results).length,
+    cacheHits,
+    vsOnline: status.vsOnline,
+    voiceId: ttsVoice,
+    results,
+  });
 });

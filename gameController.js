@@ -1,5 +1,12 @@
 import * as GE from "./gameEngine.js";
 import { publicRoomView, getRoom, addBotsToRoom } from "./rooms.js";
+import {
+  warmRoomOpeningVoices,
+  warmCupidLoversVoices,
+  warmStoryTimelineProgressively,
+  warmEndGameFinaleVoice,
+  warmPhrasesInBackground,
+} from "./storyVoiceEngine.js";
 
 // timers: Map<roomCode, Timeout>
 const timers = new Map();
@@ -65,6 +72,13 @@ export function createGameController(io) {
   }
 
   function announce(room, message) {
+    if (
+      message &&
+      (message.includes("AI Bot") ||
+        room?.players?.some((p) => p?.name && message.includes(p.name)))
+    ) {
+      warmPhrasesInBackground([message], "urgent");
+    }
     io.to(room.code).emit("mc:message", message);
   }
 
@@ -159,6 +173,7 @@ export function createGameController(io) {
 
     room.phase = "playing";
     room.lastAutoPhaseKey = null;
+    warmRoomOpeningVoices(room, GE.TIMERS.defense, autoAddedBots);
     if (autoAddedBots > 0) {
       announce(
         room,
@@ -193,6 +208,7 @@ export function createGameController(io) {
   // ============ ĐÊM 1: THẦN TÌNH YÊU ============
   function advanceFromCupid(room) {
     GE.endCupidPhase(room);
+    warmCupidLoversVoices(room);
     announce(room, "Thần Tình Yêu đã ngủ lại. Bảo Vệ ơi, hãy thức dậy và chọn người bảo vệ...");
     setRoomTimer(room.code, GE.TIMERS.guard * 1000, advanceFromGuard);
     broadcast(room);
@@ -201,6 +217,7 @@ export function createGameController(io) {
   // ============ ĐÊM: BẢO VỆ ============
   function advanceFromGuard(room) {
     GE.endGuardPhase(room);
+    warmStoryTimelineProgressively(room);
     announce(room, "Bảo Vệ đã ngủ lại. Sói ơi, hãy thức dậy và chọn con mồi...");
     setRoomTimer(room.code, GE.TIMERS.wolf * 1000, advanceFromWolf);
     broadcast(room);
@@ -209,6 +226,7 @@ export function createGameController(io) {
   // ============ ĐÊM: SÓI ============
   function advanceFromWolf(room) {
     GE.endWolfPhase(room);
+    warmStoryTimelineProgressively(room);
     announce(room, "Sói đã ngủ lại. Phù Thủy ơi, hãy thức dậy...");
     setRoomTimer(room.code, GE.TIMERS.witch * 1000, advanceFromWitch);
     broadcast(room);
@@ -217,6 +235,7 @@ export function createGameController(io) {
   // ============ ĐÊM: PHÙ THỦY ============
   function advanceFromWitch(room) {
     GE.endWitchPhase(room);
+    warmStoryTimelineProgressively(room);
     announce(room, "Phù Thủy đã ngủ lại. Tiên Tri ơi, hãy thức dậy và soi một người...");
     setRoomTimer(room.code, GE.TIMERS.seer * 1000, advanceFromSeer);
     broadcast(room);
@@ -226,6 +245,7 @@ export function createGameController(io) {
   function advanceFromSeer(room) {
     GE.endSeerPhase(room);
     const deaths = GE.resolveNightDeaths(room);
+    warmStoryTimelineProgressively(room);
     if (deaths.length === 0) {
       announce(room, "Trời đã sáng. Đêm qua không ai chết.");
     } else {
@@ -288,6 +308,7 @@ export function createGameController(io) {
     const res = GE.hunterShoot(room, hunterId, targetId);
     if (!res.ok) return res;
     clearRoomTimer(room.code);
+    warmStoryTimelineProgressively(room);
     const hunter = room.players.find((p) => p.id === hunterId);
     const killedNames = (res.killedIds || [])
       .map((id) => room.players.find((p) => p.id === id)?.name)
@@ -330,6 +351,7 @@ export function createGameController(io) {
 
   function finalizeNominationPhase(room) {
     const { nominees } = GE.finalizeNomination(room);
+    warmStoryTimelineProgressively(room);
     if (nominees.length === 0) {
       announce(room, "Không ai bị đề cử. Đêm mới lại đến...");
       return goToNextNight(room);
@@ -368,6 +390,7 @@ export function createGameController(io) {
   function finishFinalVoteTurn(room) {
     const g = room.game;
     const result = GE.resolveFinalVote(room); // xử lý hotSeatQueue[hotSeatIndex]
+    warmStoryTimelineProgressively(room);
     const defendant = room.players.find((p) => p.id === result.defendantId);
 
     if (result.hanged) {
@@ -430,6 +453,7 @@ export function createGameController(io) {
     room.phase = "ended";
     room.game.winner = winner;
     room.game.awards = GE.computeMatchAwards(room);
+    warmEndGameFinaleVoice(room);
     clearRoomTimer(room.code);
     if (room.devBotTimer) {
       clearTimeout(room.devBotTimer);
@@ -479,6 +503,7 @@ export function createGameController(io) {
     advanceCurrentPhase,
     cupidLink: (room, id, targetIds) => {
       const res = GE.cupidLink(room, id, targetIds);
+      if (res.ok) warmCupidLoversVoices(room);
       if (res.ok && room.game.phase === "night_cupid") {
         clearRoomTimer(room.code);
         const t = setTimeout(() => {
@@ -497,6 +522,7 @@ export function createGameController(io) {
     mayorReveal: (room, id) => {
       const res = GE.mayorReveal(room, id);
       if (res.ok) {
+        warmStoryTimelineProgressively(room);
         const mayor = room.players.find((p) => p.id === id);
         announce(
           room,

@@ -1,4 +1,5 @@
 import { assignCustomRoles, isWolfTeamRole, ROLE_LABELS } from "./roles.js";
+import { warmStoryTimelineProgressively } from "./storyVoiceEngine.js";
 
 // ============ HẰNG SỐ THỜI GIAN (giây) ============
 export const TIMERS = {
@@ -186,6 +187,9 @@ export function recordReplayEvent(room, evt = {}) {
   }
 
   g.replayTimeline.push(frame);
+  if (MILESTONE_REPLAY_KINDS.has(frame.kind)) {
+    warmStoryTimelineProgressively(room);
+  }
   return frame;
 }
 

@@ -14,6 +14,13 @@ import {
 } from "../rooms.js";
 import { createGameController } from "../gameController.js";
 import { registerDevSocketHandlers } from "../devSandbox.js";
+import {
+  normalizeTtsText,
+  getTtsCacheKey,
+  deriveStoryNarrationsFromRoom,
+  DEFAULT_VOICE_ID,
+  DEFAULT_TTS_SPEED,
+} from "../storyVoiceEngine.js";
 
 const startTime = performance.now();
 const results = [];
@@ -777,6 +784,66 @@ runScenario("21. V3.4: Phòng 'playing' hiện tiến độ Ngày/Số người 
   assert.equal(midJoin.phase, "playing");
 
   removePlayer(liveRoom.code, "live_host", { explicitLeave: true });
+});
+
+// 22. V3.5 — Story Voice Engine: Lọc sạch Emoji/Tiếng Anh 100%, khớp Cache Key 1:1 & bỏ qua Chat người chơi trong Replay
+runScenario("22. V3.5: Story Voice Engine lọc sạch Emoji/English, khớp Cache 1:1 & bỏ qua Chat trong Replay", () => {
+  assert.equal(DEFAULT_VOICE_ID, "b5d182f3");
+  assert.equal(DEFAULT_TTS_SPEED, 0.82);
+
+  const rawSample = "👑 [🤖 Bot Sói Xám] đạt MVP sau màn vote x2 vs AI Bot!!";
+  const cleaned = normalizeTtsText(rawSample);
+  assert.equal(
+    cleaned,
+    "Sói Xám đạt ngôi vương xuất sắc nhất sau màn bỏ phiếu nhân hai đối đầu người máy!",
+    "Phải lọc sạch Emoji, bỏ tiền tố 🤖 Bot và Việt hóa 100% MVP/vote/x2/vs/AI Bot"
+  );
+  assert.equal(
+    getTtsCacheKey("🎤 Mời 🤖 Bot Cáo Đỏ lên biện hộ. (8 giây)"),
+    getTtsCacheKey("Mời [Cáo Đỏ] lên biện hộ. (8 giây)")
+  );
+
+  // Mô phỏng ván đấu có cả hành động thật và cảnh chat tự do (wolf_chat, village_chat)
+  const room = makeTestRoom({
+    w1: "wolf", g1: "guard", wt: "witch", sr: "seer", v1: "villager", v2: "villager"
+  });
+  room.players[0].name = "🤖 Bot Sói Xám";
+  const wolf = room.players[0];
+  const guard = room.players.find((p) => p.role === "guard");
+  const v1 = room.players.find((p) => p.name === "Player_v1");
+
+  GE.guardProtect(room, guard.id, v1.id);
+  GE.endGuardPhase(room);
+  GE.recordReplayEvent(room, {
+    kind: "wolf_chat",
+    phase: "night_wolf",
+    actorId: wolf.id,
+    actorRole: "wolf",
+    chatText: "Hello bro let's attack v1 tonight!",
+  });
+  GE.wolfPick(room, wolf.id, v1.id);
+  GE.endWolfPhase(room);
+  GE.endWitchPhase(room);
+  GE.endSeerPhase(room);
+  GE.resolveNightDeaths(room);
+  GE.startDiscussion(room);
+  GE.recordReplayEvent(room, {
+    kind: "village_chat",
+    phase: "day_discuss",
+    actorId: v1.id,
+    chatText: "Skip vote fast guys!",
+  });
+
+  const narrations = deriveStoryNarrationsFromRoom(room);
+  assert.ok(narrations.length >= 3, "Phải trích xuất đầy đủ các nhịp kể chuyện hành động");
+  assert.ok(
+    narrations.every((line) => !line.includes("Hello bro") && !line.includes("Skip vote")),
+    "Tuyệt đối KHÔNG đưa nội dung wolf_chat / village_chat vào giọng đọc MC"
+  );
+  for (const line of narrations) {
+    const norm = normalizeTtsText(line);
+    assert.equal(/\b(Bot|MVP|vote|x2)\b/i.test(norm), false, `Không còn từ tiếng Anh lọt vào TTS: ${norm}`);
+  }
 });
 
 const totalMs = (performance.now() - startTime).toFixed(1);
