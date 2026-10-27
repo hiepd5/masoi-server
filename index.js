@@ -28,6 +28,7 @@ import {
   DEFAULT_TTS_SPEED,
   getOrGenerateMp3,
   getCachedMp3ByRawText,
+  warmPhrasesInBackground,
   checkVoiceStudioHealth,
   getVoiceEngineStatus,
 } from "./storyVoiceEngine.js";
@@ -1159,7 +1160,10 @@ httpServer.listen(PORT, () => {
   console.log(`Server ma sói đang chạy tại http://localhost:${PORT}`);
 });
 
-// ── TTS Batch: Tra LRU RAM Cache (~0ms nếu đã tạo cuốn chiếu trong trận) hoặc tạo tuần tự qua hàng đợi GPU ──
+// ── TTS Batch: Tra LRU RAM Cache (~0ms nếu đã tạo cuốn chiếu trong trận) + giới hạn giữ HTTP <= 18s chống Timeout Proxy Render ──
+const MAX_BATCH_WALL_MS = 18000;
+const WALL_TIMEOUT_TOKEN = Symbol("TTS_BATCH_WALL_TIMEOUT");
+
 app.post("/api/tts-batch", async (req, res) => {
   const { phrases, speed, voice, urgent } = req.body || {};
   if (!Array.isArray(phrases) || phrases.length === 0) {
@@ -1176,30 +1180,100 @@ app.post("/api/tts-batch", async (req, res) => {
       : DEFAULT_VOICE_ID;
 
   const results = {};
+  const uncachedKeys = [];
   let cacheHits = 0;
 
+  // Vòng 1 (0ms): Lấy toàn bộ các câu đã có sẵn trong LRU RAM Cache trước tiên
   for (const text of phrases) {
     if (!text || typeof text !== "string" || text.trim().length === 0) continue;
     const rawKey = text.trim();
+    if (Object.prototype.hasOwnProperty.call(results, rawKey)) continue;
     const cached = getCachedMp3ByRawText(rawKey);
     if (cached) {
       results[rawKey] = cached.toString("base64");
       cacheHits += 1;
-      continue;
+    } else {
+      uncachedKeys.push(rawKey);
     }
-    const buf = await getOrGenerateMp3(rawKey, {
+  }
+
+  if (uncachedKeys.length === 0) {
+    const status = getVoiceEngineStatus();
+    return res.json({
+      ok: true,
+      count: Object.keys(results).length,
+      cacheHits,
+      pending: [],
+      vsOnline: status.vsOnline !== false,
+      voiceId: ttsVoice,
+      results,
+    });
+  }
+
+  // Kiểm tra sức khỏe VoiceStudio thật trước khi xếp hàng GPU (trả kết quả nhanh <300ms nếu máy cá nhân đang tắt)
+  const isOnlineNow = await checkVoiceStudioHealth(false);
+  if (!isOnlineNow) {
+    for (const rawKey of uncachedKeys) {
+      results[rawKey] = null;
+    }
+    return res.json({
+      ok: true,
+      count: Object.keys(results).length,
+      cacheHits,
+      pending: [],
+      vsOnline: false,
+      voiceId: ttsVoice,
+      results,
+    });
+  }
+
+  const deadline = Date.now() + MAX_BATCH_WALL_MS;
+  const pending = [];
+
+  for (let i = 0; i < uncachedKeys.length; i += 1) {
+    const rawKey = uncachedKeys[i];
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 800) {
+      const rest = uncachedKeys.slice(i);
+      warmPhrasesInBackground(rest, urgent ? "urgent" : "normal");
+      pending.push(...rest);
+      break;
+    }
+
+    const genPromise = getOrGenerateMp3(rawKey, {
       voice: ttsVoice,
       speed: ttsSpeed,
       priority: urgent ? "urgent" : "normal",
     });
-    results[rawKey] = buf ? buf.toString("base64") : null;
+
+    let timerId = null;
+    const outcome = await Promise.race([
+      genPromise,
+      new Promise((resolve) => {
+        timerId = setTimeout(() => resolve(WALL_TIMEOUT_TOKEN), remainingMs);
+      }),
+    ]);
+    if (timerId) clearTimeout(timerId);
+
+    if (outcome === WALL_TIMEOUT_TOKEN) {
+      pending.push(rawKey);
+      const rest = uncachedKeys.slice(i + 1);
+      if (rest.length > 0) {
+        warmPhrasesInBackground(rest, urgent ? "urgent" : "normal");
+        pending.push(...rest);
+      }
+      break;
+    }
+
+    results[rawKey] = outcome ? outcome.toString("base64") : null;
   }
 
   const status = getVoiceEngineStatus();
-  res.json({
+  return res.json({
     ok: true,
     count: Object.keys(results).length,
     cacheHits,
+    pending,
     vsOnline: status.vsOnline,
     voiceId: ttsVoice,
     results,

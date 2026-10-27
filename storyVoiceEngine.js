@@ -177,10 +177,10 @@ function requestVoiceStudioSpeech(cleanText, voiceId, speed) {
             "Content-Type": "application/json",
             "Authorization": "Bearer local",
             "ngrok-skip-browser-warning": "true",
-            "User-Agent": "MaSoiOnline-StoryVoiceEngine/3.5",
+            "User-Agent": "MaSoiOnline-StoryVoiceEngine/3.5.1",
             "Content-Length": Buffer.byteLength(payload),
           },
-          timeout: 18000,
+          timeout: 26000,
         },
         (res) => {
           const ct = String(res.headers["content-type"] || "").toLowerCase();
@@ -188,7 +188,7 @@ function requestVoiceStudioSpeech(cleanText, voiceId, speed) {
             res.statusCode === 200 && (ct.includes("audio") || ct.includes("octet-stream"));
           if (!validAudio) {
             res.resume();
-            vsHealthState = { online: false, checkedAt: Date.now() };
+            checkVoiceStudioHealth(true).catch(() => {});
             return resolve(null);
           }
           res.on("data", (c) => chunks.push(c));
@@ -204,12 +204,12 @@ function requestVoiceStudioSpeech(cleanText, voiceId, speed) {
         }
       );
       req.on("error", () => {
-        vsHealthState = { online: false, checkedAt: Date.now() };
+        checkVoiceStudioHealth(true).catch(() => {});
         resolve(null);
       });
       req.on("timeout", () => {
         req.destroy();
-        vsHealthState = { online: false, checkedAt: Date.now() };
+        checkVoiceStudioHealth(true).catch(() => {});
         resolve(null);
       });
       req.write(payload);
