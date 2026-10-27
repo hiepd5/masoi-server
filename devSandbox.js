@@ -1,3 +1,4 @@
+import "./envLoader.js";
 import {
   getRoom,
   addBotsToRoom,
@@ -6,7 +7,11 @@ import {
 } from "./rooms.js";
 import { generateDefaultRoles, isWolfTeamRole, ROLE_LABELS } from "./roles.js";
 
-export const IS_LOCAL_DEV = !process.env.RENDER && process.env.NODE_ENV !== "production";
+// SEC-06: Khóa cứng 100% DevSandbox trên Render/Production & chỉ mở khi ALLOW_LOCAL_STUDIO === "1"
+export const IS_LOCAL_DEV =
+  !process.env.RENDER &&
+  process.env.NODE_ENV !== "production" &&
+  process.env.ALLOW_LOCAL_STUDIO === "1";
 
 function pickRandom(arr) {
   if (!arr || arr.length === 0) return null;
@@ -142,17 +147,26 @@ export function flushBotInteractionsForCurrentPhase(
         gameCtrl.wolfPick(room, botWolf.id, finalTarget.id);
       });
     }
-  } else if (g.phase === "night_witch" && !g.witchSaveTonight && !g.witchPoisonTargetId) {
+  } else if (
+    g.phase === "night_witch" &&
+    !g.witchSaveTonight &&
+    !g.witchPoisonTargetId &&
+    !g.witchDecidedPass
+  ) {
     const botWitch = aliveBots.find((p) => p.role === "witch");
     if (botWitch) {
       if (!g.witchUsedSave && g.wolfVictimId && (g.dayNumber >= 2 || Math.random() < 0.55)) {
-        gameCtrl.witchDecide(room, botWitch.id, { save: true });
+        gameCtrl.witchDecide(room, botWitch.id, { save: true, pass: true });
       } else if (!g.witchUsedPoison && g.dayNumber >= 2 && Math.random() < 0.45) {
         const candidates = alivePlayers.filter((p) => p.id !== botWitch.id && p.id !== g.wolfVictimId);
         const poisonTarget = pickRandom(candidates);
         if (poisonTarget) {
-          gameCtrl.witchDecide(room, botWitch.id, { poisonTargetId: poisonTarget.id });
+          gameCtrl.witchDecide(room, botWitch.id, { poisonTargetId: poisonTarget.id, pass: true });
+        } else {
+          gameCtrl.witchDecide(room, botWitch.id, { pass: true });
         }
+      } else {
+        gameCtrl.witchDecide(room, botWitch.id, { pass: true });
       }
     }
   } else if (g.phase === "night_seer") {
@@ -319,17 +333,10 @@ export function setupDevPhaseHook(gameCtrl, io = null) {
       }
 
       if (activeRole) {
-        const aliveHumansOfRole = alivePlayers.filter(
-          (p) =>
-            !p.isBot &&
-            (activeRole === "wolf_team" ? isWolfTeamRole(p.role) : p.role === activeRole)
-        );
         flushBotInteractionsForCurrentPhase(room, gameCtrl, { includeDayActions: false, io });
-        if (aliveHumansOfRole.length === 0 && room.game.phase === g.phase) {
-          gameCtrl.advanceCurrentPhase(room);
-        } else {
-          gameCtrl.broadcast(room);
-        }
+        gameCtrl.broadcast(room);
+        // Giao cho Smart Pacing + Random Jitter điều tiết thời gian chuyển pha (Solo 1 người = 1.8s; Bàn >=2 người = 5.5s-8.5s chống lộ vai!)
+        gameCtrl.notifyBotNightReady?.(room);
         return;
       }
 

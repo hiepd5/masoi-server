@@ -5,19 +5,35 @@ import {
   createRoom,
   addPlayer,
   removePlayer,
+  reconnectByToken,
   setRoomAccess,
+  setRoomTurbo,
   setSoloPracticeRole,
   addBotsToRoom,
   getPublicRoomsList,
   getRoom,
+  deleteRoom,
+  hasValidActiveSessionToken,
   publicRoomView,
 } from "../rooms.js";
+import {
+  isOriginAllowed,
+  checkIpRateLimit,
+  recordPasswordFailure,
+  getPasswordLockRemainingSec,
+  clearPasswordFailures,
+  sanitizeAvatarUrl,
+  sanitizeChatText,
+  isSafeReactionEmoji,
+} from "../securityGuard.js";
 import { createGameController } from "../gameController.js";
 import { registerDevSocketHandlers } from "../devSandbox.js";
 import {
   normalizeTtsText,
   getTtsCacheKey,
   deriveStoryNarrationsFromRoom,
+  buildOpeningVoicePlan,
+  getVoiceEngineStatus,
   DEFAULT_VOICE_ID,
   DEFAULT_TTS_SPEED,
 } from "../storyVoiceEngine.js";
@@ -344,10 +360,12 @@ runScenario("11. DevSandbox Solo: +5 Bot tự Ready, Ép vai Phù Thủy, Tua Ph
   assert.equal(startRes.ok, true, "Bắt đầu game với vai ép tanner ở phòng 6 người phải thành công");
   assert.equal(host.role, "tanner", "Host phải nhận đúng vai Chán Đời đã ép");
 
-  // Đổi nóng sang Phù Thủy ngay trong trận + Tua qua các phase Đêm -> Thảo luận -> Đề cử
+  // Đổi nóng sang Phù Thủy ngay trong trận + Tua qua các phase Mở màn -> Đêm -> Thảo luận -> Đề cử
+  assert.equal(room.game.phase, "role_reveal", "Ván đấu mới phải mở màn ở pha độc lập role_reveal (6.0s)");
   handlers["dev:forceRole"]({ role: "witch" }, () => {});
   assert.equal(host.role, "witch");
 
+  handlers["dev:skipPhase"]({}, () => {}); // role_reveal -> night_guard
   handlers["dev:skipPhase"]({}, () => {}); // night_guard -> night_wolf
   handlers["dev:skipPhase"]({}, () => {}); // night_wolf -> night_witch
   handlers["dev:skipPhase"]({}, () => {}); // night_witch -> night_seer
@@ -844,6 +862,339 @@ runScenario("22. V3.5: Story Voice Engine lọc sạch Emoji/English, khớp Cac
     const norm = normalizeTtsText(line);
     assert.equal(/\b(Bot|MVP|vote|x2)\b/i.test(norm), false, `Không còn từ tiếng Anh lọt vào TTS: ${norm}`);
   }
+});
+
+// 23. SEC-03 — Chặn cướp ghế giữa trận bằng trùng tên & chỉ cho phép reconnectByToken hợp lệ
+runScenario("23. SEC-03: Chặn cướp ghế giữa trận bằng trùng tên; bắt buộc dùng sessionToken", () => {
+  const ioStub = { to: () => ({ emit: () => {} }) };
+  const ctrl = createGameController(ioStub);
+  const room = createRoom("sec_host");
+  const { player: host } = addPlayer(room.code, "sec_host", "HiepChuPhong");
+  addBotsToRoom(room.code, 5);
+  assert.equal(ctrl.startGame(room).ok, true);
+  ctrl.clearRoomTimer(room.code);
+
+  // Giả lập chủ phòng rớt mạng giữa trận, hacker cố vào phòng gõ trùng tên "HiepChuPhong"
+  removePlayer(room.code, "sec_host", { explicitLeave: false });
+  assert.equal(host.connected, false);
+
+  const spoofAttempt = addPlayer(room.code, "attacker_sock", "HiepChuPhong");
+  assert.ok(spoofAttempt.error, "Phải chặn đứng kẻ lạ mạo danh tên để cướp ghế đang chơi");
+  assert.equal(host.socketId, "sec_host", "Socket ghế chủ phòng không được bị ghi đè bởi hacker");
+
+  // Token giả mạo -> bị từ chối
+  const fakeTokenRes = reconnectByToken(room.code, "00000000-fake-token-999999", "attacker_sock");
+  assert.ok(fakeTokenRes.error, "Token giả mạo phải bị chặn");
+
+  // Token thật của chủ phòng -> khôi phục ghế thành công!
+  const validReconnect = reconnectByToken(room.code, host.sessionToken, "new_host_sock");
+  assert.equal(validReconnect.player.id, host.id);
+  assert.equal(host.connected, true);
+  assert.equal(host.socketId, "new_host_sock");
+  deleteRoom(room.code);
+});
+
+// 24. SEC-07 — Chống mở 2 Tab cùng deviceId soi bài trên bàn công khai (enforceAntiMultiTab)
+runScenario("24. SEC-07: Chặn mở 2 Tab cùng deviceId vào bàn công khai khi bật enforceAntiMultiTab", () => {
+  const room = createRoom("tab1_sock", { accessMode: "public" });
+  const join1 = addPlayer(room.code, "tab1_sock", "Người Chơi A", null, null, "", {
+    deviceId: "dev_abc123456",
+    enforceAntiMultiTab: true,
+  });
+  assert.ok(join1.player);
+
+  const dupTab = addPlayer(room.code, "tab2_sock", "Clone Soi Bài", null, null, "", {
+    deviceId: "dev_abc123456",
+    enforceAntiMultiTab: true,
+  });
+  assert.ok(dupTab.error, "Phải chặn Tab thứ 2 cùng deviceId nhảy vào bàn công khai");
+
+  const diffDevice = addPlayer(room.code, "phone_sock", "Bạn Khác Máy", null, null, "", {
+    deviceId: "dev_xyz987654",
+    enforceAntiMultiTab: true,
+  });
+  assert.ok(diffDevice.player, "Thiết bị khác deviceId vào bàn bình thường");
+  deleteRoom(room.code);
+});
+
+// 25. SEC-05 — Whitelist Avatar URL: Chặn XSS javascript:, link lạ, path traversal '..'
+runScenario("25. SEC-05: sanitizeAvatarUrl chặn XSS/link lạ & chỉ nhận tài nguyên hợp lệ", () => {
+  assert.equal(sanitizeAvatarUrl("javascript:alert(1)"), null);
+  assert.equal(sanitizeAvatarUrl("https://evil-tracker.com/pixel.png"), null);
+  assert.equal(sanitizeAvatarUrl("/avatars/../../etc/passwd"), null);
+  assert.equal(sanitizeAvatarUrl("x".repeat(500)), null);
+  assert.equal(sanitizeAvatarUrl("/portraits/wolf_1x1.webp"), "/portraits/wolf_1x1.webp");
+  assert.equal(
+    sanitizeAvatarUrl("https://api.dicebear.com/7.x/adventurer/svg?seed=test"),
+    "https://api.dicebear.com/7.x/adventurer/svg?seed=test"
+  );
+});
+
+// 26. SEC-04 & SEC-05 — Rate-limit IP, khóa dò mật khẩu 5 lần -> 15s, cắt Chat <= 240 ký tự & lọc Emoji an toàn
+runScenario("26. SEC-04/05: Rate-limit IP, khóa sai mật khẩu 5 lần (15s), cắt Chat <= 240 ký tự", () => {
+  const testIp = "203.0.113.77";
+  assert.equal(checkIpRateLimit("unit_test_bucket", testIp, 2, 10_000).allowed, true);
+  assert.equal(checkIpRateLimit("unit_test_bucket", testIp, 2, 10_000).allowed, true);
+  const thirdHit = checkIpRateLimit("unit_test_bucket", testIp, 2, 10_000);
+  assert.equal(thirdHit.allowed, false, "Lần gọi vượt ngưỡng Rate-limit phải bị chặn");
+  assert.ok(thirdHit.retryAfterSec >= 1);
+
+  clearPasswordFailures(testIp);
+  for (let i = 0; i < 4; i++) {
+    assert.equal(recordPasswordFailure(testIp), 0);
+  }
+  assert.equal(recordPasswordFailure(testIp), 15, "Sai mật khẩu lần thứ 5 phải khóa IP 15 giây");
+  assert.ok(getPasswordLockRemainingSec(testIp) > 0);
+  clearPasswordFailures(testIp);
+
+  const giantText = "Sói kìa! ".repeat(80);
+  const cleanChat = sanitizeChatText(giantText);
+  assert.equal(cleanChat.length, 240, "Tin nhắn quá dài phải bị cắt gọn đúng 240 ký tự");
+
+  assert.equal(isSafeReactionEmoji("🔥"), true);
+  assert.equal(isSafeReactionEmoji("🐺"), true);
+  assert.equal(isSafeReactionEmoji("<script>"), false);
+  assert.equal(isSafeReactionEmoji("HACKED123"), false);
+});
+
+// 27. SEC-02 — Xác thực X-Game-Session cho cổng /api/tts chống leech GPU VoiceStudio
+runScenario("27. SEC-02: hasValidActiveSessionToken xác thực người chơi thật & chặn token giả", () => {
+  const room = createRoom("tts_host");
+  const { player } = addPlayer(room.code, "tts_host", "MC Listener");
+  addBotsToRoom(room.code, 2);
+
+  assert.equal(hasValidActiveSessionToken(player.sessionToken), true);
+  assert.equal(hasValidActiveSessionToken(""), false);
+  assert.equal(hasValidActiveSessionToken("short_tok"), false);
+  assert.equal(hasValidActiveSessionToken("11111111-2222-3333-4444-555555555555"), false);
+  deleteRoom(room.code);
+});
+
+// 28. SEC-04 — Khóa CORS Whitelist cho Web chính thức, Preview Vercel & App CapacitorJS
+runScenario("28. SEC-04: isOriginAllowed mở cho masoi.hiepd5.com + CapacitorJS & chặn miền lạ", () => {
+  assert.equal(isOriginAllowed("https://masoi.hiepd5.com"), true);
+  assert.equal(isOriginAllowed("capacitor://localhost"), true);
+  assert.equal(isOriginAllowed("https://masoi-client-git-main.vercel.app"), true);
+  assert.equal(isOriginAllowed("https://evil-hacker-site.com"), false);
+  assert.equal(isOriginAllowed("https://masoi.hiepd5.com.evil.org"), false);
+});
+
+// 29. V4.1 — Pha mở màn độc lập role_reveal (6.0s) bảo toàn trọn vẹn thời gian Đêm 1 & hỗ trợ Sẵn sàng sớm
+runScenario("29. V4.1: Pha mở màn role_reveal (6.0s) độc lập trước Đêm 1 & Sẵn sàng sớm", () => {
+  const ioStub = { to: () => ({ emit: () => {} }) };
+  const ctrl = createGameController(ioStub);
+  const room = createRoom("rr_host");
+  const { player: p1 } = addPlayer(room.code, "rr_host", "Người Thật 1");
+  const { player: p2 } = addPlayer(room.code, "rr_guest", "Người Thật 2");
+  p2.ready = true;
+  room.rolesConfig = generateExpandedV33Roles(6); // Có Cupid -> sau role_reveal phải vào night_cupid đủ 25s!
+
+  assert.equal(ctrl.startGame(room).ok, true);
+  assert.equal(room.game.phase, "role_reveal");
+  assert.equal(room.game.phaseDurationSec, 6);
+
+  const r1 = ctrl.markRoleRevealReady(room, p1.id);
+  assert.equal(r1.allHumansReady, false, "Mới 1/2 người bấm Sẵn sàng thì chưa chuyển sớm");
+  const r2 = ctrl.markRoleRevealReady(room, p2.id);
+  assert.equal(r2.allHumansReady, true, "Đủ 2/2 người thật bấm Sẵn sàng -> kích hoạt vào Đêm 1 sớm");
+
+  ctrl.advanceCurrentPhase(room);
+  assert.equal(room.game.phase, "night_cupid", "Hết role_reveal phải vào đúng night_cupid mà không mất 1 giây nào");
+  assert.equal(room.game.phaseDurationSec, GE.TIMERS.cupid);
+  ctrl.clearRoomTimer(room.code);
+  deleteRoom(room.code);
+});
+
+// 30. V4.1 — Chế độ Tốc Chiến 5 Phút (Turbo Mode) rút gọn đồng bộ Thảo luận / Đề cử / Biện hộ / Bỏ phiếu
+runScenario("30. V4.1: Chế độ Tốc Chiến (Turbo 5 Phút) áp dụng đúng bộ đếm 75s/20s/35s/20s", () => {
+  const room = createRoom("turbo_host");
+  const { player: host } = addPlayer(room.code, "turbo_host", "Chủ Tốc Chiến");
+  for (let i = 1; i <= 5; i++) {
+    const { player } = addPlayer(room.code, `tb_${i}`, `Dân ${i}`);
+    player.ready = true;
+  }
+
+  const toggleRes = setRoomTurbo(room.code, host.socketId, true);
+  assert.equal(toggleRes.ok, true);
+  assert.equal(room.isTurbo, true);
+
+  GE.initGameState(room);
+  assert.equal(GE.getPhaseDurationSec(room, "day_discuss"), 75);
+  assert.equal(GE.getPhaseDurationSec(room, "day_nominate"), 20);
+  assert.equal(GE.getPhaseDurationSec(room, "day_defense"), 35);
+  assert.equal(GE.getPhaseDurationSec(room, "day_final_vote"), 20);
+
+  GE.startDiscussion(room);
+  const view = publicRoomView(room, host.socketId);
+  assert.equal(view.isTurbo, true);
+  assert.equal(view.game.isTurbo, true);
+  assert.equal(view.game.phaseDurationSec, 75, "publicRoomView phải truyền phaseDurationSec=75s xuống thanh tiến trình Client");
+  deleteRoom(room.code);
+});
+
+// 31. V4.1 — Thảo luận ban ngày co giãn thông minh: 60s khi Solo+Bot & 120s khi tàn cuộc <= 4 người
+runScenario("31. V4.1: Thảo luận co giãn thông minh (60s Solo+Bot | 120s khi còn <= 4 người sống)", () => {
+  const soloRoom = createRoom("solo_d");
+  addPlayer(soloRoom.code, "solo_d", "Solo Tester");
+  addBotsToRoom(soloRoom.code, 5);
+  GE.initGameState(soloRoom);
+  assert.equal(GE.getPhaseDurationSec(soloRoom, "day_discuss"), 60, "Chơi 1 mình với Bot chỉ thảo luận 60s");
+  deleteRoom(soloRoom.code);
+
+  const endGameRoom = makeTestRoom({
+    w1: "wolf", g1: "guard", wt: "witch", sr: "seer", v1: "villager", v2: "villager"
+  });
+  assert.equal(GE.getPhaseDurationSec(endGameRoom, "day_discuss"), 180, "Đầu ván 6 người thật giữ 180s");
+  endGameRoom.players[4].alive = false;
+  endGameRoom.players[5].alive = false;
+  assert.equal(GE.getPhaseDurationSec(endGameRoom, "day_discuss"), 120, "Tàn cuộc <= 4 người sống co gọn còn 120s");
+  deleteRoom(endGameRoom.code);
+});
+
+// 32. V4.1 — Phù Thủy bấm Bỏ qua ({ pass: true }) & Smart Pacing không làm nhảy phaseEndsAt công khai (Zero Meta-Leak)
+runScenario("32. V4.1: Phù Thủy { pass: true } & Smart Pacing giữ nguyên phaseEndsAt chống lộ vai", () => {
+  const ioStub = { to: () => ({ emit: () => {} }) };
+  const ctrl = createGameController(ioStub);
+  const room = createRoom("mp_host");
+  addPlayer(room.code, "mp_host", "Chủ Bàn");
+  for (let i = 1; i <= 5; i++) {
+    const { player } = addPlayer(room.code, `mp_${i}`, `Người ${i}`);
+    player.ready = true;
+  }
+  ctrl.startGame(room, { skipRoleReveal: true });
+  // Ép vai để test Phù Thủy
+  const roles = ["wolf", "guard", "witch", "seer", "villager", "villager"];
+  room.players.forEach((p, idx) => { p.role = roles[idx]; p.initialRole = roles[idx]; });
+  GE.syncInitialRoleState(room);
+
+  const guard = room.players.find((p) => p.role === "guard");
+  const phaseEndsBeforeClick = room.game.phaseEndsAt;
+  assert.equal(ctrl.guardProtect(room, guard.id, guard.id).ok, true);
+  assert.equal(
+    room.game.phaseEndsAt,
+    phaseEndsBeforeClick,
+    "Zero Meta-Timing Leak: Bấm kỹ năng sớm KHÔNG ĐƯỢC làm giật lùi đồng hồ phaseEndsAt của người đang ngủ!"
+  );
+
+  ctrl.advanceCurrentPhase(room); // sang night_wolf
+  ctrl.advanceCurrentPhase(room); // sang night_witch
+  const witch = room.players.find((p) => p.role === "witch");
+  const passRes = ctrl.witchDecide(room, witch.id, { pass: true });
+  assert.equal(passRes.ok, true);
+  assert.equal(room.game.witchDecidedPass, true, "Phù Thủy bấm Ngủ lại / Bỏ qua phải ghi nhận witchDecidedPass=true");
+
+  ctrl.clearRoomTimer(room.code);
+  deleteRoom(room.code);
+});
+
+// 33. V4.1 — Trưởng Làng lộ diện ở 5 giây cuối vòng bỏ phiếu tự động bù +5s chống đánh úp (1 lần/pha)
+runScenario("33. V4.1: Trưởng Làng lộ diện lúc < 6s cuối tự bù +5s chống đánh úp (chỉ 1 lần)", () => {
+  const ioStub = { to: () => ({ emit: () => {} }) };
+  const ctrl = createGameController(ioStub);
+  const room = createRoom("my_host");
+  addPlayer(room.code, "my_host", "Trưởng Làng Test");
+  for (let i = 1; i <= 5; i++) {
+    const { player } = addPlayer(room.code, `my_${i}`, `Dân ${i}`);
+    player.ready = true;
+  }
+  room.rolesConfig = generateExpandedV33Roles(6);
+  ctrl.startGame(room, { skipRoleReveal: true });
+  const roles = ["wolf", "mayor", "guard", "witch", "seer", "hunter"];
+  room.players.forEach((p, idx) => { p.role = roles[idx]; p.initialRole = roles[idx]; });
+  GE.syncInitialRoleState(room);
+
+  // Đưa tới vòng Đề cử & giả lập đồng hồ chỉ còn 3.0 giây cuối
+  room.game.phase = "day_reveal";
+  ctrl.advanceCurrentPhase(room); // day_discuss
+  ctrl.advanceCurrentPhase(room); // day_nominate
+  assert.equal(room.game.phase, "day_nominate");
+
+  room.game.phaseEndsAt = Date.now() + 3000;
+  const beforeRevealEnd = room.game.phaseEndsAt;
+  const mayor = room.players.find((p) => p.role === "mayor");
+  assert.equal(ctrl.mayorReveal(room, mayor.id).ok, true);
+  assert.ok(
+    room.game.phaseEndsAt >= beforeRevealEnd + 4500,
+    "Trưởng Làng lật bài khi còn 3s phải được bù thêm +5s để cả làng kịp xoay phiếu"
+  );
+
+  ctrl.clearRoomTimer(room.code);
+  deleteRoom(room.code);
+});
+
+// 34. V4.1 — Thợ Săn bóp cò kích hoạt đệm điện ảnh 2.8s trước khi chuyển cảnh / kết ván
+runScenario("34. V4.1: Thợ Săn bắn đạn bạc giữ đệm điện ảnh 2.8s không cắt cảnh đột ngột", () => {
+  const ioStub = { to: () => ({ emit: () => {} }) };
+  const ctrl = createGameController(ioStub);
+  const room = createRoom("ht_host");
+  addPlayer(room.code, "ht_host", "Thợ Săn Test");
+  for (let i = 1; i <= 5; i++) {
+    const { player } = addPlayer(room.code, `ht_${i}`, `Dân ${i}`);
+    player.ready = true;
+  }
+  room.rolesConfig = generateExpandedV33Roles(6);
+  ctrl.startGame(room, { skipRoleReveal: true });
+  const roles = ["wolf", "hunter", "guard", "witch", "seer", "mayor"];
+  room.players.forEach((p, idx) => { p.role = roles[idx]; p.initialRole = roles[idx]; });
+  GE.syncInitialRoleState(room);
+
+  const wolf = room.players.find((p) => p.role === "wolf");
+  const hunter = room.players.find((p) => p.role === "hunter");
+
+  // Sói cắn Thợ Săn trong đêm -> Bình minh mở pha hunter_revenge
+  room.game.phase = "night_wolf";
+  ctrl.wolfPick(room, wolf.id, hunter.id);
+  ctrl.advanceCurrentPhase(room); // night_witch
+  ctrl.advanceCurrentPhase(room); // night_seer
+  ctrl.advanceCurrentPhase(room); // resolve -> hunter_revenge
+  assert.equal(room.game.phase, "hunter_revenge");
+
+  const shotRes = ctrl.hunterShoot(room, hunter.id, wolf.id);
+  assert.equal(shotRes.ok, true);
+  assert.equal(wolf.alive, false);
+  assert.equal(room.phase, "playing", "Trong 2.8s đệm đạn bạc, phòng vẫn ở trạng thái playing để diễn trọn VFX 3D");
+  const bufferMs = room.game.phaseEndsAt - Date.now();
+  assert.ok(bufferMs >= 2200 && bufferMs <= 3000, `Đệm điện ảnh phải ~2.8s (thực tế: ${bufferMs}ms)`);
+
+  ctrl.clearRoomTimer(room.code);
+  deleteRoom(room.code);
+});
+
+// 35. V3.5.2 / V4.1 — Instant End-Game Voice: Zero-Waste (cắt 100% 51 câu giả định) + Hàng đợi 3 làn ưu tiên GPU RTX 3090
+runScenario("35. Instant End-Game Voice: Zero-Waste (0 câu giả định đầu ván) + Hàng đợi 3 làn ưu tiên GPU", () => {
+  const room = createRoom("vc_host");
+  addPlayer(room.code, "vc_host", "Hiệp MC");
+  addBotsToRoom(room.code, 7);
+
+  const plan = buildOpeningVoicePlan(room, 7);
+  assert.equal(
+    plan.urgent.length,
+    1,
+    "Đầu ván chỉ được xếp 1 câu mở màn Phim Kể Chuyện vào làn urgent (cắt sạch 51 câu giả định gây tắc GPU!)"
+  );
+  assert.equal(plan.liveHint.length, 4, "Làn liveHint đầu ván chỉ giữ 4 câu kết cuộc chung");
+
+  const status = getVoiceEngineStatus();
+  assert.ok(status.lanes && typeof status.lanes.urgent === "number", "Phải phơi bày đủ 3 làn ưu tiên urgent/story/liveHint");
+
+  GE.initGameState(room);
+  const p0 = room.players[0];
+  const p1 = room.players[1];
+  GE.recordReplayEvent(room, { kind: "guard_pick", actorId: p0.id, targetId: p1.id });
+  GE.recordReplayEvent(room, { kind: "wolf_aim", actorId: p1.id, targetId: p0.id });
+  GE.recordReplayEvent(room, { kind: "wolf_chat", actorId: p1.id, chatText: "Cắn ghế 1 đi" });
+  GE.recordReplayEvent(room, { kind: "peaceful_dawn" });
+  GE.recordReplayEvent(room, { kind: "day_nominate", actorId: p0.id, targetId: p1.id });
+  GE.recordReplayEvent(room, { kind: "village_chat", actorId: p0.id, chatText: "Treo cổ ghế 2!" });
+
+  const narrations = deriveStoryNarrationsFromRoom(room);
+  assert.equal(
+    narrations.length,
+    5,
+    "Phải sinh đủ 5 câu kể chuyện (Mở màn + Bảo Vệ + Sói ngắm + Bình minh yên ả + Đề cử) và bỏ qua 100% chat người chơi"
+  );
+
+  deleteRoom(room.code);
 });
 
 const totalMs = (performance.now() - startTime).toFixed(1);

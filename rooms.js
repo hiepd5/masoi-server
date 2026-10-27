@@ -1,3 +1,4 @@
+import "./envLoader.js";
 import { randomUUID } from "crypto";
 import { getDefaultName, getAvatarUrl } from "./defaultNames.js";
 import {
@@ -6,9 +7,44 @@ import {
   isWolfTeamRole,
   ROLE_LABELS,
 } from "./roles.js";
+import {
+  IS_PRODUCTION_ENV,
+  MAX_ACTIVE_ROOMS,
+  MAX_CHAT_LENGTH,
+  sanitizeAvatarUrl,
+  sanitizeChatText,
+  sanitizeDeviceId,
+} from "./securityGuard.js";
 
 // rooms: Map<roomCode, RoomState>
 const rooms = new Map();
+
+export function getActiveRoomCount() {
+  return rooms.size;
+}
+
+export function canCreateNewRoom() {
+  if (rooms.size < MAX_ACTIVE_ROOMS) return true;
+  const now = Date.now();
+  for (const [code, r] of rooms.entries()) {
+    const connectedHumans = r.players.filter((p) => !p.isBot && p.connected).length;
+    if (connectedHumans === 0 && now - (r.createdAt || 0) > 5 * 60 * 1000) {
+      deleteRoom(code);
+    }
+  }
+  return rooms.size < MAX_ACTIVE_ROOMS;
+}
+
+export function hasValidActiveSessionToken(token) {
+  if (!token || typeof token !== "string" || token.length < 16) return false;
+  const trimmed = token.trim();
+  for (const room of rooms.values()) {
+    if (room.players.some((p) => !p.isBot && p.sessionToken === trimmed)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 export const BOT_NAMES = [
   "🤖 Bot Sói Xám", "🤖 Bot Cáo Đỏ", "🤖 Bot Cú Đêm", "🤖 Bot Thợ Săn",
@@ -104,7 +140,7 @@ export function createRoom(hostSocketId, options = {}) {
   const validMode = ["public", "password", "hidden"].includes(rawMode) ? rawMode : "public";
   const cleanPassword = String(options.password || "").trim().slice(0, 32);
   const accessMode = validMode === "password" && !cleanPassword ? "public" : validMode;
-  const cleanTitle = String(options.roomTitle || "").trim().slice(0, 36);
+  const cleanTitle = sanitizeChatText(String(options.roomTitle || ""), 36);
 
   const room = {
     code,
@@ -113,6 +149,7 @@ export function createRoom(hostSocketId, options = {}) {
     roomTitle: cleanTitle,
     accessMode, // 'public' | 'password' | 'hidden'
     password: accessMode === "password" ? cleanPassword : "",
+    isTurbo: Boolean(options.isTurbo),
     soloPracticeRole: null,
     createdAt: Date.now(),
     scenePresetId: "nordic_village_v3",
@@ -146,32 +183,17 @@ export function addPlayer(
   requestedName,
   avatarSeed = null,
   avatarUrl = null,
-  passwordInput = ""
+  passwordInput = "",
+  options = {}
 ) {
   const room = getRoom(code);
   if (!room) return { error: "Phòng không tồn tại hoặc đã đóng." };
 
   clearOrphanTimer(room);
-  let name = requestedName?.trim();
+  let name = sanitizeChatText(String(requestedName || ""), 20);
 
-  // Reconnect logic — chỉ cho phép reconnect vào slot người thật (!p.isBot)
-  if (room.phase !== "lobby" && name) {
-    const existingPlayer = room.players.find((p) => !p.isBot && p.name === name);
-    if (existingPlayer && existingPlayer.socketId !== socketId) {
-      existingPlayer.socketId = socketId;
-      existingPlayer.connected = true;
-      existingPlayer.leftExplicitly = false;
-      if (existingPlayer.disconnectTimer) {
-        clearTimeout(existingPlayer.disconnectTimer);
-        existingPlayer.disconnectTimer = null;
-      }
-      return { room, player: existingPlayer };
-    }
-    if (existingPlayer && existingPlayer.socketId === socketId) {
-      return { room, player: existingPlayer };
-    }
-  }
-
+  // SEC-03 FIX: Tuyệt đối KHÔNG cho phép cướp ghế đang chơi chỉ bằng trùng Tên hiển thị!
+  // Việc kết nối lại giữa trận bắt buộc 100% phải đi qua `reconnectByToken(code, sessionToken, socketId)`.
   if (room.phase !== "lobby") {
     if (room.phase === "playing") {
       return {
@@ -199,8 +221,27 @@ export function addPlayer(
       return {
         error: "Mật khẩu phòng không chính xác!",
         requirePassword: true,
+        passwordFailed: true,
       };
     }
+  }
+
+  // SEC-07: Chống mở 2 Tab cùng trình duyệt/thiết bị tự vào 1 bàn công khai soi bài trên Production
+  // (Trên localhost Dev vẫn giữ mở đa tab thoải mái để test!)
+  const cleanDeviceId = sanitizeDeviceId(options?.deviceId);
+  const enforceAntiMultiTab =
+    options?.enforceAntiMultiTab !== undefined
+      ? Boolean(options.enforceAntiMultiTab)
+      : IS_PRODUCTION_ENV;
+  if (
+    enforceAntiMultiTab &&
+    cleanDeviceId &&
+    room.accessMode === "public" &&
+    realHumansBefore.some((p) => p.connected && p.deviceId && p.deviceId === cleanDeviceId)
+  ) {
+    return {
+      error: "Thiết bị này đã đang ngồi 1 ghế trong bàn công khai này! (Chống mở nhiều tab soi bài)",
+    };
   }
 
   if (realHumansBefore.length >= 18) {
@@ -236,17 +277,20 @@ export function addPlayer(
     name = getDefaultName(existingNames);
   }
 
+  const safeAvatarUrl = sanitizeAvatarUrl(avatarUrl);
+  const safeSeed = avatarSeed ? String(avatarSeed).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) : null;
   const isFirstRealHuman = realHumansBefore.length === 0;
   const player = {
     id: socketId,
     socketId: socketId,
+    deviceId: cleanDeviceId || null,
     connected: true,
     sessionToken: randomUUID(),
     disconnectedAt: null,
     name,
-    avatar: avatarUrl
-      || (avatarSeed
-        ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${avatarSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
+    avatar: safeAvatarUrl
+      || (safeSeed
+        ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${safeSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
         : getAvatarUrl(name + "-" + socketId.slice(0, 4))),
     isHost: isFirstRealHuman,
     ready: isFirstRealHuman,
@@ -537,6 +581,7 @@ export function getPublicRoomsList() {
       hostAvatar: hostPlayer?.avatar || null,
       accessMode: room.accessMode === "password" ? "password" : "public",
       hasPassword: room.accessMode === "password",
+      isTurbo: Boolean(room.isTurbo),
       phase: room.phase, // 'lobby' | 'playing' | 'ended'
       humanCount: realHumans.length,
       botCount,
@@ -563,7 +608,7 @@ export function getPublicRoomsList() {
 export function renamePlayer(code, socketId, newName, avatarSeed = null, avatarUrl = null) {
   const room = getRoom(code);
   if (!room) return { error: "Phòng không tồn tại." };
-  const trimmed = newName?.trim();
+  const trimmed = sanitizeChatText(String(newName || ""), 20);
   if (!trimmed) return { error: "Tên không được để trống." };
   if (trimmed.length > 20) return { error: "Tên tối đa 20 ký tự." };
 
@@ -574,12 +619,30 @@ export function renamePlayer(code, socketId, newName, avatarSeed = null, avatarU
 
   const player = room.players.find((p) => p.socketId === socketId || p.id === socketId);
   if (!player) return { error: "Không tìm thấy người chơi." };
+  const safeAvatarUrl = sanitizeAvatarUrl(avatarUrl);
+  const safeSeed = avatarSeed ? String(avatarSeed).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) : null;
   player.name = trimmed;
-  player.avatar = avatarUrl
-    || (avatarSeed
-      ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${avatarSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
+  player.avatar = safeAvatarUrl
+    || (safeSeed
+      ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${safeSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
       : getAvatarUrl(trimmed + "-" + player.id.slice(0, 4)));
   return { room, player };
+}
+
+export function setRoomTurbo(code, requesterSocketId, isTurbo) {
+  const room = getRoom(code);
+  if (!room) return { error: "Phòng không tồn tại." };
+  if (room.phase !== "lobby") {
+    return { error: "Chỉ có thể bật/tắt chế độ Tốc Chiến khi đang ở sảnh chờ." };
+  }
+  const player = room.players.find(
+    (p) => p.socketId === requesterSocketId || p.id === requesterSocketId
+  );
+  if (!player || !player.isHost) {
+    return { error: "Chỉ chủ phòng mới có quyền đổi chế độ Tốc Chiến." };
+  }
+  room.isTurbo = Boolean(isTurbo);
+  return { ok: true, room, isTurbo: room.isTurbo };
 }
 
 export function toggleReady(code, socketId) {
@@ -642,7 +705,7 @@ export function addLobbyMessage(code, senderSocketId, text) {
   if (!room) return null;
   const player = room.players.find((p) => p.socketId === senderSocketId);
   if (!player) return null;
-  const trimmed = text?.trim();
+  const trimmed = sanitizeChatText(String(text || ""), MAX_CHAT_LENGTH);
   if (!trimmed) return null;
 
   const msg = {
@@ -673,7 +736,7 @@ export function publicRoomView(room, forSocketId) {
     room.players.find((p) => p.isHost) ||
     realHumans[0];
 
-  const isLocalDev = !process.env.RENDER && process.env.NODE_ENV !== "production";
+  const isLocalDev = !IS_PRODUCTION_ENV && process.env.ALLOW_LOCAL_STUDIO === "1";
 
   const base = {
     code: room.code,
@@ -682,6 +745,7 @@ export function publicRoomView(room, forSocketId) {
     rawRoomTitle: room.roomTitle || "",
     accessMode: room.accessMode || "public", // 'public' | 'password' | 'hidden'
     hasPassword: room.accessMode === "password",
+    isTurbo: Boolean(room.isTurbo),
     humanCount: realHumans.length,
     botCount: room.players.length - realHumans.length,
     soloPracticeRole: realHumans.length === 1 ? room.soloPracticeRole || null : null,
@@ -734,6 +798,9 @@ export function publicRoomView(room, forSocketId) {
         : [],
       gameStartedAt: g.gameStartedAt,
       phaseEndsAt: g.phaseEndsAt,
+      phaseDurationSec: g.phaseDurationSec || null,
+      isTurbo: Boolean(room.isTurbo),
+      roleRevealReadyIds: g.phase === "role_reveal" ? g.roleRevealReadyIds || {} : undefined,
       discussEndsAt: g.discussEndsAt,
       nominees: g.nominees,
       hotSeatQueue: g.hotSeatQueue,

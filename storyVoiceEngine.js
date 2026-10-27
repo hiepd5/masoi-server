@@ -1,3 +1,4 @@
+import "./envLoader.js";
 import http from "http";
 import https from "https";
 import { ROLE_LABELS, isWolfTeamRole } from "./roles.js";
@@ -49,18 +50,73 @@ export function getTtsCacheKey(raw) {
 }
 
 export function getVoiceStudioBaseUrl() {
+  const configured = String(process.env.VOICESTUDIO_URL || "").trim();
+  if (configured) return configured.replace(/\/+$/, "");
   const isLocalEnv = !process.env.RENDER && process.env.NODE_ENV !== "production";
-  const defaultVsUrl = isLocalEnv
-    ? "http://127.0.0.1:3900"
-    : "https://cassette-letter-paralegal.ngrok-free.dev";
-  return (process.env.VOICESTUDIO_URL || defaultVsUrl).trim();
+  return isLocalEnv ? "http://127.0.0.1:3900" : "";
 }
 
-// ── Bộ nhớ đệm LRU MP3 trên RAM Server + Hàng đợi GPU tuần tự 1 luồng ──
-const audioLruCache = new Map(); // cacheKey -> Buffer
-const inFlightMap = new Map();   // cacheKey -> Promise<Buffer | null>
-const gpuQueue = [];             // [{ key, cleanText, voiceId, speed, resolve }]
+function buildVoiceStudioExtraHeaders() {
+  const sharedSecret = String(process.env.VOICESTUDIO_SHARED_SECRET || "").trim();
+  return sharedSecret ? { "X-VoiceStudio-Secret": sharedSecret } : {};
+}
+
+// ── Bộ nhớ đệm LRU MP3 trên RAM Server + Hàng đợi GPU tuần tự 3 Làn Ưu Tiên (urgent > story > live_hint) ──
+const audioLruCache = new Map();     // cacheKey -> Buffer
+const inFlightMap = new Map();       // cacheKey -> Promise<Buffer | null>
+const pendingJobsByKey = new Map();  // cacheKey -> job (đang nằm chờ trong 1 trong 3 làn, chưa vào GPU)
+const urgentQueue = [];              // Làn 1: Câu đang cần phát ngay / Mở màn / Vinh danh MVP cuối ván
+const storyQueue = [];               // Làn 2: Các cảnh Phim Kể Chuyện thật sự xảy ra trong trận
+const liveHintQueue = [];            // Làn 3: Câu thông báo đúng 1 nạn nhân / 1 bị cáo thực tế vừa lộ diện
+const storyWarmTimers = new Map();   // roomCode -> Timeout (debounce 450ms khi nhiều người/Bot bấm liên tiếp)
 let workerRunning = false;
+
+function normalizePriorityLane(priority) {
+  if (priority === "urgent") return "urgent";
+  if (priority === "live_hint" || priority === "low") return "live_hint";
+  return "story";
+}
+
+function enqueueJobToLane(job) {
+  const lane = normalizePriorityLane(job.priority);
+  job.priority = lane;
+  pendingJobsByKey.set(job.key, job);
+  if (lane === "urgent") {
+    urgentQueue.push(job);
+  } else if (lane === "story") {
+    storyQueue.push(job);
+  } else {
+    liveHintQueue.push(job);
+  }
+}
+
+function promoteWaitingJobIfHigher(key, requestedPriority) {
+  const targetLane = normalizePriorityLane(requestedPriority);
+  const job = pendingJobsByKey.get(key);
+  if (!job) return false;
+  const rank = { live_hint: 1, story: 2, urgent: 3 };
+  if ((rank[targetLane] || 2) <= (rank[job.priority] || 2)) return false;
+
+  const removeFrom = (arr) => {
+    const idx = arr.indexOf(job);
+    if (idx >= 0) arr.splice(idx, 1);
+  };
+  removeFrom(storyQueue);
+  removeFrom(liveHintQueue);
+  job.priority = targetLane;
+  if (targetLane === "urgent") {
+    urgentQueue.unshift(job);
+  } else {
+    storyQueue.push(job);
+  }
+  return true;
+}
+
+function popNextGpuJob() {
+  const job = urgentQueue.shift() || storyQueue.shift() || liveHintQueue.shift() || null;
+  if (job) pendingJobsByKey.delete(job.key);
+  return job;
+}
 
 let vsHealthState = {
   online: null,
@@ -98,6 +154,10 @@ export async function checkVoiceStudioHealth(force = false) {
     return vsHealthState.online;
   }
   const vsUrl = getVoiceStudioBaseUrl();
+  if (!vsUrl) {
+    vsHealthState = { online: false, checkedAt: now };
+    return false;
+  }
   const ok = await new Promise((resolve) => {
     try {
       const targetUrl = new URL("/health", vsUrl);
@@ -108,7 +168,8 @@ export async function checkVoiceStudioHealth(force = false) {
           method: "GET",
           headers: {
             "ngrok-skip-browser-warning": "true",
-            "User-Agent": "MaSoiOnline-StoryVoiceEngine/3.5",
+            "User-Agent": "MaSoiOnline-StoryVoiceEngine/4.1",
+            ...buildVoiceStudioExtraHeaders(),
           },
           timeout: 3500,
         },
@@ -149,13 +210,19 @@ export function getVoiceEngineStatus() {
     voiceId: DEFAULT_VOICE_ID,
     speed: DEFAULT_TTS_SPEED,
     cachedCount: audioLruCache.size,
-    queueLength: gpuQueue.length,
+    queueLength: urgentQueue.length + storyQueue.length + liveHintQueue.length,
+    lanes: {
+      urgent: urgentQueue.length,
+      story: storyQueue.length,
+      liveHint: liveHintQueue.length,
+    },
     inFlightCount: inFlightMap.size,
   };
 }
 
 function requestVoiceStudioSpeech(cleanText, voiceId, speed) {
   const vsUrl = getVoiceStudioBaseUrl();
+  if (!vsUrl) return Promise.resolve(null);
   const payload = JSON.stringify({
     model: "omnivoice",
     voice: voiceId || DEFAULT_VOICE_ID,
@@ -177,8 +244,9 @@ function requestVoiceStudioSpeech(cleanText, voiceId, speed) {
             "Content-Type": "application/json",
             "Authorization": "Bearer local",
             "ngrok-skip-browser-warning": "true",
-            "User-Agent": "MaSoiOnline-StoryVoiceEngine/3.5.1",
+            "User-Agent": "MaSoiOnline-StoryVoiceEngine/4.1",
             "Content-Length": Buffer.byteLength(payload),
+            ...buildVoiceStudioExtraHeaders(),
           },
           timeout: 26000,
         },
@@ -224,21 +292,22 @@ async function drainGpuQueue() {
   if (workerRunning) return;
   workerRunning = true;
   try {
-    while (gpuQueue.length > 0) {
-      const job = gpuQueue.shift();
-      if (!job) continue;
+    let job = popNextGpuJob();
+    while (job) {
       const existing = getCachedBuffer(job.key);
       if (existing) {
         job.resolve(existing);
+        job = popNextGpuJob();
         continue;
       }
-      // Nếu VoiceStudio vừa báo offline cách đây < 8s thì bỏ qua job nền để tránh nghẽn
+      // Nếu VoiceStudio vừa xác nhận tắt cách đây < 8s thì bỏ qua job nền live_hint để tránh nghẽn
       if (
-        job.priority === "low" &&
+        job.priority === "live_hint" &&
         vsHealthState.online === false &&
         Date.now() - vsHealthState.checkedAt < 8000
       ) {
         job.resolve(null);
+        job = popNextGpuJob();
         continue;
       }
       const buf = await requestVoiceStudioSpeech(job.cleanText, job.voiceId, job.speed);
@@ -246,6 +315,7 @@ async function drainGpuQueue() {
         setCachedBuffer(job.key, buf);
       }
       job.resolve(buf);
+      job = popNextGpuJob();
     }
   } finally {
     workerRunning = false;
@@ -253,13 +323,12 @@ async function drainGpuQueue() {
 }
 
 /**
- * Lấy ngay MP3 từ RAM Cache (~0ms) hoặc xếp hàng tạo mới có khử trùng lặp (Deduplication).
- * - priority = "urgent": chèn đầu hàng đợi (cho câu đang cần phát ngay hoặc câu chốt MVP cuối game).
- * - priority = "normal" | "low": xếp cuối hàng đợi (tạo cuốn chiếu ngầm trong trận).
+ * Lấy ngay MP3 từ RAM Cache (~0ms) hoặc xếp hàng tạo mới 3 làn ưu tiên (urgent > story > live_hint).
+ * Nếu câu đã nằm chờ ở làn thấp hơn và nay được yêu cầu "urgent", tự động thăng hạng lên đầu làn urgent!
  */
 export function getOrGenerateMp3(
   rawText,
-  { voice = DEFAULT_VOICE_ID, speed = DEFAULT_TTS_SPEED, priority = "normal" } = {}
+  { voice = DEFAULT_VOICE_ID, speed = DEFAULT_TTS_SPEED, priority = "story" } = {}
 ) {
   const cleanText = normalizeTtsText(rawText);
   const key = cleanText.toLowerCase();
@@ -273,6 +342,7 @@ export function getOrGenerateMp3(
   }
 
   if (inFlightMap.has(key)) {
+    promoteWaitingJobIfHigher(key, priority);
     return inFlightMap.get(key);
   }
 
@@ -283,13 +353,10 @@ export function getOrGenerateMp3(
 
   const p = new Promise((resolve) => {
     const job = { key, cleanText, voiceId, speed, priority, resolve };
-    if (priority === "urgent") {
-      gpuQueue.unshift(job);
-    } else {
-      gpuQueue.push(job);
-    }
+    enqueueJobToLane(job);
     drainGpuQueue();
   }).finally(() => {
+    pendingJobsByKey.delete(key);
     inFlightMap.delete(key);
   });
 
@@ -301,13 +368,17 @@ const IS_HEADLESS_SIM_TEST =
   process.env.DISABLE_BACKGROUND_TTS === "1" ||
   process.argv.some((a) => String(a).includes("sim_test"));
 
-export function warmPhrasesInBackground(phrases = [], priority = "normal") {
+export function warmPhrasesInBackground(phrases = [], priority = "story") {
   if (IS_HEADLESS_SIM_TEST) return;
   if (!Array.isArray(phrases) || phrases.length === 0) return;
   for (const raw of phrases) {
     if (!raw || typeof raw !== "string") continue;
     const key = getTtsCacheKey(raw);
-    if (!key || audioLruCache.has(key) || inFlightMap.has(key)) continue;
+    if (!key || audioLruCache.has(key)) continue;
+    if (inFlightMap.has(key)) {
+      promoteWaitingJobIfHigher(key, priority);
+      continue;
+    }
     getOrGenerateMp3(raw, { priority }).catch(() => {});
   }
 }
@@ -551,50 +622,68 @@ export function deriveStoryNarrationsFromRoom(room) {
 }
 
 /**
- * Hook 1: Kích hoạt ngay sau khi startGame() đã bù đủ AI Bot.
- * Tạo sẵn câu mở màn Phim Kể Chuyện + bộ câu đơn cá nhân hóa theo đúng ghế thật trong phòng.
+ * Trả về danh sách câu tạo sớm ở giây 0 của ván đấu (Zero-Waste: 0 câu giả định thừa!).
+ * Dành 100% GPU RTX 3090 để tổng hợp các cảnh Phim Kể Chuyện thật sự xảy ra trong ván.
  */
-export function warmRoomOpeningVoices(room, defenseTimerSec = 60, autoAddedBots = 0) {
-  if (!room?.players?.length) return;
-  const highPhrases = [RECAP_OPENING_NARRATION];
-  if (autoAddedBots > 0) {
-    highPhrases.push(
-      `🤖 Đã tự động triệu hồi thêm ${autoAddedBots} AI Bot lấp đủ ${room.players.length} ghế. Trò chơi bắt đầu!`
-    );
-  }
+export function buildOpeningVoicePlan(room, _autoAddedBots = 0) {
+  if (!room?.players?.length) return { urgent: [], liveHint: [] };
+  const urgent = [RECAP_OPENING_NARRATION];
+  const liveHint = Object.values(WINNER_SUBTITLES);
+  return { urgent, liveHint };
+}
 
-  const normalPhrases = [];
-  for (const p of room.players) {
-    if (!p?.name) continue;
-    const defSec = p.isBot ? 8 : defenseTimerSec;
-    normalPhrases.push(`Trời đã sáng. Đêm qua ${p.name} đã không qua khỏi.`);
-    normalPhrases.push(`${p.name} bị đề cử nhiều nhất. Mời lần lượt lên biện hộ.`);
-    normalPhrases.push(`🎤 Mời ${p.name} lên biện hộ. (${defSec} giây)`);
-    normalPhrases.push(`⚖️ Mời cả làng vote cho ${p.name}: Treo cổ hay Tha.`);
-    normalPhrases.push(
-      `Làng đã quyết định! ${p.name} sẽ rời khỏi ván đấu. Xin hãy giữ im lặng tuyệt đối.`
-    );
-    normalPhrases.push(`Làng đã tha ${p.name}! Không ai bị xử tử hôm nay.`);
-
-    if (p.role === "hunter") {
-      normalPhrases.push(
-        `🏹 Khoan đã! Thợ Săn ${p.name} còn 15 giây hơi thở cuối để bóp cò bắn đạn bạc trả thù!`
-      );
-      normalPhrases.push("🏹 Hết thời gian! Thợ Săn đã gục xuống mà không bóp cò.");
-    }
-    if (p.role === "mayor") {
-      normalPhrases.push(
-        `👑 ${p.name} giơ cao Quyền Trượng Vàng công bố thân phận Trưởng Làng — lá phiếu từ nay tính x2!`
-      );
-    }
-  }
-
-  warmPhrasesInBackground(highPhrases, "urgent");
-  warmPhrasesInBackground(normalPhrases, "low");
+export function warmRoomOpeningVoices(room, _defenseTimerSec = 60, autoAddedBots = 0) {
+  const plan = buildOpeningVoicePlan(room, autoAddedBots);
+  warmPhrasesInBackground(plan.urgent, "urgent");
+  warmPhrasesInBackground(plan.liveHint, "live_hint");
 }
 
 /**
- * Hook 2: Chỉ khi Cupid ghép đôi đúng 2 người A & B mới tạo câu Tình Nhân cho cặp đó (Zero-Waste, không đẻ C(15,2)=105 câu thừa).
+ * Tạo trước đúng 1 câu Bình Minh cho nạn nhân thực tế vừa bị Sói cắn / Phù Thủy quăng độc (trong lúc chờ Tiên Tri 20s).
+ */
+export function warmExactNightVictimVoice(room) {
+  const g = room?.game;
+  if (!g || !Array.isArray(room?.players)) return;
+  const candidateIds = [];
+  if (g.wolfVictimId && !g.witchSaveTonight && !g.alphaConvertTonight) {
+    const guarded = g.guardedIdTonight && g.guardedIdTonight === g.wolfVictimId;
+    const victimPlayer = room.players.find((p) => p.id === g.wolfVictimId);
+    if (!guarded && victimPlayer && victimPlayer.role !== "cursed" && victimPlayer.role !== "tough_guy") {
+      candidateIds.push(victimPlayer.id);
+    }
+  }
+  if (g.witchPoisonTargetId && !candidateIds.includes(g.witchPoisonTargetId)) {
+    candidateIds.push(g.witchPoisonTargetId);
+  }
+  if (candidateIds.length > 0) {
+    const names = candidateIds
+      .map((id) => room.players.find((p) => p.id === id)?.name)
+      .filter(Boolean)
+      .join(", ");
+    if (names) {
+      warmPhrasesInBackground([`Trời đã sáng. Đêm qua ${names} đã không qua khỏi.`], "live_hint");
+    }
+  }
+}
+
+/**
+ * Tạo trước câu biện hộ & bỏ phiếu cho ĐÚNG bị cáo thật sự vừa bị đề cử lên ghế nóng (1-2 người thay vì 8 người).
+ */
+export function warmExactNomineesVoices(room, nominees = [], defenseTimerSec = 60) {
+  if (!room?.players?.length || !Array.isArray(nominees) || nominees.length === 0) return;
+  const phrases = [];
+  for (const nom of nominees) {
+    const p = room.players.find((pl) => pl.id === nom.playerId);
+    if (!p?.name) continue;
+    const defSec = p.isBot ? 8 : defenseTimerSec;
+    phrases.push(`🎤 Mời ${p.name} lên biện hộ. (${defSec} giây)`);
+    phrases.push(`⚖️ Mời cả làng vote cho ${p.name}: Treo cổ hay Tha.`);
+  }
+  warmPhrasesInBackground(phrases, "live_hint");
+}
+
+/**
+ * Hook 2: Chỉ khi Cupid ghép đôi đúng 2 người A & B mới tạo câu Tình Nhân cho cặp đó (Zero-Waste).
  */
 export function warmCupidLoversVoices(room) {
   const g = room?.game;
@@ -612,25 +701,50 @@ export function warmCupidLoversVoices(room) {
       `💔 Tơ hồng đứt đoạn! Tình Nhân ${pB.name} không chịu nổi nỗi đau đã gục ngã theo!`
     );
   }
-  warmPhrasesInBackground(phrases, "normal");
   warmStoryTimelineProgressively(room);
+  warmPhrasesInBackground(phrases, "live_hint");
 }
 
 /**
- * Hook 3: Chạy cuốn chiếu sau mỗi pha Đêm/Ngày để tạo sẵn toàn bộ giọng đọc Phim Kể Chuyện cuối game (Zero-Leak).
+ * Hook 3A: Gom nhịp 450ms khi người chơi/Bot bấm chọn liên tiếp (guard_pick, wolf_aim, day_nominate) -> tạo sớm ngay trong pha!
+ */
+export function scheduleStoryTimelineWarm(room, delayMs = 450) {
+  if (IS_HEADLESS_SIM_TEST || !room?.code || !room?.game) return;
+  const code = room.code;
+  if (storyWarmTimers.has(code)) {
+    clearTimeout(storyWarmTimers.get(code));
+  }
+  const t = setTimeout(() => {
+    storyWarmTimers.delete(code);
+    warmStoryTimelineProgressively(room);
+  }, delayMs);
+  t.unref?.();
+  storyWarmTimers.set(code, t);
+}
+
+/**
+ * Hook 3B: Chạy cuốn chiếu sau mỗi pha Đêm/Ngày để tạo sẵn toàn bộ giọng đọc Phim Kể Chuyện cuối game (Zero-Leak, Làn 2 story).
  */
 export function warmStoryTimelineProgressively(room) {
   if (!room?.game) return;
+  if (room.code && storyWarmTimers.has(room.code)) {
+    clearTimeout(storyWarmTimers.get(room.code));
+    storyWarmTimers.delete(room.code);
+  }
   const narrations = deriveStoryNarrationsFromRoom(room);
-  warmPhrasesInBackground(narrations, "normal");
+  warmPhrasesInBackground(narrations, "story");
 }
 
 /**
- * Hook 4: Ngay khoảnh khắc Kết Game (endGame), đẩy câu vinh danh MVP lên đầu hàng đợi ưu tiên cao nhất.
+ * Hook 4: Ngay khoảnh khắc Kết Game (endGame), thăng hạng toàn bộ kịch bản Phim Kể Chuyện & câu vinh danh MVP lên ưu tiên cao nhất.
  */
 export function warmEndGameFinaleVoice(room) {
   const g = room?.game;
   if (!g) return;
+  if (room.code && storyWarmTimers.has(room.code)) {
+    clearTimeout(storyWarmTimers.get(room.code));
+    storyWarmTimers.delete(room.code);
+  }
   const awards = g.awards || [];
   const winner = g.winner || "village";
   const mvpAward = awards.find((a) => a.id === "mvp") || awards[0] || null;
@@ -638,6 +752,6 @@ export function warmEndGameFinaleVoice(room) {
     ? `Khép lại câu chuyện sinh tử, ngôi vương MVP thuộc về ${mvpAward.name}. ${mvpAward.description}`
     : WINNER_SUBTITLES[winner] || "Trận đấu đã khép lại!";
 
-  warmPhrasesInBackground([RECAP_OPENING_NARRATION, finaleNarration], "urgent");
-  warmStoryTimelineProgressively(room);
+  const allStoryNarrations = deriveStoryNarrationsFromRoom(room);
+  warmPhrasesInBackground([RECAP_OPENING_NARRATION, ...allStoryNarrations, finaleNarration], "urgent");
 }

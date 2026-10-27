@@ -1,8 +1,12 @@
 import { assignCustomRoles, isWolfTeamRole, ROLE_LABELS } from "./roles.js";
-import { warmStoryTimelineProgressively } from "./storyVoiceEngine.js";
+import {
+  warmStoryTimelineProgressively,
+  scheduleStoryTimelineWarm,
+} from "./storyVoiceEngine.js";
 
 // ============ HẰNG SỐ THỜI GIAN (giây) ============
 export const TIMERS = {
+  roleReveal: 6,
   cupid: 20,
   guard: 20,
   wolf: 30,
@@ -11,9 +15,52 @@ export const TIMERS = {
   hunterRevenge: 15,
   dayDiscuss: 180, // 3 phút mặc định
   dayDiscussExtend: 120, // +2 phút mỗi lần gia hạn
+  nominate: 30,
   defense: 60,
   finalVote: 30,
 };
+
+/**
+ * Tính thời lượng chuẩn (giây) cho từng Phase dựa trên chế độ Tốc Chiến (Turbo 5 Phút),
+ * chế độ Solo 1 mình với AI Bot và số người còn sống trên bàn.
+ */
+export function getPhaseDurationSec(room, phaseKey) {
+  const isTurbo = Boolean(room?.isTurbo);
+  const players = room?.players || [];
+  const realHumans = players.filter((p) => !p.isBot).length;
+  const hasBots = players.some((p) => p.isBot);
+  const aliveCount = players.filter((p) => p.alive).length;
+
+  switch (phaseKey) {
+    case "role_reveal":
+      return TIMERS.roleReveal;
+    case "night_cupid":
+      return TIMERS.cupid;
+    case "night_guard":
+      return TIMERS.guard;
+    case "night_wolf":
+      return isTurbo ? 22 : TIMERS.wolf;
+    case "night_witch":
+      return isTurbo ? 20 : TIMERS.witch;
+    case "night_seer":
+      return TIMERS.seer;
+    case "hunter_revenge":
+      return TIMERS.hunterRevenge;
+    case "day_discuss":
+      if (realHumans === 1 && hasBots) return 60;
+      if (isTurbo) return 75;
+      if (aliveCount > 0 && aliveCount <= 4) return 120;
+      return TIMERS.dayDiscuss;
+    case "day_nominate":
+      return isTurbo ? 20 : TIMERS.nominate;
+    case "day_defense":
+      return isTurbo ? 35 : TIMERS.defense;
+    case "day_final_vote":
+      return isTurbo ? 20 : TIMERS.finalVote;
+    default:
+      return 20;
+  }
+}
 
 // ============ TẠO GAME STATE MỚI TỪ ROOM ============
 export function initGameState(room) {
@@ -35,6 +82,11 @@ export function initGameState(room) {
     phase: hasCupid ? "night_cupid" : "night_guard", // Đêm 1 mở night_cupid nếu có Thần Tình Yêu
     gameStartedAt: Date.now(), // Thời gian bắt đầu ván đấu
     phaseEndsAt: null, // Thời gian kết thúc phase hiện tại
+    phaseDurationSec: null,
+    phaseStartedAt: Date.now(),
+    firstNightPhase: hasCupid ? "night_cupid" : "night_guard",
+    roleRevealReadyIds: {},
+    mayorTimeExtendedPhaseKey: null,
     roleCounts: counts,
 
     // Cặp đôi sinh tử do Cupid ghép ở Đêm 1: [playerIdA, playerIdB] | null
@@ -55,6 +107,7 @@ export function initGameState(room) {
     witchUsedPoison: false,
     witchSaveTonight: false,
     witchPoisonTargetId: null,
+    witchDecidedPass: false,
 
     seerChecksLog: [], // { seerId, targetId, dayNumber, result }
 
@@ -103,9 +156,10 @@ export function syncInitialRoleState(room) {
     if (p.role) counts[p.role] = (counts[p.role] || 0) + 1;
   });
   g.roleCounts = counts;
+  const hasCupid = room.players.some((p) => p.role === "cupid" && p.alive);
+  g.firstNightPhase = hasCupid ? "night_cupid" : "night_guard";
   if (g.dayNumber === 1 && (g.phase === "night_guard" || g.phase === "night_cupid")) {
-    const hasCupid = room.players.some((p) => p.role === "cupid" && p.alive);
-    g.phase = hasCupid ? "night_cupid" : "night_guard";
+    g.phase = g.firstNightPhase;
   }
 }
 
@@ -124,8 +178,15 @@ const MILESTONE_REPLAY_KINDS = new Set([
   "hunter_shot",
   "mayor_reveal",
   "night_death",
+  "peaceful_dawn",
   "day_defense",
   "day_verdict",
+]);
+
+const DEBOUNCED_STORY_REPLAY_KINDS = new Set([
+  "guard_pick",
+  "wolf_aim",
+  "day_nominate",
 ]);
 
 export function recordReplayEvent(room, evt = {}) {
@@ -174,6 +235,9 @@ export function recordReplayEvent(room, evt = {}) {
     frame.seq = last.seq;
     frame.prevTargetId = last.prevTargetId || last.targetId || frame.prevTargetId;
     g.replayTimeline[g.replayTimeline.length - 1] = frame;
+    if (DEBOUNCED_STORY_REPLAY_KINDS.has(frame.kind)) {
+      scheduleStoryTimelineWarm(room, 450);
+    }
     return frame;
   }
 
@@ -189,6 +253,8 @@ export function recordReplayEvent(room, evt = {}) {
   g.replayTimeline.push(frame);
   if (MILESTONE_REPLAY_KINDS.has(frame.kind)) {
     warmStoryTimelineProgressively(room);
+  } else if (DEBOUNCED_STORY_REPLAY_KINDS.has(frame.kind)) {
+    scheduleStoryTimelineWarm(room, 450);
   }
   return frame;
 }
@@ -544,13 +610,17 @@ export function endWolfPhase(room) {
 }
 
 // ============ ĐÊM: PHÙ THỦY ============
-export function witchDecide(room, witchId, { save, poisonTargetId }) {
+export function witchDecide(room, witchId, { save, poisonTargetId, pass } = {}) {
   const g = room.game;
   const witch = getPlayer(room, witchId);
   if (!witch || witch.role !== "witch" || !witch.alive) {
     return { error: "Bạn không phải Phù Thủy hoặc đã chết." };
   }
   if (g.phase !== "night_witch") return { error: "Không phải lượt Phù Thủy." };
+
+  if (pass) {
+    g.witchDecidedPass = true;
+  }
 
   if (save) {
     if (g.witchUsedSave) return { error: "Bạn đã dùng bình cứu rồi." };
@@ -837,7 +907,9 @@ export function resolveNightDeaths(room) {
 export function startDiscussion(room) {
   const g = room.game;
   g.phase = "day_discuss";
-  g.discussEndsAt = Date.now() + TIMERS.dayDiscuss * 1000;
+  const discussSec = getPhaseDurationSec(room, "day_discuss");
+  g.phaseDurationSec = discussSec;
+  g.discussEndsAt = Date.now() + discussSec * 1000;
   g.extendVotes = {};
   g.skipDiscussVotes = {};
 }
@@ -1124,14 +1196,18 @@ export function nextDefenseOrFinalVote(room) {
   const g = room.game;
   g.hotSeatIndex += 1;
   if (g.hotSeatIndex < g.hotSeatQueue.length) {
-    g.hotSeatEndsAt = Date.now() + TIMERS.defense * 1000;
+    const defSec = getPhaseDurationSec(room, "day_defense");
+    g.phaseDurationSec = defSec;
+    g.hotSeatEndsAt = Date.now() + defSec * 1000;
     return { phase: "day_defense", currentDefendantId: g.hotSeatQueue[g.hotSeatIndex] };
   }
   // hết lượt biện hộ -> chuyển sang vote chốt cho từng người theo thứ tự
   g.phase = "day_final_vote";
   g.finalVotes = {};
   g.hotSeatIndex = 0;
-  g.finalVoteEndsAt = Date.now() + TIMERS.finalVote * 1000;
+  const finalSec = getPhaseDurationSec(room, "day_final_vote");
+  g.phaseDurationSec = finalSec;
+  g.finalVoteEndsAt = Date.now() + finalSec * 1000;
   return { phase: "day_final_vote", currentDefendantId: g.hotSeatQueue[0] };
 }
 
@@ -1304,6 +1380,7 @@ export function startNextNight(room) {
   g.wolfVictimId = null;
   g.witchSaveTonight = false;
   g.witchPoisonTargetId = null;
+  g.witchDecidedPass = false;
   g.nightDeaths = [];
 
   // BUG 8 FIX: Reset tất cả trạng thái ban ngày để tránh state leak sang ngày tiếp theo
