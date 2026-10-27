@@ -21,12 +21,46 @@ import {
   sanitizeChatText,
   sanitizeDeviceId,
 } from "./securityGuard.js";
+import { getVietnamGoldenHourInfo } from "./moderationAndStats.js";
 
 // rooms: Map<roomCode, RoomState>
 const rooms = new Map();
 
 export function getActiveRoomCount() {
   return rooms.size;
+}
+
+export function getGlobalServerRuntimeMetrics() {
+  let lobbyRoomsCount = 0;
+  let playingRoomsCount = 0;
+  let endedRoomsCount = 0;
+  let totalConnectedHumans = 0;
+  let totalBots = 0;
+  let totalSpectators = 0;
+
+  for (const r of rooms.values()) {
+    if (r.phase === "lobby") lobbyRoomsCount += 1;
+    else if (r.phase === "playing") playingRoomsCount += 1;
+    else endedRoomsCount += 1;
+
+    for (const p of r.players || []) {
+      if (p.isBot) totalBots += 1;
+      else if (p.connected) totalConnectedHumans += 1;
+    }
+    for (const s of r.spectators || []) {
+      if (s.connected) totalSpectators += 1;
+    }
+  }
+
+  return {
+    activeRoomsCount: rooms.size,
+    lobbyRoomsCount,
+    playingRoomsCount,
+    endedRoomsCount,
+    totalConnectedHumans,
+    totalBots,
+    totalSpectators,
+  };
 }
 
 export function canCreateNewRoom() {
@@ -1169,6 +1203,7 @@ export function publicRoomView(room, forSocketId) {
     botCount: room.players.length - realHumans.length,
     spectatorCount: (room.spectators || []).filter((s) => s.connected).length,
     isSpectator: false,
+    serverGoldenHour: getVietnamGoldenHourInfo(),
     soloPracticeRole: realHumans.length === 1 ? room.soloPracticeRole || null : null,
     scenePresetId: room.scenePresetId || "nordic_village_v3",
     rolesConfig: room.rolesConfig || generateDefaultRoles(Math.max(6, room.players.length)),

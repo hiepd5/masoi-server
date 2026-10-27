@@ -27,7 +27,13 @@ import {
   addLobbyMessage,
   publicRoomView,
   publicSpectatorView,
+  getGlobalServerRuntimeMetrics,
 } from "./rooms.js";
+import {
+  getVietnamGoldenHourInfo,
+  recordPlayerReport,
+  getModerationStats,
+} from "./moderationAndStats.js";
 import {
   IS_PRODUCTION_ENV,
   MAX_CHAT_LENGTH,
@@ -198,7 +204,7 @@ app.use(
       return cb(new Error("Origin blocked by Ma Soi Zero-Trust CORS"));
     },
     methods: ["GET", "POST", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "x-game-session"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-game-session", "x-admin-key"],
     exposedHeaders: ["X-TTS-Voice", "X-TTS-Cache"],
   })
 );
@@ -235,6 +241,48 @@ app.get("/", (req, res) =>
     uptime: process.uptime(),
   })
 );
+
+// Khung Giờ Vàng Đêm Huyết Nguyệt (20:00 – 23:00 UTC+7 tính theo đồng hồ Server — Chốt #9)
+app.get("/api/golden-hour", (req, res) => {
+  return res.json({
+    ok: true,
+    ...getVietnamGoldenHourInfo(),
+  });
+});
+
+// Bảng chỉ số vận hành & văn minh cộng đồng dành cho Chủ dự án (/api/admin/stats)
+app.get("/api/admin/stats", (req, res) => {
+  const clientIp = extractClientIp(req);
+  if (!checkIpRateLimit("admin_stats", clientIp, 30, 60_000).allowed) {
+    return res.status(429).json({ ok: false, error: "Too many admin stats requests" });
+  }
+
+  const configuredKey = String(process.env.ADMIN_STATS_KEY || "").trim();
+  const providedKey = String(req.headers["x-admin-key"] || req.query?.key || "").trim();
+
+  if (IS_PRODUCTION_ENV) {
+    if (!configuredKey || providedKey !== configuredKey) {
+      return res.status(403).json({ ok: false, error: "Forbidden admin stats endpoint" });
+    }
+  } else if (configuredKey && providedKey && providedKey !== configuredKey) {
+    return res.status(403).json({ ok: false, error: "Invalid admin stats key" });
+  }
+
+  const mem = process.memoryUsage();
+  return res.json({
+    ok: true,
+    version: "4.1.0",
+    uptimeSec: Math.round(process.uptime()),
+    memory: {
+      rssMB: Math.round((mem.rss / (1024 * 1024)) * 10) / 10,
+      heapUsedMB: Math.round((mem.heapUsed / (1024 * 1024)) * 10) / 10,
+    },
+    runtime: getGlobalServerRuntimeMetrics(),
+    goldenHour: getVietnamGoldenHourInfo(),
+    voiceStudio: getVoiceEngineStatus(),
+    moderation: getModerationStats(),
+  });
+});
 
 // Trạng thái VoiceStudio & bộ nhớ đệm StoryVoiceEngine (cho phép HUD báo chấm Online/Offline)
 app.get("/api/tts-status", async (req, res) => {
@@ -1508,6 +1556,49 @@ io.on("connection", (socket) => {
       broadcastRoomsList();
     }
     cb?.({ ok: true });
+  });
+
+  // Báo cáo người chơi vi phạm văn minh (Ring buffer <= 200 bản ghi bảo vệ 512MB RAM Render)
+  socket.on("player:report", ({ targetId, targetName, reason } = {}, cb) => {
+    if (!checkSocketCooldown(socket, "player_report", 3000)) {
+      return cb?.({ ok: false, error: "Bạn vừa gửi báo cáo, vui lòng đợi ít giây." });
+    }
+    const repLim = checkIpRateLimit("player_report", clientIp, 6, 60_000);
+    if (!repLim.allowed) {
+      return cb?.({
+        ok: false,
+        error: `Bạn gửi báo cáo quá nhanh! Vui lòng đợi ${repLim.retryAfterSec} giây.`,
+      });
+    }
+
+    const code = socket.data.roomCode;
+    if (!code) return cb?.({ ok: false, error: "Không ở trong bàn chơi." });
+    const room = getRoom(code);
+    if (!room) return cb?.({ ok: false, error: "Phòng không tồn tại." });
+
+    const reporter =
+      room.players.find((p) => p.socketId === socket.id || p.id === socket.data.playerId) ||
+      (room.spectators || []).find((s) => s.socketId === socket.id || s.id === socket.data.playerId);
+    if (!reporter) return cb?.({ ok: false, error: "Không xác thực được người báo cáo." });
+
+    const resolvedTarget =
+      room.players.find((p) => p.id === targetId) ||
+      (room.spectators || []).find((s) => s.id === targetId);
+    const cleanTargetName =
+      resolvedTarget?.name || String(targetName || "Ẩn danh").trim().slice(0, 24);
+    const cleanReason = sanitizeChatText(String(reason || "Ngôn từ thiếu văn minh"), 120);
+
+    const entry = recordPlayerReport({
+      reporterIp: clientIp,
+      roomCode: room.code,
+      reporterId: reporter.id,
+      reporterName: reporter.name,
+      targetId: resolvedTarget?.id || String(targetId || ""),
+      targetName: cleanTargetName,
+      reason: cleanReason || "Ngôn từ thiếu văn minh",
+    });
+
+    cb?.({ ok: true, reportId: entry.id });
   });
 
   // [LOCAL DEV ONLY] Đăng ký bộ công cụ DevSandbox (tự khóa cứng trên Render/Production)

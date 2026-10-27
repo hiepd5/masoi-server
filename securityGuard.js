@@ -5,6 +5,8 @@
 // - Chống dò mật khẩu phòng, lọc Avatar độc hại, giới hạn Chat & Emoji đêm
 // =============================================================================
 
+import { filterVietnameseProfanity } from "./moderationAndStats.js";
+
 export const IS_PRODUCTION_ENV = Boolean(
   process.env.RENDER || process.env.NODE_ENV === "production"
 );
@@ -172,10 +174,10 @@ export function sanitizeDeviceId(rawId) {
 
 export function sanitizeChatText(rawText, maxLen = MAX_CHAT_LENGTH) {
   if (typeof rawText !== "string") return "";
-  return rawText
+  const stripped = rawText
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
-    .trim()
-    .slice(0, maxLen);
+    .trim();
+  return filterVietnameseProfanity(stripped).slice(0, maxLen);
 }
 
 export function checkSocketCooldown(socket, actionKey, cooldownMs) {

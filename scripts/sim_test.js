@@ -24,7 +24,14 @@ import {
   deleteRoom,
   hasValidActiveSessionToken,
   publicRoomView,
+  getGlobalServerRuntimeMetrics,
 } from "../rooms.js";
+import {
+  filterVietnameseProfanity,
+  getVietnamGoldenHourInfo,
+  recordPlayerReport,
+  getModerationStats,
+} from "../moderationAndStats.js";
 import {
   BUILTIN_VILLAGER_IDS,
   resolveCitizenAvatarSpec,
@@ -1238,7 +1245,7 @@ runScenario("36. V3.5.3: EndGameRecap 0-Abort Lock (EMPTY_ARRAY + storyVoicePlan
     "useEffect nạp Voice chỉ phụ thuộc chữ ký chuỗi orderedVoicePlan.planKey bất biến (0% tự abort khi 3D re-render)"
   );
   assert.ok(
-    serverIndexSrc.includes('allowedHeaders: ["Content-Type", "Authorization", "x-game-session"]'),
+    serverIndexSrc.includes('allowedHeaders: ["Content-Type", "Authorization", "x-game-session"'),
     "server/index.js phải khai báo tường minh allowedHeaders cho x-game-session"
   );
 });
@@ -1516,6 +1523,137 @@ runScenario("44. V4.1: Kho 12+ Ô Chờ Avatar 3D Người Thật (DB-Ready) & A
     true,
     "Mọi Avatar 3D Người Thật phải khóa botAllowed=false & tintableCloak=false (giữ nguyên màu da/áo gốc)"
   );
+});
+
+// 45. V4.1 — Lá Chắn Văn Minh Tiếng Việt, Giới Hạn Ring Buffer Báo Cáo (<= 200) & Chỉ Số Vận Hành Server
+runScenario("45. V4.1: sanitizeChatText che từ tục tiếng Việt (giữ nguyên từ bình thường), Ring Buffer <= 200 & Runtime Metrics", () => {
+  const dirtyCleaned = sanitizeChatText("đm con sói vcl cắn bậy fuck thật");
+  assert.equal(dirtyCleaned.includes("đm"), false, "Phải che từ tục có dấu tiếng Việt đầu câu");
+  assert.equal(dirtyCleaned.includes("vcl"), false, "Phải che từ viết tắt tục tĩu");
+  assert.equal(dirtyCleaned.includes("fuck"), false, "Phải che từ tục tiếng Anh");
+  assert.ok(dirtyCleaned.includes("**"), "Từ vi phạm phải được thay bằng ký tự sao (*)");
+
+  const cleanVietnamese = "Đêm nay dân làng cùng chức năng bảo vệ công cụ thảo luận văn minh!";
+  assert.equal(
+    filterVietnameseProfanity(cleanVietnamese),
+    cleanVietnamese,
+    "Tuyệt đối không làm hỏng các từ tiếng Việt bình thường (đêm, làng, chức, công cụ)"
+  );
+
+  for (let i = 0; i < 215; i++) {
+    recordPlayerReport({
+      reporterIp: "198.51.100.42",
+      roomCode: "V41RM",
+      reporterId: `rep_${i}`,
+      reporterName: "Dân Làng",
+      targetId: "bad_actor",
+      targetName: "Kẻ Quấy Rối",
+      reason: "Chửi thề trên bàn thảo luận",
+    });
+  }
+  const modStats = getModerationStats();
+  assert.ok(modStats.totalReportsCount >= 215);
+  assert.equal(
+    modStats.recentReportsCount,
+    200,
+    "Ring Buffer báo cáo phải khóa cứng trần <= 200 bản ghi bảo vệ 512MB RAM Render"
+  );
+
+  const metrics = getGlobalServerRuntimeMetrics();
+  assert.equal(typeof metrics.activeRoomsCount, "number");
+  assert.equal(typeof metrics.totalConnectedHumans, "number");
+});
+
+// 46. V4.1 — Chốt #9: Khung Giờ Vàng Đêm Huyết Nguyệt (20:00 – 23:00 UTC+7) Xác Thực 100% Bằng Đồng Hồ Server
+runScenario("46. V4.1 (Chốt #9): getVietnamGoldenHourInfo tính chuẩn 20:00–23:00 UTC+7 & xuất kèm publicRoomView", () => {
+  // 19:59 UTC+7 = 12:59 UTC -> Chưa mở Giờ Vàng
+  const beforeWindow = getVietnamGoldenHourInfo(Date.UTC(2026, 9, 28, 12, 59, 0));
+  assert.equal(beforeWindow.active, false);
+  assert.equal(beforeWindow.multiplier, 1);
+  assert.equal(beforeWindow.utc7Hour, 19);
+  assert.equal(beforeWindow.serverDateKey, "2026-10-28");
+
+  // 20:30 UTC+7 = 13:30 UTC -> ĐANG TRONG ĐÊM HUYẾT NGUYỆT X2 XP!
+  const insideWindow = getVietnamGoldenHourInfo(Date.UTC(2026, 9, 28, 13, 30, 0));
+  assert.equal(insideWindow.active, true);
+  assert.equal(insideWindow.multiplier, 2);
+  assert.equal(insideWindow.utc7Hour, 20);
+
+  // 23:00 UTC+7 = 16:00 UTC -> Đã khép lại khung 20:00 - 22:59
+  const afterWindow = getVietnamGoldenHourInfo(Date.UTC(2026, 9, 28, 16, 0, 0));
+  assert.equal(afterWindow.active, false);
+  assert.equal(afterWindow.multiplier, 1);
+  assert.equal(afterWindow.utc7Hour, 23);
+
+  const room = createRoom("gh_host");
+  addPlayer(room.code, "gh_host", "Thợ Săn Đêm");
+  const view = publicRoomView(room, "gh_host");
+  assert.ok(view.serverGoldenHour && typeof view.serverGoldenHour.multiplier === "number");
+  deleteRoom(room.code);
+});
+
+// 47. V4.1 — Viral Clip Dọc 9:16 TikTok, Thẻ MVP PNG, Zero-Leak Haptics (Chốt #7/#13) & Sói Đầu Đàn Voice
+runScenario("47. V4.1: Clip dọc 9:16 + Watermark masoi.hiepd5.com, Thẻ MVP PNG, Haptics Zero-Leak & Alpha Wolf Voice", () => {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const rootDir = path.resolve(__dirname, "../..");
+
+  const recorderSrc = fs.readFileSync(path.join(rootDir, "client/src/utils/cinemaVideoRecorder.js"), "utf8");
+  assert.ok(recorderSrc.includes('aspectMode === "9:16"'), "cinemaVideoRecorder.js phải hỗ trợ chế độ dọc 9:16 TikTok/Reels");
+  assert.ok(recorderSrc.includes("masoi.hiepd5.com"), "Video xuất ra phải đóng dấu thương hiệu masoi.hiepd5.com");
+
+  const mvpCardSrc = fs.readFileSync(path.join(rootDir, "client/src/utils/mvpShareCard.js"), "utf8");
+  assert.ok(mvpCardSrc.includes("generateMvpShareCardBlob") && mvpCardSrc.includes("1080") && mvpCardSrc.includes("1350"));
+
+  const hapticsSrc = fs.readFileSync(path.join(rootDir, "client/src/utils/hapticsAndSound.js"), "utf8");
+  assert.ok(
+    hapticsSrc.includes("ALLOWED_HAPTIC_PATTERNS") && !hapticsSrc.includes("wolf_bite"),
+    "Chốt #7: Bảng rung xúc giác chỉ cho phép sự kiện công khai/cá nhân hợp lệ, cấm sự kiện đêm lộ bài"
+  );
+
+  const voiceRoomSrc = fs.readFileSync(path.join(rootDir, "client/src/components/VoiceRoom.jsx"), "utf8");
+  assert.ok(
+    voiceRoomSrc.includes("isWolfTeamRole(myRole)") && !voiceRoomSrc.includes('myRole === "wolf"'),
+    "Sói Đầu Đàn (alpha_wolf) phải nghe & nói được kênh LiveKit Bầy Sói ban đêm"
+  );
+});
+
+// 48. V4.1 — Tối Ưu HUD 1 Lớp Phẳng (0 Drei Html Root), Draco Nội Bộ 100%, PWA Split-Cache (Chốt #14) & Capacitor App Store
+runScenario("48. V4.1: SeatHudBatchOverlay 1 lớp DOM, Draco nội bộ '/draco/', Service Worker Chốt #14 & Capacitor Config", () => {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const rootDir = path.resolve(__dirname, "../..");
+
+  const hudOverlayPath = path.join(rootDir, "client/src/3d/components/SeatHudBatchOverlay.jsx");
+  assert.equal(fs.existsSync(hudOverlayPath), true, "Phải có module SeatHudBatchOverlay.jsx gộp HUD ghế về 1 lớp DOM phẳng");
+
+  const loaderFiles = [
+    "client/src/3d/props/SmartPropGLB.jsx",
+    "client/src/3d/actors/SkinnedCharacterGLB.jsx",
+    "client/src/3d/actors/RoleSocketAttachment3D.jsx",
+  ];
+  for (const rel of loaderFiles) {
+    const src = fs.readFileSync(path.join(rootDir, rel), "utf8");
+    assert.ok(src.includes('setDecoderPath("/draco/")'), `${rel} phải trỏ tới bộ giải mã Draco nội bộ /draco/`);
+    assert.equal(src.includes("gstatic.com/draco"), false, `${rel} phải gỡ sạch phụ thuộc CDN gstatic.com`);
+  }
+
+  assert.equal(
+    fs.existsSync(path.join(rootDir, "client/public/draco/draco_decoder.wasm")),
+    true,
+    "Thư mục client/public/draco/ phải có đủ draco_decoder.wasm nội bộ"
+  );
+
+  const swSrc = fs.readFileSync(path.join(rootDir, "client/public/sw.js"), "utf8");
+  assert.ok(
+    swSrc.includes("masoi-assets-v4.1") && swSrc.includes("masoi-shell-v4.1") && swSrc.includes("/socket.io/"),
+    "Chốt #14: Service Worker phải tách bạch Cache-First cho GLB/WebP/Audio và Network-First cho HTML/JS"
+  );
+
+  const capConfig = JSON.parse(fs.readFileSync(path.join(rootDir, "client/capacitor.config.json"), "utf8"));
+  assert.equal(capConfig.appId, "com.hiepd5.masoi3d");
+  assert.equal(capConfig.webDir, "dist");
+
+  const runtimeEnvSrc = fs.readFileSync(path.join(rootDir, "client/src/config/runtimeEnv.js"), "utf8");
+  assert.ok(runtimeEnvSrc.includes("isNativeCapacitor") && runtimeEnvSrc.includes("GRAPHICS_PRESETS"));
 });
 
 const totalMs = (performance.now() - startTime).toFixed(1);
