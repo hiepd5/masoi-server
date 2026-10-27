@@ -193,6 +193,9 @@ app.use(
       if (isOriginAllowed(origin)) return cb(null, true);
       return cb(new Error("Origin blocked by Ma Soi Zero-Trust CORS"));
     },
+    methods: ["GET", "POST", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-game-session"],
+    exposedHeaders: ["X-TTS-Voice", "X-TTS-Cache"],
   })
 );
 // Riêng công cụ D5 Studio nội bộ trên máy Dev được nhận payload cảnh quan tới 1MB; toàn bộ API công khai giới hạn <= 64KB bảo vệ 512MB RAM Render
@@ -1311,12 +1314,14 @@ app.post("/api/tts-batch", async (req, res) => {
   if (!isAuthorizedTtsRequest(req)) {
     return res.status(401).json({ error: "Unauthorized game session" });
   }
+  const { phrases, speed, voice, urgent, cacheOnly } = req.body || {};
   const clientIp = extractClientIp(req);
-  if (!checkIpRateLimit("tts_batch", clientIp, 90, 60_000).allowed) {
+  const limBucket = cacheOnly === true ? "tts_batch_cache" : "tts_batch";
+  const limMax = cacheOnly === true ? 240 : 180;
+  if (!checkIpRateLimit(limBucket, clientIp, limMax, 60_000).allowed) {
     return res.status(429).json({ error: "Too many TTS batch requests" });
   }
 
-  const { phrases, speed, voice, urgent, cacheOnly } = req.body || {};
   if (!Array.isArray(phrases) || phrases.length === 0) {
     return res.status(400).json({ error: "Missing phrases array" });
   }

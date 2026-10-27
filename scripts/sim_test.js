@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import * as GE from "../gameEngine.js";
 import { generateDefaultRoles, generateExpandedV33Roles, assignCustomRoles } from "../roles.js";
 import {
@@ -1195,6 +1198,37 @@ runScenario("35. Instant End-Game Voice: Zero-Waste (0 câu giả định đầu
   );
 
   deleteRoom(room.code);
+});
+
+// 36. V3.5.3 — EndGameRecap 0-Abort Lock: Chống tự hủy fetch 280ms, chống trôi Cảnh 0 ở Render #1 & bảo toàn CORS x-game-session
+runScenario("36. V3.5.3: EndGameRecap 0-Abort Lock (EMPTY_ARRAY + storyVoicePlanKey + Render #1 Wait + CORS)", () => {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const rootDir = path.resolve(__dirname, "../..");
+  const playingViewSrc = fs.readFileSync(path.join(rootDir, "client/src/components/PlayingView.jsx"), "utf8");
+  const endGameSrc = fs.readFileSync(path.join(rootDir, "client/src/components/EndGameRecap.jsx"), "utf8");
+  const serverIndexSrc = fs.readFileSync(path.join(rootDir, "server/index.js"), "utf8");
+
+  assert.ok(
+    playingViewSrc.includes("const EMPTY_ARRAY = Object.freeze([]);") &&
+      !playingViewSrc.includes("loversPublic={g.loversPublic || []}"),
+    "PlayingView.jsx phải dùng EMPTY_ARRAY bất biến thay vì inline || [] gây hủy fetch mỗi 280ms"
+  );
+  assert.ok(
+    playingViewSrc.includes("sessionToken={liveSessionToken}"),
+    "PlayingView.jsx phải truyền thẳng liveSessionToken sống sang EndGameRecap"
+  );
+  assert.ok(
+    endGameSrc.includes("const [storyVoiceLoading, setStoryVoiceLoading] = useState(() => mcVoiceEnabled !== false);"),
+    "EndGameRecap.jsx phải khóa storyVoiceLoading=true ngay từ Render #1 để Cảnh 0 không bị trôi sớm"
+  );
+  assert.ok(
+    endGameSrc.includes("}, [orderedVoicePlan.planKey, speechEnabled, voiceRecheckTick, autoRetryTick]);"),
+    "useEffect nạp Voice chỉ phụ thuộc chữ ký chuỗi orderedVoicePlan.planKey bất biến (0% tự abort khi 3D re-render)"
+  );
+  assert.ok(
+    serverIndexSrc.includes('allowedHeaders: ["Content-Type", "Authorization", "x-game-session"]'),
+    "server/index.js phải khai báo tường minh allowedHeaders cho x-game-session"
+  );
 });
 
 const totalMs = (performance.now() - startTime).toFixed(1);
