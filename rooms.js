@@ -1,6 +1,11 @@
 import "./envLoader.js";
 import { randomUUID } from "crypto";
-import { getDefaultName, getAvatarUrl } from "./defaultNames.js";
+import {
+  getDefaultName,
+  getAvatarUrl,
+  BUILTIN_VILLAGER_IDS,
+  resolveCitizenAvatarSpec,
+} from "./defaultNames.js";
 import {
   generateDefaultRoles,
   generateExpandedV33Roles,
@@ -12,6 +17,7 @@ import {
   MAX_ACTIVE_ROOMS,
   MAX_CHAT_LENGTH,
   sanitizeAvatarUrl,
+  sanitizeCitizenModelId,
   sanitizeChatText,
   sanitizeDeviceId,
 } from "./securityGuard.js";
@@ -310,7 +316,11 @@ export function addPlayer(
   }
 
   const safeAvatarUrl = sanitizeAvatarUrl(avatarUrl);
-  const safeSeed = avatarSeed ? String(avatarSeed).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) : null;
+  const safeCitizenReq = sanitizeCitizenModelId(options?.citizenModelId);
+  const citizenSpec = resolveCitizenAvatarSpec(safeCitizenReq, {
+    fallbackSeed: `${name}-${String(socketId).slice(0, 4)}`,
+    forBot: false,
+  });
   const isFirstRealHuman = realHumansBefore.length === 0;
   const player = {
     id: socketId,
@@ -320,10 +330,9 @@ export function addPlayer(
     sessionToken: randomUUID(),
     disconnectedAt: null,
     name,
-    avatar: safeAvatarUrl
-      || (safeSeed
-        ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${safeSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
-        : getAvatarUrl(name + "-" + socketId.slice(0, 4))),
+    citizenModelId: citizenSpec.citizenModelId,
+    avatarSource: citizenSpec.avatarSource,
+    avatar: safeAvatarUrl || citizenSpec.avatar,
     isHost: isFirstRealHuman,
     ready: isFirstRealHuman,
     seatIndex: room.players.length,
@@ -531,8 +540,9 @@ export function addBotsToRoom(code, count = 1, { syncRolesMode = null } = {}) {
     if (existingNames.has(botName)) botName = `${botName} #${idx + 1}`;
     existingNames.add(botName);
 
-    const seed = `${BOT_SEEDS[idx % BOT_SEEDS.length]}-${idx}`;
     const persona = BOT_PERSONAS[idx % BOT_PERSONAS.length];
+    const botVillagerId = BUILTIN_VILLAGER_IDS[idx % BUILTIN_VILLAGER_IDS.length];
+    const botSpec = resolveCitizenAvatarSpec(botVillagerId, { forBot: true });
     room.players.push({
       id: `bot_${randomUUID().slice(0, 8)}`,
       socketId: null,
@@ -543,7 +553,9 @@ export function addBotsToRoom(code, count = 1, { syncRolesMode = null } = {}) {
       sessionToken: null,
       disconnectedAt: null,
       name: botName,
-      avatar: `https://api.dicebear.com/7.x/bottts/svg?seed=${seed}&backgroundColor=b6e3f4,c0aede,d1d4f9`,
+      citizenModelId: botSpec.citizenModelId,
+      avatarSource: "builtin_villager",
+      avatar: botSpec.avatar,
       isHost: false,
       ready: true,
       seatIndex: room.players.length,
@@ -659,7 +671,14 @@ export function getPublicRoomsList() {
   return list;
 }
 
-export function renamePlayer(code, socketId, newName, avatarSeed = null, avatarUrl = null) {
+export function renamePlayer(
+  code,
+  socketId,
+  newName,
+  avatarSeed = null,
+  avatarUrl = null,
+  citizenModelId = null
+) {
   const room = getRoom(code);
   if (!room) return { error: "Phòng không tồn tại." };
   const trimmed = sanitizeChatText(String(newName || ""), 20);
@@ -674,13 +693,43 @@ export function renamePlayer(code, socketId, newName, avatarSeed = null, avatarU
   const player = room.players.find((p) => p.socketId === socketId || p.id === socketId);
   if (!player) return { error: "Không tìm thấy người chơi." };
   const safeAvatarUrl = sanitizeAvatarUrl(avatarUrl);
-  const safeSeed = avatarSeed ? String(avatarSeed).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) : null;
+  const safeCitizenReq = sanitizeCitizenModelId(citizenModelId || player.citizenModelId);
+  const citizenSpec = resolveCitizenAvatarSpec(safeCitizenReq, {
+    fallbackSeed: `${trimmed}-${String(player.id).slice(0, 4)}`,
+    forBot: Boolean(player.isBot),
+  });
   player.name = trimmed;
-  player.avatar = safeAvatarUrl
-    || (safeSeed
-      ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${safeSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
-      : getAvatarUrl(trimmed + "-" + player.id.slice(0, 4)));
+  player.citizenModelId = citizenSpec.citizenModelId;
+  player.avatarSource = citizenSpec.avatarSource;
+  player.avatar = safeAvatarUrl || citizenSpec.avatar;
   return { room, player };
+}
+
+export function setPlayerCitizenModel(code, socketId, requestedCitizenModelId) {
+  const room = getRoom(code);
+  if (!room) return { error: "Phòng không tồn tại." };
+  if (room.phase !== "lobby") {
+    return { error: "Chỉ có thể đổi nhân vật 3D khi đang ở sảnh chờ." };
+  }
+  const player = room.players.find((p) => p.socketId === socketId || p.id === socketId);
+  if (!player || player.isBot) {
+    return { error: "Không tìm thấy người chơi." };
+  }
+  const safeCitizenReq = sanitizeCitizenModelId(requestedCitizenModelId);
+  const citizenSpec = resolveCitizenAvatarSpec(safeCitizenReq, {
+    fallbackSeed: `${player.name}-${String(player.id).slice(0, 4)}`,
+    forBot: false,
+  });
+  player.citizenModelId = citizenSpec.citizenModelId;
+  player.avatarSource = citizenSpec.avatarSource;
+  player.avatar = citizenSpec.avatar;
+  return {
+    ok: true,
+    room,
+    player,
+    citizenModelId: player.citizenModelId,
+    avatar: player.avatar,
+  };
 }
 
 export function setRoomTurbo(code, requesterSocketId, isTurbo) {
@@ -861,7 +910,11 @@ export function addSpectator(
   }
 
   const safeAvatarUrl = sanitizeAvatarUrl(avatarUrl);
-  const safeSeed = avatarSeed ? String(avatarSeed).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) : null;
+  const safeCitizenReq = sanitizeCitizenModelId(options?.citizenModelId);
+  const citizenSpec = resolveCitizenAvatarSpec(safeCitizenReq, {
+    fallbackSeed: `${name}-${String(socketId).slice(0, 4)}`,
+    forBot: false,
+  });
   const spectator = {
     id: socketId,
     socketId,
@@ -870,11 +923,9 @@ export function addSpectator(
     isSpectator: true,
     sessionToken: randomUUID(),
     name,
-    avatar:
-      safeAvatarUrl ||
-      (safeSeed
-        ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${safeSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
-        : getAvatarUrl(name + "-" + socketId.slice(0, 4))),
+    citizenModelId: citizenSpec.citizenModelId,
+    avatarSource: citizenSpec.avatarSource,
+    avatar: safeAvatarUrl || citizenSpec.avatar,
     joinedAt: Date.now(),
   };
   room.spectators.push(spectator);
@@ -892,6 +943,7 @@ export function findOrCreateQuickMatchRoom(
     name = null,
     avatarSeed = null,
     avatarUrl = null,
+    citizenModelId = null,
     preferTurbo = false,
     deviceId = null,
     enforceAntiMultiTab = undefined,
@@ -937,7 +989,7 @@ export function findOrCreateQuickMatchRoom(
       avatarSeed,
       avatarUrl,
       "",
-      { deviceId: cleanDeviceId, enforceAntiMultiTab }
+      { deviceId: cleanDeviceId, enforceAntiMultiTab, citizenModelId }
     );
     if (!joined.error && joined.room && joined.player) {
       return {
@@ -967,7 +1019,12 @@ export function findOrCreateQuickMatchRoom(
     avatarSeed,
     avatarUrl,
     "",
-    { deviceId: cleanDeviceId, enforceAntiMultiTab, isNewQuickMatchRoom: true }
+    {
+      deviceId: cleanDeviceId,
+      enforceAntiMultiTab,
+      citizenModelId,
+      isNewQuickMatchRoom: true,
+    }
   );
   if (createdJoin.error) {
     deleteRoom(newRoom.code);
@@ -1051,7 +1108,9 @@ export function resetRoomToLobby(room) {
       sessionToken: spec.sessionToken || randomUUID(),
       disconnectedAt: null,
       name: finalName,
-      avatar: spec.avatar,
+      citizenModelId: spec.citizenModelId || "villager_cloak",
+      avatarSource: spec.avatarSource || "builtin_villager",
+      avatar: spec.avatar || "/portraits/badges/villager_cloak.webp",
       isHost: becomeHost,
       ready: becomeHost,
       seatIndex: room.players.length,
@@ -1124,6 +1183,8 @@ export function publicRoomView(room, forSocketId) {
       id: p.id,
       name: p.name,
       avatar: p.avatar,
+      citizenModelId: p.citizenModelId || "villager_cloak",
+      avatarSource: p.avatarSource || "builtin_villager",
       seatIndex: typeof p.seatIndex === "number" ? p.seatIndex : idx,
       isHost: p.isHost,
       isBot: Boolean(p.isBot),

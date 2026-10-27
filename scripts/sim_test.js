@@ -17,6 +17,7 @@ import {
   setRoomAccess,
   setRoomTurbo,
   setSoloPracticeRole,
+  setPlayerCitizenModel,
   addBotsToRoom,
   getPublicRoomsList,
   getRoom,
@@ -25,12 +26,17 @@ import {
   publicRoomView,
 } from "../rooms.js";
 import {
+  BUILTIN_VILLAGER_IDS,
+  resolveCitizenAvatarSpec,
+} from "../defaultNames.js";
+import {
   isOriginAllowed,
   checkIpRateLimit,
   recordPasswordFailure,
   getPasswordLockRemainingSec,
   clearPasswordFailures,
   sanitizeAvatarUrl,
+  sanitizeCitizenModelId,
   sanitizeChatText,
   isSafeReactionEmoji,
 } from "../securityGuard.js";
@@ -932,9 +938,10 @@ runScenario("25. SEC-05: sanitizeAvatarUrl chặn XSS/link lạ & chỉ nhận t
   assert.equal(sanitizeAvatarUrl("/avatars/../../etc/passwd"), null);
   assert.equal(sanitizeAvatarUrl("x".repeat(500)), null);
   assert.equal(sanitizeAvatarUrl("/portraits/wolf_1x1.webp"), "/portraits/wolf_1x1.webp");
+  assert.equal(sanitizeAvatarUrl("/avatars/villager_cloak.webp"), "/avatars/villager_cloak.webp");
   assert.equal(
     sanitizeAvatarUrl("https://api.dicebear.com/7.x/adventurer/svg?seed=test"),
-    "https://api.dicebear.com/7.x/adventurer/svg?seed=test"
+    null
   );
 });
 
@@ -1348,7 +1355,10 @@ runScenario("40. V4.1: markRematchReady đủ >= 50% người thật tự mở l
   room.game.phase = "night_seer";
   ctrl.advanceCurrentPhase(room);
   assert.equal(room.phase, "ended");
-  assert.ok(room.game.rematchEndsAt > Date.now(), "Kết ván phải khởi tạo đồng hồ rematchEndsAt 45s");
+  assert.ok(
+    room.game.rematchEndsAt >= Date.now() + 250_000,
+    "Kết ván phải khởi tạo trần dọn phòng ngầm 300s (không cắt ngang phim 45s)"
+  );
 
   // Có 3 người thật -> cần ceil(3/2) = 2 người bấm Ván Mới
   const r1 = ctrl.markRematchReady(room, g1.id);
@@ -1392,6 +1402,120 @@ runScenario("41. V4.1: Dự đoán Cõi Âm (+35 XP khi đoán trúng, ẩn kh�
   const cardFiles = fs.readdirSync(cardsDir).filter((f) => f.endsWith(".webp"));
   assert.equal(badgeFiles.length, 16, "Phải có đủ 16/16 huy hiệu 3D WebP 1:1");
   assert.equal(cardFiles.length, 16, "Phải có đủ 16/16 thẻ bài Tarot 3D WebP 2:3");
+});
+
+// 42. V3.5.4 — Rạp Chiếu Cá Nhân Không Hẫng + Nút Về Sảnh 2 Giai Đoạn + Tốc Độ Mặc Định 1.5x (1x/1.5x/2x/3x Giữ Âm Sắc)
+runScenario("42. V3.5.4: Rạp cá nhân không hẫng, nút Về Sảnh 2 giai đoạn (0 đếm ngược) & tốc độ 1.5x mặc định [1x/1.5x/2x/3x] giữ pitch", () => {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const roomSrc = fs.readFileSync(
+    path.resolve(__dirname, "../../client/src/components/Room.jsx"),
+    "utf8"
+  );
+  const recapSrc = fs.readFileSync(
+    path.resolve(__dirname, "../../client/src/components/EndGameRecap.jsx"),
+    "utf8"
+  );
+  const recorderSrc = fs.readFileSync(
+    path.resolve(__dirname, "../../client/src/utils/cinemaVideoRecorder.js"),
+    "utf8"
+  );
+
+  // 1. Tách rạp cá nhân (frozenRecapSnapshot + dismissedRecapKey + freshSessionToken)
+  assert.ok(roomSrc.includes("frozenRecapSnapshot"), "Room.jsx phải giữ bản chụp rạp cá nhân frozenRecapSnapshot");
+  assert.ok(roomSrc.includes("dismissedRecapKey"), "Room.jsx phải cho phép từng máy thoát sảnh độc lập qua dismissedRecapKey");
+  assert.ok(roomSrc.includes("freshSessionToken"), "Room.jsx phải truyền freshSessionToken sống cho /api/tts-batch");
+
+  // 2. Hai giai đoạn nút Về Sảnh Chờ (ẩn đếm ngược giây, mở khóa sau khi hết truyện hoặc tua tới MVP)
+  assert.ok(recapSrc.includes("hasCompletedStoryOnce"), "EndGameRecap.jsx phải khóa trạng thái hasCompletedStoryOnce");
+  assert.ok(recapSrc.includes("⏭️ Về sảnh chờ sớm"), "Khi chưa hết truyện phải hiện nút phụ '⏭️ Về sảnh chờ sớm'");
+  assert.ok(recapSrc.includes("🏰 Về Sảnh Chờ"), "Khi hết truyện phải bung nút chính '🏰 Về Sảnh Chờ'");
+  assert.ok(!recapSrc.includes("rematchSecLeft"), "Tuyệt đối không hiển thị số giây đếm ngược hối thúc trên nút về sảnh");
+
+  // 3. Tốc độ mặc định 1.5x + bộ chọn [1, 1.5, 2, 3] + preservesPitch = true chống méo giọng
+  assert.ok(recapSrc.includes("useState(1.5)"), "Tốc độ xem mặc định phải là 1.5x");
+  assert.ok(recapSrc.includes("[1, 1.5, 2, 3]"), "Bộ chọn tốc độ phải đủ 4 mức 1x, 1.5x, 2x, 3x");
+  assert.ok(recorderSrc.includes("preservesPitch = true"), "cinemaVideoRecorder.js phải bật preservesPitch = true giữ giọng Clone trầm ấm");
+  assert.ok(recorderSrc.includes("Math.min(3.0"), "cinemaVideoRecorder.js phải mở trần tốc độ lên 3.0x");
+  assert.ok(recorderSrc.includes("setPlaybackRate"), "cinemaVideoRecorder.js phải hỗ trợ đổi tốc độ trực tiếp giữa câu không ngắt lời");
+});
+
+// 43. V4.1 — Hệ Nhân Vật Dân Làng 3D Ngồi Ghế, Đổi Nhân Vật Trong Phòng & Gỡ Sạch Avatar 2D Cũ / Dicebear
+runScenario("43. V4.1: Đồng bộ citizenModelId qua Join/QuickMatch/Spectator/setPlayerCitizenModel & 0% Dicebear/Avatar 2D cũ", () => {
+  assert.equal(sanitizeCitizenModelId("villager_female"), "villager_female");
+  assert.equal(sanitizeCitizenModelId("../evil_hack"), null);
+
+  const room = createRoom("cit_host");
+  const { player: host } = addPlayer(room.code, "cit_host", "Chủ Làng", null, null, "", {
+    citizenModelId: "villager_elder",
+  });
+  assert.equal(host.citizenModelId, "villager_elder");
+  assert.equal(host.avatar, "/portraits/badges/villager_elder.webp");
+  assert.ok(!host.avatar.includes("dicebear.com"));
+
+  const changeRes = setPlayerCitizenModel(room.code, "cit_host", "villager_female");
+  assert.equal(changeRes.ok, true, "Người chơi đổi Nhân vật 3D ngay trong sảnh chờ phải thành công");
+  assert.equal(host.citizenModelId, "villager_female");
+  assert.equal(host.avatar, "/portraits/badges/villager_female.webp");
+
+  const pubView = publicRoomView(room, "cit_host");
+  assert.equal(pubView.players[0].citizenModelId, "villager_female");
+
+  // Kiểm tra Khán giả giữ nguyên citizenModelId khi đôn lên ghế ván mới
+  addBotsToRoom(room.code, 5);
+  GE.initGameState(room);
+  room.phase = "playing";
+  const specRes = addSpectator(room.code, "cit_spec", "Khách Mời", null, null, "", {
+    citizenModelId: "villager_true",
+  });
+  assert.equal(specRes.spectator.citizenModelId, "villager_true");
+  resetRoomToLobby(room);
+  const promoted = room.players.find((p) => p.socketId === "cit_spec");
+  assert.equal(promoted.citizenModelId, "villager_true");
+  deleteRoom(room.code);
+
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const legacyCustomDir = path.resolve(__dirname, "../../client/public/avatars/custom");
+  assert.equal(fs.existsSync(legacyCustomDir), false, "Thư mục ảnh mặt thật 2D cũ phải được gỡ khỏi public web");
+  const lobbySrc = fs.readFileSync(path.resolve(__dirname, "../../client/src/components/Lobby.jsx"), "utf8");
+  assert.equal(lobbySrc.includes("dicebear.com"), false, "Lobby.jsx phải gỡ sạch 100% api.dicebear.com");
+});
+
+// 44. V4.1 — Kho Ô Chờ Avatar 3D Người Thật (DB-Ready) & Khóa Độc Quyền Không Cấp Cho AI Bot
+runScenario("44. V4.1: Kho 12+ Ô Chờ Avatar 3D Người Thật (DB-Ready) & AI Bot khóa cứng 4 Dân Làng Bắc Âu", () => {
+  const botAttemptCustom = resolveCitizenAvatarSpec("avatar_real_01", {
+    fallbackSeed: "bot2",
+    forBot: true,
+  });
+  assert.ok(
+    BUILTIN_VILLAGER_IDS.includes(botAttemptCustom.citizenModelId),
+    "AI Bot tuyệt đối không được mượn avatar_real_* của người thật"
+  );
+  assert.equal(botAttemptCustom.avatarSource, "builtin_villager");
+
+  const room = createRoom("bot_lock_host");
+  addPlayer(room.code, "bot_lock_host", "Người Thật");
+  addBotsToRoom(room.code, 7);
+  const bots = room.players.filter((p) => p.isBot);
+  assert.equal(bots.length, 7);
+  assert.equal(
+    bots.every((b) => BUILTIN_VILLAGER_IDS.includes(b.citizenModelId) && !b.avatar.includes("dicebear.com")),
+    true,
+    "100% AI Bot phải xoay vòng 4 Nhân vật Dân Làng 3D nội bộ"
+  );
+  deleteRoom(room.code);
+
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const manifestDoc = JSON.parse(
+    fs.readFileSync(path.resolve(__dirname, "../../client/public/models/avatars/avatars_manifest.json"), "utf8")
+  );
+  assert.equal(manifestDoc.builtinVillagers.length, 4, "Phải có đúng 4 Dân Làng 3D mặc định");
+  assert.ok(manifestDoc.customHumanAvatars.length >= 12, "Phải có tối thiểu 12 Ô Chờ Avatar 3D Người Thật");
+  assert.equal(manifestDoc.dbReadySchema.column, "citizen_model_id", "Sẵn sàng cột citizen_model_id cho DB User");
+  assert.equal(
+    manifestDoc.customHumanAvatars.every((item) => item.botAllowed === false && item.tintableCloak === false),
+    true,
+    "Mọi Avatar 3D Người Thật phải khóa botAllowed=false & tintableCloak=false (giữ nguyên màu da/áo gốc)"
+  );
 });
 
 const totalMs = (performance.now() - startTime).toFixed(1);

@@ -1,0 +1,84 @@
+{
+  "schemaVersion": "1.0.0",
+  "updatedAt": "2026-10-27",
+  "builtinVillagerIds": [
+    "villager_cloak",
+    "villager_true",
+    "villager_female",
+    "villager_elder"
+  ],
+  "customHumanAvatars": [
+    {
+      "id": "avatar_real_01",
+      "status": "reserved",
+      "botAllowed": false,
+      "portraitBadge": null
+    },
+    {
+      "id": "avatar_real_02",
+      "status": "reserved",
+      "botAllowed": false,
+      "portraitBadge": null
+    },
+    {
+      "id": "avatar_real_03",
+      "status": "reserved",
+      "botAllowed": false,
+      "portraitBadge": null
+    },
+    {
+      "id": "avatar_real_04",
+      "status": "reserved",
+      "botAllowed": false,
+      "portraitBadge": null
+    },
+    {
+      "id": "avatar_real_05",
+      "status": "reserved",
+      "botAllowed": false,
+      "portraitBadge": null
+    },
+    {
+      "id": "avatar_real_06",
+      "status": "reserved",
+      "botAllowed": false,
+      "portraitBadge": null
+    },
+    {
+      "id": "avatar_real_07",
+      "status": "reserved",
+      "botAllowed": false,
+      "portraitBadge": null
+    },
+    {
+      "id": "avatar_real_08",
+      "status": "reserved",
+      "botAllowed": false,
+      "portraitBadge": null
+    },
+    {
+      "id": "avatar_real_09",
+      "status": "reserved",
+      "botAllowed": false,
+      "portraitBadge": null
+    },
+    {
+      "id": "avatar_real_10",
+      "status": "reserved",
+      "botAllowed": false,
+      "portraitBadge": null
+    },
+    {
+      "id": "avatar_real_11",
+      "status": "reserved",
+      "botAllowed": false,
+      "portraitBadge": null
+    },
+    {
+      "id": "avatar_real_12",
+      "status": "reserved",
+      "botAllowed": false,
+      "portraitBadge": null
+    }
+  ]
+}

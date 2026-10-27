@@ -14,6 +14,7 @@ import {
   reconnectByToken,
   removePlayer,
   renamePlayer,
+  setPlayerCitizenModel,
   toggleReady,
   setRolesConfig,
   setScenePreset,
@@ -685,6 +686,7 @@ io.on("connection", (socket) => {
       name,
       avatarSeed,
       avatarUrl,
+      citizenModelId = null,
       roomTitle,
       accessMode = "public",
       password = "",
@@ -706,7 +708,7 @@ io.on("connection", (socket) => {
       avatarSeed || null,
       avatarUrl || null,
       password,
-      { deviceId }
+      { deviceId, citizenModelId }
     );
 
     if (soloQuickStart) {
@@ -770,6 +772,7 @@ io.on("connection", (socket) => {
       name = null,
       avatarSeed = null,
       avatarUrl = null,
+      citizenModelId = null,
       preferTurbo = false,
       deviceId = null,
     } = payload || {};
@@ -778,6 +781,7 @@ io.on("connection", (socket) => {
       name,
       avatarSeed,
       avatarUrl,
+      citizenModelId,
       preferTurbo,
       deviceId,
     });
@@ -798,7 +802,7 @@ io.on("connection", (socket) => {
     broadcastRoom(res.room);
   });
 
-  socket.on("room:spectate", ({ roomCode, name, avatarSeed, avatarUrl, password, deviceId } = {}, cb) => {
+  socket.on("room:spectate", ({ roomCode, name, avatarSeed, avatarUrl, citizenModelId, password, deviceId } = {}, cb) => {
     const lockSec = getPasswordLockRemainingSec(clientIp);
     if (lockSec > 0) {
       return cb?.({
@@ -814,7 +818,7 @@ io.on("connection", (socket) => {
       avatarSeed || null,
       avatarUrl || null,
       password || "",
-      { deviceId }
+      { deviceId, citizenModelId }
     );
     if (res.error) {
       if (res.passwordFailed) {
@@ -862,7 +866,7 @@ io.on("connection", (socket) => {
     broadcastRoom(res.room);
   });
 
-  socket.on("room:join", ({ roomCode, name, avatarSeed, avatarUrl, password, deviceId } = {}, cb) => {
+  socket.on("room:join", ({ roomCode, name, avatarSeed, avatarUrl, citizenModelId, password, deviceId } = {}, cb) => {
     // SEC-05: Chống dò mật khẩu phòng hàng loạt (5 lần sai -> khóa 15 giây/IP)
     const lockSec = getPasswordLockRemainingSec(clientIp);
     if (lockSec > 0) {
@@ -880,7 +884,7 @@ io.on("connection", (socket) => {
       avatarSeed || null,
       avatarUrl || null,
       password || "",
-      { deviceId }
+      { deviceId, citizenModelId }
     );
     if (result.error) {
       if (result.passwordFailed) {
@@ -997,16 +1001,41 @@ io.on("connection", (socket) => {
     cb?.({ ok: true, added: res.added, total: res.total });
   });
 
-  socket.on("room:rename", ({ newName, avatarSeed, avatarUrl } = {}, cb) => {
+  socket.on("room:rename", ({ newName, avatarSeed, avatarUrl, citizenModelId } = {}, cb) => {
     const code = socket.data.roomCode;
     if (!code) return cb?.({ ok: false, error: "Bạn chưa ở trong phòng." });
-    const result = renamePlayer(code, socket.id, newName, avatarSeed || null, avatarUrl || null);
+    const result = renamePlayer(
+      code,
+      socket.id,
+      newName,
+      avatarSeed || null,
+      avatarUrl || null,
+      citizenModelId || null
+    );
     if (result.error) {
       cb?.({ ok: false, error: result.error });
       return;
     }
     cb?.({ ok: true });
     broadcastRoom(result.room);
+  });
+
+  socket.on("room:setCitizenModel", ({ citizenModelId } = {}, cb) => {
+    if (!checkSocketCooldown(socket, "set_citizen_model", 350)) {
+      return cb?.({ ok: false, error: "Thao tác quá nhanh." });
+    }
+    const code = socket.data.roomCode;
+    if (!code) return cb?.({ ok: false, error: "Bạn chưa ở trong phòng." });
+    const result = setPlayerCitizenModel(code, socket.id, citizenModelId);
+    if (result.error) {
+      return cb?.({ ok: false, error: result.error });
+    }
+    broadcastRoom(result.room);
+    cb?.({
+      ok: true,
+      citizenModelId: result.citizenModelId,
+      avatar: result.avatar,
+    });
   });
 
   socket.on("room:leave", () => {

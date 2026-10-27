@@ -138,29 +138,30 @@ export function clearPasswordFailures(ip) {
   pwdFailMap.delete(ip || "unknown");
 }
 
-// ── Whitelist & Làm sạch Avatar URL (Chặn XSS javascript:, tracking pixel & chuỗi 5MB) ──
+// ── Whitelist & Làm sạch Avatar URL (100% nội bộ, chặn XSS javascript:, api.dicebear.com & link ngoài) ──
 export function sanitizeAvatarUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== "string") return null;
   const trimmed = rawUrl.trim();
   if (!trimmed || trimmed.length > 280) return null;
 
-  // Chỉ nhận đường dẫn nội bộ hợp lệ (/portraits/..., /avatars/..., /icons/...)
+  if (trimmed === "/icon-192.png" || trimmed === "/icon-512.png") {
+    return trimmed;
+  }
+
+  // Chỉ nhận đường dẫn nội bộ hợp lệ (/portraits/..., /avatars/..., /icons/..., /images/...)
   if (/^\/(portraits|avatars|icons|images)\/[a-zA-Z0-9_./-]+$/i.test(trimmed)) {
     if (trimmed.includes("..")) return null;
     return trimmed;
   }
 
-  // Hoặc API Dicebear chính thức dùng sẵn của game
-  try {
-    const parsed = new URL(trimmed);
-    if (parsed.protocol === "https:" && parsed.hostname === "api.dicebear.com") {
-      return trimmed;
-    }
-  } catch {
-    return null;
-  }
-
   return null;
+}
+
+export function sanitizeCitizenModelId(rawId) {
+  if (!rawId || typeof rawId !== "string") return null;
+  const trimmed = rawId.trim();
+  if (!/^[a-zA-Z0-9_-]{3,48}$/.test(trimmed)) return null;
+  return trimmed;
 }
 
 export function sanitizeDeviceId(rawId) {

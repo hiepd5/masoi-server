@@ -684,7 +684,8 @@ export function createGameController(io) {
     scheduleSmartNightCheck(room);
   }
 
-  const REMATCH_AUTO_LOBBY_MS = 45_000;
+  // Nâng trần dọn sảnh treo ngầm lên 5 phút (300_000ms) để không bao giờ ngắt ngang câu chuyện cuối game khi người chơi đang xem!
+  const REMATCH_AUTO_LOBBY_MS = 300_000;
 
   function reopenRoomLobby(room) {
     if (!room) return { ok: false, error: "Phòng không tồn tại." };
