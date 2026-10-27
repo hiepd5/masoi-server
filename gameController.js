@@ -1,7 +1,13 @@
 import "./envLoader.js";
 import * as GE from "./gameEngine.js";
 import { isWolfTeamRole } from "./roles.js";
-import { publicRoomView, getRoom, addBotsToRoom } from "./rooms.js";
+import {
+  publicRoomView,
+  publicSpectatorView,
+  getRoom,
+  addBotsToRoom,
+  resetRoomToLobby,
+} from "./rooms.js";
 import {
   warmRoomOpeningVoices,
   warmExactNightVictimVoice,
@@ -97,6 +103,11 @@ export function createGameController(io) {
     room.players.forEach((p) => {
       if (p.connected && p.socketId) {
         io.to(p.socketId).emit("room:update", publicRoomView(room, p.socketId));
+      }
+    });
+    (room.spectators || []).forEach((s) => {
+      if (s.connected && s.socketId) {
+        io.to(s.socketId).emit("room:update", publicSpectatorView(room, s.socketId));
       }
     });
     if (phaseHook) {
@@ -673,16 +684,76 @@ export function createGameController(io) {
     scheduleSmartNightCheck(room);
   }
 
+  const REMATCH_AUTO_LOBBY_MS = 45_000;
+
+  function reopenRoomLobby(room) {
+    if (!room) return { ok: false, error: "Phòng không tồn tại." };
+    clearRoomTimer(room.code);
+    const res = resetRoomToLobby(room);
+    broadcast(room);
+    notifyRoomList(room);
+    return { ok: true, promotedIds: res?.promotedIds || [] };
+  }
+
+  function markRematchReady(room, playerId) {
+    if (!room || room.phase !== "ended" || !room.game?.winner) {
+      return { ok: false, error: "Ván đấu chưa ở màn tổng kết." };
+    }
+    const me = room.players.find((p) => p.id === playerId && !p.isBot);
+    if (!me) {
+      return { ok: false, error: "Chỉ người chơi trong bàn mới bấm sẵn sàng ván mới." };
+    }
+    if (!room.game.rematchReadyIds) room.game.rematchReadyIds = {};
+    room.game.rematchReadyIds[me.id] = true;
+
+    const connectedHumans = room.players.filter((p) => !p.isBot && p.connected);
+    const needed = Math.max(1, Math.ceil(connectedHumans.length / 2));
+    const readyCount = Object.keys(room.game.rematchReadyIds).filter((id) =>
+      connectedHumans.some((p) => p.id === id)
+    ).length;
+
+    if (me.isHost || readyCount >= needed) {
+      const reopened = reopenRoomLobby(room);
+      return { ok: true, reopened: true, promotedIds: reopened.promotedIds };
+    }
+
+    broadcast(room);
+    return { ok: true, reopened: false, readyCount, requiredCount: needed };
+  }
+
   function endGame(room, winner) {
     room.phase = "ended";
     room.game.winner = winner;
     room.game.awards = GE.computeMatchAwards(room);
+    room.game.rematchReadyIds = {};
+    room.game.rematchEndsAt = Date.now() + REMATCH_AUTO_LOBBY_MS;
     warmEndGameFinaleVoice(room);
     clearRoomTimer(room.code);
     if (room.devBotTimer) {
       clearTimeout(room.devBotTimer);
       room.devBotTimer = null;
     }
+    if (Array.isArray(room.devDebateTimers)) {
+      room.devDebateTimers.forEach((t) => clearTimeout(t));
+      room.devDebateTimers = [];
+    }
+    if (room.rematchAutoTimer) {
+      clearTimeout(room.rematchAutoTimer);
+      room.rematchAutoTimer = null;
+    }
+    room.rematchAutoTimer = setTimeout(() => {
+      room.rematchAutoTimer = null;
+      const fresh = getRoom(room.code);
+      if (!fresh || fresh.phase !== "ended") return;
+      const hasHumansOrSpecs =
+        fresh.players.some((p) => !p.isBot && p.connected) ||
+        (fresh.spectators || []).some((s) => s.connected);
+      if (hasHumansOrSpecs) {
+        reopenRoomLobby(fresh);
+      }
+    }, REMATCH_AUTO_LOBBY_MS);
+    room.rematchAutoTimer.unref?.();
+
     if (winner === "lovers") {
       announce(room, "💘 Trò chơi kết thúc! Cặp Đôi Định Mệnh vượt qua chiến tuyến chiến thắng trọn vẹn!");
     } else if (winner === "wolf") {
@@ -721,6 +792,8 @@ export function createGameController(io) {
   return {
     startGame,
     markRoleRevealReady,
+    markRematchReady,
+    reopenRoomLobby,
     notifyBotNightReady: (room) => scheduleSmartNightCheck(room, { triggeredByHuman: false }),
     checkUniversalDayVoteConsensus,
     broadcast,

@@ -42,9 +42,19 @@ export function hasValidActiveSessionToken(token) {
     if (room.players.some((p) => !p.isBot && p.sessionToken === trimmed)) {
       return true;
     }
+    if ((room.spectators || []).some((s) => s.connected && s.sessionToken === trimmed)) {
+      return true;
+    }
   }
   return false;
 }
+
+export const BOT_PERSONAS = [
+  { id: "sharp_fox", label: "🦊 Sắc Sảo" },
+  { id: "calm_owl", label: "🦉 Điềm Đạm" },
+  { id: "bold_bear", label: "🔥 Quyết Liệt" },
+  { id: "cautious_raven", label: "🌙 Thận Trọng" },
+];
 
 export const BOT_NAMES = [
   "🤖 Bot Sói Xám", "🤖 Bot Cáo Đỏ", "🤖 Bot Cú Đêm", "🤖 Bot Thợ Săn",
@@ -154,8 +164,10 @@ export function createRoom(hostSocketId, options = {}) {
     createdAt: Date.now(),
     scenePresetId: "nordic_village_v3",
     players: [],
+    spectators: [],
     rolesConfig: generateDefaultRoles(6),
     lobbyMessages: [],
+    lastHumanVillageChatAt: 0,
   };
   rooms.set(code, room);
   return room;
@@ -165,14 +177,31 @@ export function getRoom(code) {
   return rooms.get(code?.toUpperCase());
 }
 
-export function deleteRoom(code) {
-  const room = getRoom(code);
-  if (!room) return false;
-  clearOrphanTimer(room);
+export function clearRoomExtraTimers(room) {
+  if (!room) return;
   if (room.devBotTimer) {
     clearTimeout(room.devBotTimer);
     room.devBotTimer = null;
   }
+  if (room.devConsensusTimer) {
+    clearTimeout(room.devConsensusTimer);
+    room.devConsensusTimer = null;
+  }
+  if (Array.isArray(room.devDebateTimers)) {
+    room.devDebateTimers.forEach((t) => clearTimeout(t));
+    room.devDebateTimers = [];
+  }
+  if (room.rematchAutoTimer) {
+    clearTimeout(room.rematchAutoTimer);
+    room.rematchAutoTimer = null;
+  }
+}
+
+export function deleteRoom(code) {
+  const room = getRoom(code);
+  if (!room) return false;
+  clearOrphanTimer(room);
+  clearRoomExtraTimers(room);
   rooms.delete(room.code);
   return true;
 }
@@ -194,16 +223,19 @@ export function addPlayer(
 
   // SEC-03 FIX: Tuyệt đối KHÔNG cho phép cướp ghế đang chơi chỉ bằng trùng Tên hiển thị!
   // Việc kết nối lại giữa trận bắt buộc 100% phải đi qua `reconnectByToken(code, sessionToken, socketId)`.
+  // Nếu khách mới muốn vào xem & đặt chỗ ván sau, Client gọi `room:spectate` (`addSpectator`).
   if (room.phase !== "lobby") {
     if (room.phase === "playing") {
       return {
-        error: `Phòng đang trong ván đấu (Ngày ${room.game?.dayNumber || 1}). Vui lòng chờ hết ván!`,
+        error: `Phòng đang trong ván đấu (Ngày ${room.game?.dayNumber || 1}). Vui lòng chờ hết ván hoặc bấm Vào Xem & Đặt Ghế!`,
         phase: "playing",
+        canSpectate: true,
       };
     }
     return {
-      error: "Ván đấu đang tổng kết, vui lòng chờ chủ phòng mở lại sảnh!",
+      error: "Ván đấu đang tổng kết, vui lòng chờ mở lại sảnh hoặc bấm Vào Xem & Đặt Ghế!",
       phase: room.phase,
+      canSpectate: true,
     };
   }
 
@@ -319,7 +351,16 @@ export function reconnectByToken(code, token, newSocketId) {
   if (!room) return { error: "Token không hợp lệ hoặc đã hết hạn." };
 
   const player = room.players.find((p) => !p.isBot && p.sessionToken === token);
-  if (!player) return { error: "Token không hợp lệ hoặc đã hết hạn." };
+  if (!player) {
+    const spec = (room.spectators || []).find((s) => s.sessionToken === token);
+    if (spec) {
+      clearOrphanTimer(room);
+      spec.socketId = newSocketId;
+      spec.connected = true;
+      return { room, spectator: spec, isSpectator: true };
+    }
+    return { error: "Token không hợp lệ hoặc đã hết hạn." };
+  }
 
   if (player.disconnectedAt !== null && Date.now() - player.disconnectedAt > 30 * 60 * 1000) {
     return { error: "Phiên chơi đã hết hạn (30 phút). Vui lòng tạo phòng mới." };
@@ -343,7 +384,16 @@ export function removePlayer(code, socketId, { explicitLeave = false, onOrphanEx
   if (!room) return null;
 
   const player = room.players.find((p) => p.socketId === socketId || p.id === socketId);
-  if (!player) return room;
+  if (!player) {
+    if (Array.isArray(room.spectators)) {
+      const beforeLen = room.spectators.length;
+      room.spectators = room.spectators.filter((s) => s.socketId !== socketId && s.id !== socketId);
+      if (room.spectators.length !== beforeLen) {
+        return room;
+      }
+    }
+    return room;
+  }
 
   if (room.phase === "lobby") {
     room.players = room.players.filter((p) => p.id !== player.id);
@@ -482,10 +532,13 @@ export function addBotsToRoom(code, count = 1, { syncRolesMode = null } = {}) {
     existingNames.add(botName);
 
     const seed = `${BOT_SEEDS[idx % BOT_SEEDS.length]}-${idx}`;
+    const persona = BOT_PERSONAS[idx % BOT_PERSONAS.length];
     room.players.push({
       id: `bot_${randomUUID().slice(0, 8)}`,
       socketId: null,
       isBot: true,
+      personaId: persona.id,
+      personaLabel: persona.label,
       connected: true,
       sessionToken: null,
       disconnectedAt: null,
@@ -585,6 +638,7 @@ export function getPublicRoomsList() {
       phase: room.phase, // 'lobby' | 'playing' | 'ended'
       humanCount: realHumans.length,
       botCount,
+      spectatorCount: (room.spectators || []).filter((s) => s.connected).length,
       totalPlayers: room.players.length,
       maxSeats,
       hasExpandedRoles: hasExpandedV33Role(room.rolesConfig),
@@ -725,6 +779,312 @@ export function addLobbyMessage(code, senderSocketId, text) {
   return msg;
 }
 
+const MAX_SPECTATORS_PER_ROOM = 12;
+
+/**
+ * Chế Độ Vào Xem & Đặt Ghế Ván Sau (Zero-Leak Spectator Queue — V4.1):
+ * - Nếu phòng đang ở 'lobby' -> tự chuyển sang addPlayer ngồi ghế thật ngay.
+ * - Nếu phòng đang 'playing' hoặc 'ended' -> cho vào room.spectators (Mù Vai Trò 100%, khóa Mic & Chat ngày),
+ *   và ngay khi phòng mở lại Sảnh chờ ván sau -> tự động xếp ghế chơi chính thức!
+ */
+export function addSpectator(
+  code,
+  socketId,
+  requestedName,
+  avatarSeed = null,
+  avatarUrl = null,
+  passwordInput = "",
+  options = {}
+) {
+  const room = getRoom(code);
+  if (!room) return { error: "Phòng không tồn tại hoặc đã đóng." };
+
+  if (room.phase === "lobby") {
+    const joined = addPlayer(code, socketId, requestedName, avatarSeed, avatarUrl, passwordInput, options);
+    if (joined.error) return joined;
+    return { ...joined, ok: true, isSpectator: false };
+  }
+
+  if (room.accessMode === "password") {
+    const cleanInput = String(passwordInput || "").trim();
+    if (!cleanInput) {
+      return {
+        error: "Phòng này có đặt mật khẩu. Vui lòng nhập mật khẩu để vào xem!",
+        requirePassword: true,
+      };
+    }
+    if (cleanInput !== room.password) {
+      return {
+        error: "Mật khẩu phòng không chính xác!",
+        requirePassword: true,
+        passwordFailed: true,
+      };
+    }
+  }
+
+  if (!Array.isArray(room.spectators)) room.spectators = [];
+  const existingSpec = room.spectators.find((s) => s.socketId === socketId);
+  if (existingSpec) {
+    existingSpec.connected = true;
+    return { ok: true, room, spectator: existingSpec, isSpectator: true };
+  }
+
+  // SEC-07: Không cho phép 1 trình duyệt vừa ngồi ghế chơi vừa mở tab Spectator trong bàn công khai
+  const cleanDeviceId = sanitizeDeviceId(options?.deviceId);
+  const enforceAntiMultiTab =
+    options?.enforceAntiMultiTab !== undefined
+      ? Boolean(options.enforceAntiMultiTab)
+      : IS_PRODUCTION_ENV;
+  if (
+    enforceAntiMultiTab &&
+    cleanDeviceId &&
+    room.accessMode === "public" &&
+    room.players.some((p) => !p.isBot && p.connected && p.deviceId && p.deviceId === cleanDeviceId)
+  ) {
+    return {
+      error: "Thiết bị này đã đang ngồi trong ván đấu! Không mở thêm tab khán giả trên cùng máy.",
+    };
+  }
+
+  const activeSpecs = room.spectators.filter((s) => s.connected);
+  if (activeSpecs.length >= MAX_SPECTATORS_PER_ROOM) {
+    return { error: `Hàng ghế khán giả của bàn này đã đầy (${MAX_SPECTATORS_PER_ROOM} người xem).` };
+  }
+
+  let name = sanitizeChatText(String(requestedName || ""), 20);
+  const usedNames = [
+    ...room.players.map((p) => p.name),
+    ...room.spectators.map((s) => s.name),
+  ];
+  if (!name || usedNames.includes(name)) {
+    name = getDefaultName(usedNames);
+  }
+
+  const safeAvatarUrl = sanitizeAvatarUrl(avatarUrl);
+  const safeSeed = avatarSeed ? String(avatarSeed).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) : null;
+  const spectator = {
+    id: socketId,
+    socketId,
+    deviceId: cleanDeviceId || null,
+    connected: true,
+    isSpectator: true,
+    sessionToken: randomUUID(),
+    name,
+    avatar:
+      safeAvatarUrl ||
+      (safeSeed
+        ? `https://api.dicebear.com/7.x/adventurer/svg?seed=${safeSeed}&backgroundColor=b6e3f4,c0aede,d1d4f9`
+        : getAvatarUrl(name + "-" + socketId.slice(0, 4))),
+    joinedAt: Date.now(),
+  };
+  room.spectators.push(spectator);
+  return { ok: true, room, spectator, isSpectator: true };
+}
+
+/**
+ * Ghép Bàn Nhanh 1-Chạm (Quick Match — V4.1):
+ * Ưu tiên vào bàn Công khai không mật khẩu đang chờ đông người thật nhất;
+ * nếu chưa có bàn nào phù hợp thì tự tạo bàn mới kèm bộ 8 vai Mở rộng V3.3 + AI Bot sẵn sàng.
+ */
+export function findOrCreateQuickMatchRoom(
+  socketId,
+  {
+    name = null,
+    avatarSeed = null,
+    avatarUrl = null,
+    preferTurbo = false,
+    deviceId = null,
+    enforceAntiMultiTab = undefined,
+  } = {}
+) {
+  const cleanDeviceId = sanitizeDeviceId(deviceId);
+  const shouldEnforceDevice =
+    enforceAntiMultiTab !== undefined ? Boolean(enforceAntiMultiTab) : IS_PRODUCTION_ENV;
+
+  const candidates = [];
+  for (const room of rooms.values()) {
+    if (room.phase !== "lobby") continue;
+    if (room.accessMode !== "public") continue;
+    const realHumans = room.players.filter((p) => !p.isBot);
+    const connectedHumans = realHumans.filter((p) => p.connected);
+    if (connectedHumans.length === 0) continue;
+    if (realHumans.length >= 18) continue;
+    if (
+      shouldEnforceDevice &&
+      cleanDeviceId &&
+      realHumans.some((p) => p.connected && p.deviceId && p.deviceId === cleanDeviceId)
+    ) {
+      continue;
+    }
+    candidates.push({
+      room,
+      humanCount: connectedHumans.length,
+      turboMatch: Boolean(room.isTurbo) === Boolean(preferTurbo) ? 1 : 0,
+    });
+  }
+
+  candidates.sort((a, b) => {
+    if (b.humanCount !== a.humanCount) return b.humanCount - a.humanCount;
+    if (b.turboMatch !== a.turboMatch) return b.turboMatch - a.turboMatch;
+    return (b.room.createdAt || 0) - (a.room.createdAt || 0);
+  });
+
+  for (const cand of candidates) {
+    const joined = addPlayer(
+      cand.room.code,
+      socketId,
+      name,
+      avatarSeed,
+      avatarUrl,
+      "",
+      { deviceId: cleanDeviceId, enforceAntiMultiTab }
+    );
+    if (!joined.error && joined.room && joined.player) {
+      return {
+        ok: true,
+        matchedExisting: true,
+        room: joined.room,
+        player: joined.player,
+      };
+    }
+  }
+
+  if (!canCreateNewRoom()) {
+    return {
+      error: "Máy chủ đang đầy bàn chơi (150 phòng). Mời bạn bấm Vào Xem một bàn đang mở!",
+    };
+  }
+
+  const newRoom = createRoom(socketId, {
+    roomTitle: preferTurbo ? "⚡ Bàn Ghép Nhanh (5 Phút)" : "🔥 Bàn Ghép Nhanh Sôi Động",
+    accessMode: "public",
+    isTurbo: Boolean(preferTurbo),
+  });
+  const createdJoin = addPlayer(
+    newRoom.code,
+    socketId,
+    name,
+    avatarSeed,
+    avatarUrl,
+    "",
+    { deviceId: cleanDeviceId, enforceAntiMultiTab, isNewQuickMatchRoom: true }
+  );
+  if (createdJoin.error) {
+    deleteRoom(newRoom.code);
+    return createdJoin;
+  }
+  newRoom.rolesConfig = generateExpandedV33Roles(8);
+  addBotsToRoom(newRoom.code, 5);
+  return {
+    ok: true,
+    matchedExisting: false,
+    createdNew: true,
+    room: newRoom,
+    player: createdJoin.player,
+  };
+}
+
+/**
+ * Mở lại Sảnh chờ sau khi kết thúc ván & tự động đôn Khán Giả đặt chỗ (`room.spectators`) vào ngồi ghế chính thức!
+ */
+export function resetRoomToLobby(room) {
+  if (!room) return null;
+  clearRoomExtraTimers(room);
+  room.game = null;
+  room.phase = "lobby";
+  room.lastAutoPhaseKey = null;
+  room.lastHumanVillageChatAt = 0;
+
+  // Thu dọn những người chơi thật đã thoát hẳn giữa trận trước khi xếp lại ghế
+  room.players = room.players.filter((p) => p.isBot || (p.connected && !p.leftExplicitly));
+
+  room.players.forEach((p) => {
+    p.alive = true;
+    p.role = null;
+    delete p.initialRole;
+    p.ready = p.isHost || Boolean(p.isBot);
+  });
+
+  // Đảm bảo vẫn còn 1 Host người thật nếu Host cũ đã rời đi
+  if (room.players.length > 0 && !room.players.some((p) => !p.isBot && p.isHost)) {
+    room.players.forEach((p) => {
+      p.isHost = false;
+    });
+    const nextHumanHost = room.players.find((p) => !p.isBot && p.connected);
+    if (nextHumanHost) {
+      nextHumanHost.isHost = true;
+      nextHumanHost.ready = true;
+      room.hostId = nextHumanHost.id;
+    }
+  }
+
+  // Đôn toàn bộ Khán giả đang kết nối lên ngồi ghế chơi ván mới (nhường ghế AI Bot nếu cần)
+  const promotedIds = [];
+  const waitingSpectators = Array.isArray(room.spectators)
+    ? room.spectators.filter((s) => s.connected)
+    : [];
+  const remainingSpectators = [];
+
+  for (const spec of waitingSpectators) {
+    const realCount = room.players.filter((p) => !p.isBot).length;
+    if (realCount >= 18) {
+      remainingSpectators.push(spec);
+      continue;
+    }
+    if (room.players.length >= 18) {
+      const botIdx = room.players.findLastIndex((p) => p.isBot);
+      if (botIdx >= 0) room.players.splice(botIdx, 1);
+    }
+    if (room.players.length >= 18) {
+      remainingSpectators.push(spec);
+      continue;
+    }
+
+    const usedNames = room.players.map((p) => p.name);
+    const finalName = usedNames.includes(spec.name) ? getDefaultName(usedNames) : spec.name;
+    const becomeHost = !room.players.some((p) => !p.isBot && p.isHost);
+    room.players.push({
+      id: spec.id,
+      socketId: spec.socketId,
+      deviceId: spec.deviceId || null,
+      connected: true,
+      sessionToken: spec.sessionToken || randomUUID(),
+      disconnectedAt: null,
+      name: finalName,
+      avatar: spec.avatar,
+      isHost: becomeHost,
+      ready: becomeHost,
+      seatIndex: room.players.length,
+      alive: true,
+      role: null,
+    });
+    if (becomeHost) room.hostId = spec.id;
+    promotedIds.push(spec.id);
+  }
+
+  room.spectators = remainingSpectators;
+  reindexSeats(room);
+
+  const realHumansNow = room.players.filter((p) => !p.isBot);
+  if (realHumansNow.length >= 2) {
+    room.soloPracticeRole = null;
+  }
+
+  // Nếu tổng ghế người vượt quá tổng vai cấu hình cũ, tự bù thêm Nông Dân cho cân
+  const totalRoles = Object.values(room.rolesConfig || {}).reduce(
+    (s, v) => s + (Number(v) || 0),
+    0
+  );
+  if (room.players.length > totalRoles) {
+    room.rolesConfig = {
+      ...(room.rolesConfig || {}),
+      villager: (Number(room.rolesConfig?.villager) || 0) + (room.players.length - totalRoles),
+    };
+  }
+
+  return { room, promotedIds };
+}
+
 // Trả về bản public của room (an toàn để gửi cho mọi client — không lộ role người khác & KHÔNG lộ mật khẩu)
 export function publicRoomView(room, forSocketId) {
   const g = room.game;
@@ -748,6 +1108,8 @@ export function publicRoomView(room, forSocketId) {
     isTurbo: Boolean(room.isTurbo),
     humanCount: realHumans.length,
     botCount: room.players.length - realHumans.length,
+    spectatorCount: (room.spectators || []).filter((s) => s.connected).length,
+    isSpectator: false,
     soloPracticeRole: realHumans.length === 1 ? room.soloPracticeRole || null : null,
     scenePresetId: room.scenePresetId || "nordic_village_v3",
     rolesConfig: room.rolesConfig || generateDefaultRoles(Math.max(6, room.players.length)),
@@ -815,6 +1177,15 @@ export function publicRoomView(room, forSocketId) {
       nominationVotes: g.phase === "day_nominate" || (g.hotSeatQueue?.length ?? 0) > 0 ? g.nominationVotes : {},
       finalVotes: g.phase === "day_final_vote" ? g.finalVotes : {},
       winner: g.winner,
+      rematchEndsAt: gameOver ? g.rematchEndsAt || null : null,
+      rematchReadyCount: gameOver ? Object.keys(g.rematchReadyIds || {}).length : 0,
+      rematchRequiredCount: gameOver
+        ? Math.max(1, Math.ceil(realHumans.filter((p) => p.connected).length / 2))
+        : 0,
+      myRematchReady: Boolean(gameOver && me && g.rematchReadyIds?.[me.id]),
+      myGhostBet: me && (!me.alive || gameOver) ? g.ghostBets?.[me.id] || null : null,
+      ghostBetBonusXp:
+        gameOver && me && g.ghostBets?.[me.id] && g.ghostBets[me.id] === g.winner ? 35 : 0,
       history: gameOver ? g.history : [],
       replayTimeline: gameOver ? g.replayTimeline || [] : [],
       awards: gameOver ? g.awards || [] : [],
@@ -854,5 +1225,20 @@ export function publicRoomView(room, forSocketId) {
           ? g.seerChecksLog.filter((c) => c.seerId === me.id).slice(-1)[0] || null
           : null,
     },
+  };
+}
+
+/**
+ * Bản xem hoàn toàn Mù Vai Trò (100% Zero-Leak) dành riêng cho Khán giả đang đặt chỗ (`room.spectators`).
+ */
+export function publicSpectatorView(room, forSocketId) {
+  const baseView = publicRoomView(room, "__SPECTATOR_ZERO_LEAK__");
+  const spec = (room.spectators || []).find((s) => s.socketId === forSocketId);
+  return {
+    ...baseView,
+    isSpectator: true,
+    mySpectatorId: spec?.id || null,
+    mySpectatorName: spec?.name || "Khán giả",
+    spectatorSessionToken: spec?.sessionToken || undefined,
   };
 }

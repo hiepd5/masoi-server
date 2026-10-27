@@ -36,7 +36,79 @@ const DEFENSE_BOT_LINES = [
   "Mọi người bình tĩnh! Tôi thề mình là dân lương thiện, treo nhầm tôi là Sói cười thầm đấy!",
   "Đừng nghe lời khích bác! Đêm qua tôi ngủ say, hãy tha cho tôi để ngày mai tìm đúng Sói!",
   "Tôi vô tội thật sự! Nếu treo tôi hôm nay làng sẽ mất đi một lá phiếu quan trọng!",
+  "Ai chỉ tay vào tôi sớm nhất mới đáng nghi! Hãy tha để tôi còn giúp làng bắt Sói thật!",
 ];
+
+/**
+ * Chốt #8 (100% Zero-Leak Smart Persona Bot Deduction):
+ * Hàm thuần CHỈ nhận dữ liệu công khai của ván đấu (tuyệt đối KHÔNG nhận p.role của bất kỳ ai!),
+ * sinh câu tranh biện khớp tính cách từng Bot (`sharp_fox` / `calm_owl` / `bold_bear` / `cautious_raven`).
+ */
+export function buildZeroLeakBotLine({
+  personaId = "sharp_fox",
+  dayNumber = 1,
+  nightDeathNames = [],
+  suspectName = "ai đó",
+  mayorName = null,
+  aliveCount = 8,
+} = {}) {
+  const hasVictim = Array.isArray(nightDeathNames) && nightDeathNames.length > 0;
+  const victimStr = hasVictim ? nightDeathNames.join(", ") : null;
+
+  if (personaId === "sharp_fox") {
+    if (hasVictim) {
+      return `Đêm ${dayNumber} mất ${victimStr} chứng tỏ Sói nhắm người tỉnh táo. Tôi đang để ý kỹ ${suspectName}!`;
+    }
+    return `Đêm qua bình yên không ai gục, chắc Bảo Vệ hoặc Phù Thủy đã ra tay! ${suspectName} thấy sao?`;
+  }
+  if (personaId === "calm_owl") {
+    if (mayorName) {
+      return `Đã có Trưởng Làng ${mayorName} dẫn nhịp, cả làng (${aliveCount} ghế) khoan vội treo nhầm nhé.`;
+    }
+    if (hasVictim) {
+      return `Vụ ${victimStr} đêm qua rất có tính toán. Mọi người nghe kỹ ${suspectName} giải thích trước khi vote.`;
+    }
+    return `Ngày ${dayNumber} còn ${aliveCount} người sống, ai giữ thông tin soi/chặn đòn hãy lên tiếng đúng lúc!`;
+  }
+  if (personaId === "bold_bear") {
+    if (hasVictim) {
+      return `Không thể để ${victimStr} nằm xuống vô ích! Hôm nay phải đưa ${suspectName} lên ghế nóng hỏi rõ!`;
+    }
+    return `${suspectName} từ đầu ngày hơi kiệm lời đấy, mạnh dạn nêu quan điểm cho cả làng nghe xem!`;
+  }
+  // cautious_raven
+  if (hasVictim) {
+    return `Sương mù dày quá... sau cái chết của ${victimStr}, tôi thấy hướng nhìn của ${suspectName} khá lạ.`;
+  }
+  return `Đêm yên ắng coi chừng Kẻ Bị Nguyền hoặc Sói Đầu Đàn giở trò! Mọi người dè chừng ${suspectName} nhé.`;
+}
+
+function clearBotDebateTimers(room) {
+  if (room && Array.isArray(room.devDebateTimers)) {
+    room.devDebateTimers.forEach((t) => clearTimeout(t));
+    room.devDebateTimers = [];
+  }
+}
+
+function emitBotVillageBubble(room, gameCtrl, io, speaker, suspect, text, phaseName = "day_discuss") {
+  if (!room || room.phase !== "playing" || !room.game || room.game.winner) return;
+  if (!speaker?.alive) return;
+  gameCtrl.recordReplayEvent?.(room, {
+    kind: "village_chat",
+    phase: phaseName,
+    actorId: speaker.id,
+    targetId: suspect && suspect.id !== speaker.id ? suspect.id : null,
+    chatText: text,
+    caption: `💬 ${speaker.name}: "${text}"`,
+  });
+  io?.to(room.code)?.emit("village:chat", {
+    senderId: speaker.id,
+    senderName: speaker.name,
+    personaLabel: speaker.personaLabel || null,
+    isBot: true,
+    message: text,
+  });
+}
 
 export function checkBotVoteConsensus(room, gameCtrl) {
   if (!room || room.phase !== "playing" || !room.game || room.game.winner) return;
@@ -182,29 +254,84 @@ export function flushBotInteractionsForCurrentPhase(
     if (botMayor && !g.mayorRevealedId && (g.dayNumber >= 2 || Math.random() < 0.35)) {
       gameCtrl.mayorReveal(room, botMayor.id);
     }
+
+    // Dữ liệu 100% CÔNG KHAI (tuyệt đối không đọc p.role để sinh câu chat!)
+    const buildPublicSpeechForBot = (speakerBot, avoidSuspectId = null) => {
+      const publicAlive = room.players
+        .filter((p) => p.alive)
+        .map((p) => ({ id: p.id, name: p.name }));
+      const candidates = publicAlive.filter(
+        (p) => p.id !== speakerBot.id && p.id !== avoidSuspectId
+      );
+      const suspect = pickRandom(candidates) || pickRandom(publicAlive) || { id: speakerBot.id, name: speakerBot.name };
+      const nightDeathNames = (g.nightDeaths || [])
+        .map((id) => room.players.find((p) => p.id === id)?.name)
+        .filter(Boolean);
+      const mayorName = g.mayorRevealedId
+        ? room.players.find((p) => p.id === g.mayorRevealedId)?.name || null
+        : null;
+      const text = buildZeroLeakBotLine({
+        personaId: speakerBot.personaId || "sharp_fox",
+        dayNumber: g.dayNumber,
+        nightDeathNames,
+        suspectName: suspect.name,
+        mayorName,
+        aliveCount: publicAlive.length,
+      });
+      return { suspect, text };
+    };
+
     const hasChatToday = (g.replayTimeline || []).some(
       (f) => f.day === g.dayNumber && f.kind === "village_chat"
     );
     if (!hasChatToday && aliveBots.length > 0) {
-      const speaker = pickRandom(aliveBots);
-      const suspect = pickRandom(alivePlayers.filter((p) => p.id !== speaker.id)) || speaker;
-      const lineFn = pickRandom(VILLAGE_BOT_LINES);
-      const text = lineFn ? lineFn(suspect.name) : `Ai đang che giấu sự thật đêm qua?`;
-      gameCtrl.recordReplayEvent?.(room, {
-        kind: "village_chat",
-        phase: "day_discuss",
-        actorId: speaker.id,
-        targetId: suspect.id !== speaker.id ? suspect.id : null,
-        chatText: text,
-        caption: `💬 ${speaker.name}: "${text}"`,
-      });
-      io?.to(room.code)?.emit("village:chat", {
-        senderId: speaker.id,
-        senderName: speaker.name,
-        message: text,
-      });
+      const shuffledBots = [...aliveBots].sort(() => Math.random() - 0.5);
+      const firstSpeaker = shuffledBots[0];
+      const firstSpeech = buildPublicSpeechForBot(firstSpeaker);
+      emitBotVillageBubble(
+        room,
+        gameCtrl,
+        io,
+        firstSpeaker,
+        firstSpeech.suspect,
+        firstSpeech.text,
+        "day_discuss"
+      );
+
+      // Rải thêm 1–2 bóng thoại 3D tự nhiên cách quãng 6.5s & 13.5s nếu có người thật đang nghe & không đang gõ liên tục
+      clearBotDebateTimers(room);
+      const aliveHumansCount = alivePlayers.filter((p) => !p.isBot).length;
+      if (aliveHumansCount > 0 && shuffledBots.length >= 2) {
+        room.devDebateTimers = [];
+        const followUps = shuffledBots.slice(1, 3);
+        const scheduleOffsetsMs = [6500, 13800];
+        const expectedDay = g.dayNumber;
+
+        followUps.forEach((botSpeaker, idx) => {
+          const timer = setTimeout(() => {
+            if (!room || room.phase !== "playing" || !room.game || room.game.winner) return;
+            if (room.game.phase !== "day_discuss" || room.game.dayNumber !== expectedDay) return;
+            if (!botSpeaker.alive) return;
+            // Nhường lời ngay nếu người chơi thật vừa nhắn tin trong 4.5s gần nhất!
+            if (Date.now() - (room.lastHumanVillageChatAt || 0) < 4500) return;
+            const nextSpeech = buildPublicSpeechForBot(botSpeaker, firstSpeech.suspect?.id);
+            emitBotVillageBubble(
+              room,
+              gameCtrl,
+              io,
+              botSpeaker,
+              nextSpeech.suspect,
+              nextSpeech.text,
+              "day_discuss"
+            );
+          }, scheduleOffsetsMs[idx] || 7000);
+          timer.unref?.();
+          room.devDebateTimers.push(timer);
+        });
+      }
     }
   } else if (includeDayActions && g.phase === "day_defense") {
+    clearBotDebateTimers(room);
     const defendantId = g.hotSeatQueue?.[g.hotSeatIndex];
     const defendant = aliveBots.find((b) => b.id === defendantId);
     if (defendant) {

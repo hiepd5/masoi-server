@@ -9,6 +9,8 @@ import {
   hasValidActiveSessionToken,
   getRoom,
   addPlayer,
+  addSpectator,
+  findOrCreateQuickMatchRoom,
   reconnectByToken,
   removePlayer,
   renamePlayer,
@@ -23,6 +25,7 @@ import {
   getPublicRoomsList,
   addLobbyMessage,
   publicRoomView,
+  publicSpectatorView,
 } from "./rooms.js";
 import {
   IS_PRODUCTION_ENV,
@@ -625,6 +628,11 @@ function broadcastRoom(room) {
       io.to(p.socketId).emit("room:update", publicRoomView(room, p.socketId));
     }
   });
+  (room.spectators || []).forEach((s) => {
+    if (s.connected && s.socketId) {
+      io.to(s.socketId).emit("room:update", publicSpectatorView(room, s.socketId));
+    }
+  });
   broadcastRoomsList();
 }
 
@@ -726,14 +734,132 @@ io.on("connection", (socket) => {
     }
     socket.join(result.room.code);
     socket.data.roomCode = result.room.code;
-    socket.data.playerId = result.player.id;
+    if (result.isSpectator && result.spectator) {
+      socket.data.playerId = result.spectator.id;
+      socket.data.isSpectator = true;
+      cb?.({
+        ok: true,
+        isSpectator: true,
+        roomCode: result.room.code,
+        playerId: result.spectator.id,
+        sessionToken: result.spectator.sessionToken,
+      });
+    } else {
+      socket.data.playerId = result.player.id;
+      socket.data.isSpectator = false;
+      cb?.({
+        ok: true,
+        roomCode: result.room.code,
+        playerId: result.player.id,
+        sessionToken: result.player.sessionToken,
+      });
+    }
+    broadcastRoom(result.room);
+  });
+
+  socket.on("room:quickMatch", (payload = {}, cb) => {
+    // SEC-04: Chống spam nhấn Ghép Bàn Nhanh liên tục (<= 6 lần/phút/IP)
+    const qmLim = checkIpRateLimit("quick_match", clientIp, 6, 60_000);
+    if (!qmLim.allowed) {
+      return cb?.({
+        ok: false,
+        error: `Bạn thao tác quá nhanh! Vui lòng đợi ${qmLim.retryAfterSec} giây.`,
+      });
+    }
+    const {
+      name = null,
+      avatarSeed = null,
+      avatarUrl = null,
+      preferTurbo = false,
+      deviceId = null,
+    } = payload || {};
+
+    const res = findOrCreateQuickMatchRoom(socket.id, {
+      name,
+      avatarSeed,
+      avatarUrl,
+      preferTurbo,
+      deviceId,
+    });
+    if (res.error) {
+      return cb?.({ ok: false, error: res.error });
+    }
+    socket.join(res.room.code);
+    socket.data.roomCode = res.room.code;
+    socket.data.playerId = res.player.id;
+    socket.data.isSpectator = false;
     cb?.({
       ok: true,
-      roomCode: result.room.code,
-      playerId: result.player.id,
-      sessionToken: result.player.sessionToken,
+      matchedExisting: Boolean(res.matchedExisting),
+      roomCode: res.room.code,
+      playerId: res.player.id,
+      sessionToken: res.player.sessionToken,
     });
-    broadcastRoom(result.room);
+    broadcastRoom(res.room);
+  });
+
+  socket.on("room:spectate", ({ roomCode, name, avatarSeed, avatarUrl, password, deviceId } = {}, cb) => {
+    const lockSec = getPasswordLockRemainingSec(clientIp);
+    if (lockSec > 0) {
+      return cb?.({
+        ok: false,
+        error: `Bạn nhập sai mật khẩu quá nhiều lần! Vui lòng thử lại sau ${lockSec} giây.`,
+        requirePassword: true,
+      });
+    }
+    const res = addSpectator(
+      roomCode,
+      socket.id,
+      name,
+      avatarSeed || null,
+      avatarUrl || null,
+      password || "",
+      { deviceId }
+    );
+    if (res.error) {
+      if (res.passwordFailed) {
+        const penaltySec = recordPasswordFailure(clientIp);
+        if (penaltySec > 0) {
+          return cb?.({
+            ok: false,
+            error: `Sai mật khẩu 5 lần liên tiếp! Tạm khóa thử lại trong ${penaltySec} giây.`,
+            requirePassword: true,
+          });
+        }
+      }
+      return cb?.({
+        ok: false,
+        error: res.error,
+        requirePassword: Boolean(res.requirePassword),
+      });
+    }
+    if (res.room?.accessMode === "password") {
+      clearPasswordFailures(clientIp);
+    }
+    socket.join(res.room.code);
+    socket.data.roomCode = res.room.code;
+    if (res.isSpectator && res.spectator) {
+      socket.data.playerId = res.spectator.id;
+      socket.data.isSpectator = true;
+      cb?.({
+        ok: true,
+        isSpectator: true,
+        roomCode: res.room.code,
+        playerId: res.spectator.id,
+        sessionToken: res.spectator.sessionToken,
+      });
+    } else if (res.player) {
+      socket.data.playerId = res.player.id;
+      socket.data.isSpectator = false;
+      cb?.({
+        ok: true,
+        isSpectator: false,
+        roomCode: res.room.code,
+        playerId: res.player.id,
+        sessionToken: res.player.sessionToken,
+      });
+    }
+    broadcastRoom(res.room);
   });
 
   socket.on("room:join", ({ roomCode, name, avatarSeed, avatarUrl, password, deviceId } = {}, cb) => {
@@ -947,7 +1073,12 @@ io.on("connection", (socket) => {
     const player =
       room.players.find((p) => p.socketId === socket.id) ||
       room.players.find((p) => p.id === socket.data.playerId);
-    if (!player) return cb?.({ error: "Không tìm thấy người chơi." });
+    const spectator = !player
+      ? (room.spectators || []).find(
+          (s) => s.socketId === socket.id || s.id === socket.data.playerId
+        )
+      : null;
+    if (!player && !spectator) return cb?.({ error: "Không tìm thấy người chơi." });
 
     const health = await checkLivekitHealth();
     if (!health.ok) {
@@ -955,10 +1086,13 @@ io.on("connection", (socket) => {
     }
 
     try {
-      const canPublishAudio = player.alive !== false;
+      // Khán giả (Spectator) & Người đã chết bị khóa cứng canPublish: false trên LiveKit Token!
+      const canPublishAudio = Boolean(player && player.alive !== false);
+      const identity = player ? player.id : `spec_${spectator.id}`;
+      const displayName = player ? player.name : `👀 ${spectator.name}`;
       const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
-        identity: player.id,
-        name: player.name,
+        identity,
+        name: displayName,
         ttl: "2h",
       });
       at.addGrant({
@@ -1034,25 +1168,15 @@ io.on("connection", (socket) => {
   socket.on("room:restart", (_, cb) => {
     withPlayer((room, player) => {
       if (!player.isHost) return cb?.({ ok: false, error: "Chỉ chủ phòng mới có thể chơi lại." });
+      const reopened = gameCtrl.reopenRoomLobby(room);
+      cb?.({ ok: true, promotedIds: reopened.promotedIds || [] });
+    });
+  });
 
-      gameCtrl.clearRoomTimer(room.code);
-      room.game = null;
-      room.phase = "lobby";
-
-      if (room.devBotTimer) {
-        clearTimeout(room.devBotTimer);
-        room.devBotTimer = null;
-      }
-      room.lastAutoPhaseKey = null;
-
-      room.players.forEach((p) => {
-        p.alive = true;
-        p.role = null;
-        p.ready = p.isHost || Boolean(p.isBot);
-      });
-
-      broadcastRoom(room);
-      cb?.({ ok: true });
+  socket.on("room:rematchReady", (_, cb) => {
+    withPlayer((room, player) => {
+      const res = gameCtrl.markRematchReady(room, player.id);
+      cb?.(res);
     });
   });
 
@@ -1145,6 +1269,7 @@ io.on("connection", (socket) => {
       const cleanMsg = sanitizeChatText(String(message || ""), MAX_CHAT_LENGTH);
       if (!cleanMsg) return cb?.({ ok: false, error: "Tin nhắn trống." });
 
+      room.lastHumanVillageChatAt = Date.now();
       if (room.game && !room.game.winner) {
         gameCtrl.recordReplayEvent?.(room, {
           kind: "village_chat",
@@ -1160,6 +1285,65 @@ io.on("connection", (socket) => {
         message: cleanMsg,
       });
       cb?.({ ok: true });
+    });
+  });
+
+  // 👻 Kênh Trò Chuyện Cõi Âm (Ghost Chat — 100% cô lập chỉ người đã hy sinh mới thấy, 0% lộ vai người sống!)
+  socket.on("action:ghostChat", ({ message } = {}, cb) => {
+    withPlayer((room, player) => {
+      if (player.alive) {
+        return cb?.({ ok: false, error: "Người còn sống không thể nghe hay nói ở Cõi Âm!" });
+      }
+      if (!room.game || room.game.winner) {
+        return cb?.({ ok: false, error: "Ván đấu đã kết thúc." });
+      }
+      if (!checkSocketCooldown(socket, "chat", 650)) {
+        return cb?.({ ok: false, error: "Bạn nhắn tin quá nhanh!" });
+      }
+      const cleanMsg = sanitizeChatText(String(message || ""), MAX_CHAT_LENGTH);
+      if (!cleanMsg) return cb?.({ ok: false, error: "Tin nhắn trống." });
+
+      if (!Array.isArray(room.game.ghostMessages)) room.game.ghostMessages = [];
+      const payload = {
+        id: `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        senderId: player.id,
+        senderName: player.name,
+        message: cleanMsg,
+        time: new Date().toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" }),
+      };
+      room.game.ghostMessages.push(payload);
+      if (room.game.ghostMessages.length > 40) room.game.ghostMessages.shift();
+
+      // Chỉ gửi đích danh tới các người chơi ĐÃ CHẾT (!p.alive) — người sống & khán giả nhận 0 byte!
+      room.players.forEach((p) => {
+        if (!p.alive && p.connected && p.socketId) {
+          io.to(p.socketId).emit("ghost:chat", payload);
+        }
+      });
+      cb?.({ ok: true });
+    });
+  });
+
+  // 👻 Dự Đoán Phe Thắng từ Cõi Âm (+35 XP thưởng vui cuối ván)
+  socket.on("action:ghostBet", ({ team } = {}, cb) => {
+    withPlayer((room, player) => {
+      if (player.alive) {
+        return cb?.({ ok: false, error: "Chỉ Linh Hồn mới được dự đoán đại cục từ Cõi Âm!" });
+      }
+      if (!room.game || room.game.winner) {
+        return cb?.({ ok: false, error: "Ván đấu đã khép lại." });
+      }
+      const validTeams = ["village", "wolf", "lovers", "tanner"];
+      if (!validTeams.includes(team)) {
+        return cb?.({ ok: false, error: "Phe dự đoán không hợp lệ." });
+      }
+      if (!room.game.ghostBets) room.game.ghostBets = {};
+      if (room.game.ghostBets[player.id]) {
+        return cb?.({ ok: false, error: "Bạn đã chốt linh cảm Cõi Âm cho ván này rồi!" });
+      }
+      room.game.ghostBets[player.id] = team;
+      gameCtrl.broadcast(room);
+      cb?.({ ok: true, team });
     });
   });
 

@@ -7,6 +7,11 @@ import { generateDefaultRoles, generateExpandedV33Roles, assignCustomRoles } fro
 import {
   createRoom,
   addPlayer,
+  addSpectator,
+  findOrCreateQuickMatchRoom,
+  resetRoomToLobby,
+  publicSpectatorView,
+  BOT_PERSONAS,
   removePlayer,
   reconnectByToken,
   setRoomAccess,
@@ -30,7 +35,7 @@ import {
   isSafeReactionEmoji,
 } from "../securityGuard.js";
 import { createGameController } from "../gameController.js";
-import { registerDevSocketHandlers } from "../devSandbox.js";
+import { registerDevSocketHandlers, buildZeroLeakBotLine } from "../devSandbox.js";
 import {
   normalizeTtsText,
   getTtsCacheKey,
@@ -1229,6 +1234,164 @@ runScenario("36. V3.5.3: EndGameRecap 0-Abort Lock (EMPTY_ARRAY + storyVoicePlan
     serverIndexSrc.includes('allowedHeaders: ["Content-Type", "Authorization", "x-game-session"]'),
     "server/index.js phải khai báo tường minh allowedHeaders cho x-game-session"
   );
+});
+
+// 37. V4.1 — Ghép Bàn Nhanh 1-Chạm (Quick Match): tự tạo bàn V3.3 + 5 Bot AI nhường ghế & ghép người sau vào chung phòng
+runScenario("37. V4.1: Quick Match 1-Chạm tự tạo phòng 8 vai V3.3 + 5 Bot & ưu tiên ghép chung phòng đông người thật", () => {
+  // Dọn sạch các phòng test còn sót lại từ kịch bản 01..24 trước khi test tạo phòng mới
+  getPublicRoomsList().forEach((r) => deleteRoom(r.code));
+
+  const q1 = findOrCreateQuickMatchRoom("qm_sock_1", {
+    name: "Chiến Binh 1",
+    avatarUrl: "/icon-192.png",
+  });
+  assert.equal(q1.createdNew, true, "Chưa có phòng công khai mở -> tạo phòng Quick Match mới");
+  assert.equal(q1.room.players.length, 6, "1 người thật + 5 Bot AI mồi bàn (sẵn sàng 6 ghế)");
+
+  const q2 = findOrCreateQuickMatchRoom("qm_sock_2", {
+    name: "Chiến Binh 2",
+    avatarUrl: "/icon-192.png",
+  });
+  assert.equal(q2.matchedExisting, true, "Người thứ 2 bấm Chơi Ngay phải được ghép thẳng vào phòng đang mở");
+  assert.equal(q2.room.code, q1.room.code);
+  const humanCount = q2.room.players.filter((p) => !p.isBot).length;
+  assert.equal(humanCount, 2, "Phòng phải có 2 người thật cùng bàn");
+
+  // Đẩy thêm người thật vượt ngưỡng 8 vai -> Bot tự động nhường ghế!
+  findOrCreateQuickMatchRoom("qm_sock_3", { name: "Chiến Binh 3" });
+  const q4 = findOrCreateQuickMatchRoom("qm_sock_4", { name: "Chiến Binh 4" });
+  assert.equal(q4.room.players.filter((p) => !p.isBot).length, 4);
+  assert.equal(q4.room.players.filter((p) => p.isBot).length, 4, "Bot tự nhường ghế khi bàn chạm ngưỡng cấu hình 8 vai");
+
+  deleteRoom(q1.room.code);
+});
+
+// 38. V4.1 — Hàng Đợi Khán Giả Zero-Leak & Tự Động Lên Ghế Chơi Ván Sau
+runScenario("38. V4.1: Khán giả vào phòng đang đấu (Zero-Leak 100%) & tự lên ghế chính khi mở lại Sảnh", () => {
+  const room = createRoom("sp_host");
+  addPlayer(room.code, "sp_host", "Chủ Phòng");
+  addBotsToRoom(room.code, 5);
+  GE.initGameState(room);
+  room.phase = "playing";
+
+  const joinPlaying = addPlayer(room.code, "late_sock", "Khách Trễ");
+  assert.equal(joinPlaying.canSpectate, true, "addPlayer giữ nguyên lỗi + cờ canSpectate:true cho phòng đang chơi");
+
+  const specRes = addSpectator(room.code, "late_sock", "Khán Giả A", null, "/icon-192.png");
+  assert.ok(specRes.spectator, "Phải thêm vào hàng chờ khán giả thành công");
+  assert.equal(hasValidActiveSessionToken(specRes.spectator.sessionToken), true, "Token khán giả được phép nghe giọng MC /api/tts");
+
+  const specView = publicSpectatorView(room, "late_sock");
+  assert.equal(specView.isSpectator, true);
+  assert.equal(specView.spectatorCount, 1);
+  assert.equal(specView.game.myRole, null, "Zero-Leak: Khán giả tuyệt đối không thấy myRole");
+  assert.equal(specView.game.wolfPicksVisible, null, "Zero-Leak: Khán giả tuyệt đối không thấy mục tiêu Sói cắn");
+  assert.equal(
+    specView.players.every((p) => p.role === null && !p.sessionToken),
+    true,
+    "Zero-Leak: Toàn bộ vai trò người còn sống & sessionToken bị ẩn sạch khỏi gói tin Khán giả"
+  );
+
+  resetRoomToLobby(room);
+  assert.equal(room.phase, "lobby");
+  assert.equal(room.spectators.length, 0, "Hàng chờ khán giả đã được dọn sạch lên ghế");
+  const promoted = room.players.find((p) => p.socketId === "late_sock");
+  assert.ok(promoted, "Khán Giả A phải tự động được xếp vào ghế người chơi thật ở ván mới!");
+  assert.equal(promoted.name, "Khán Giả A");
+
+  deleteRoom(room.code);
+});
+
+// 39. V4.1 — 4 Tính Cách Bot AI Tranh Biện Sống Động (100% Zero-Leak từ dữ liệu công khai)
+runScenario("39. V4.1: BOT_PERSONAS & buildZeroLeakBotLine sinh thoại tiếng Việt đa tính cách 0% lộ vai", () => {
+  const room = createRoom("bp_host");
+  addPlayer(room.code, "bp_host", "Hiệp Test");
+  addBotsToRoom(room.code, 4);
+  const bots = room.players.filter((p) => p.isBot);
+  assert.equal(bots.length, 4);
+  assert.ok(bots.every((b) => b.personaId && BOT_PERSONAS.some((bp) => bp.id === b.personaId)), "Mỗi Bot phải mang 1 cá tính tranh biện");
+
+  const lines = BOT_PERSONAS.map((bp) =>
+    buildZeroLeakBotLine({
+      personaId: bp.id,
+      dayNumber: 2,
+      nightDeathNames: ["Minh"],
+      suspectName: "Hùng",
+      mayorName: "Lan",
+      aliveCount: 5,
+    })
+  );
+  assert.equal(lines.every((l) => typeof l === "string" && l.length >= 15), true, "Mọi câu thoại Bot đều giàu ngữ cảnh tiếng Việt");
+  assert.ok(new Set(lines).size >= 3, "Các cá tính Bot khác nhau phải tạo góc nhìn phản biện khác nhau");
+
+  deleteRoom(room.code);
+});
+
+// 40. V4.1 — Đồng Thuận Mở Sảnh Ván Mới (Rematch Consensus) không bị kẹt chờ Host thụ động
+runScenario("40. V4.1: markRematchReady đủ >= 50% người thật tự mở lại Sảnh ngay không cần chờ Host", () => {
+  const ioStub = { to: () => ({ emit: () => {} }) };
+  const ctrl = createGameController(ioStub);
+  const room = createRoom("rm_host");
+  const { player: host } = addPlayer(room.code, "rm_host", "Host AFK");
+  const { player: g1 } = addPlayer(room.code, "rm_g1", "Khách 1");
+  const { player: g2 } = addPlayer(room.code, "rm_g2", "Khách 2");
+  g1.ready = true;
+  g2.ready = true;
+  addBotsToRoom(room.code, 3);
+
+  ctrl.startGame(room, { skipRoleReveal: true });
+  // Giả lập kết thúc đêm (chỉ còn Sói sống -> Phe Sói thắng -> endGame)
+  room.players.forEach((p, idx) => {
+    p.role = idx === 0 ? "wolf" : "villager";
+    p.alive = idx === 0;
+  });
+  room.game.phase = "night_seer";
+  ctrl.advanceCurrentPhase(room);
+  assert.equal(room.phase, "ended");
+  assert.ok(room.game.rematchEndsAt > Date.now(), "Kết ván phải khởi tạo đồng hồ rematchEndsAt 45s");
+
+  // Có 3 người thật -> cần ceil(3/2) = 2 người bấm Ván Mới
+  const r1 = ctrl.markRematchReady(room, g1.id);
+  assert.equal(r1.reopened, false, "1/2 người đồng thuận chưa mở sảnh");
+  const r2 = ctrl.markRematchReady(room, g2.id);
+  assert.equal(r2.reopened, true, "2/2 người đồng thuận (>= 50% người thật) tự mở Sảnh ngay dù Host AFK!");
+  assert.equal(room.phase, "lobby");
+  assert.ok(host.id && room.players.length >= 3);
+
+  ctrl.clearRoomTimer(room.code);
+  deleteRoom(room.code);
+});
+
+// 41. V4.1 — Dự Đoán Cõi Âm (+35 XP Zero-Leak) & Kiểm Chứng 32 Chân Dung 3D Studio WebP
+runScenario("41. V4.1: Dự đoán Cõi Âm (+35 XP khi đoán trúng, ẩn khỏi người sống) & đủ 32 ảnh WebP Studio", () => {
+  const room = makeTestRoom({
+    w1: "wolf", g1: "guard", wt: "witch", sr: "seer", v1: "villager", v2: "villager"
+  });
+  const deadVillager = room.players[4];
+  const aliveVillager = room.players[5];
+  deadVillager.alive = false;
+  room.game.ghostBets = { [deadVillager.id]: "village" };
+
+  const aliveView = publicRoomView(room, aliveVillager.socketId);
+  assert.equal(aliveView.game.myGhostBet, null, "Người sống không thấy kèo dự đoán của Cõi Âm");
+
+  const deadViewDuring = publicRoomView(room, deadVillager.socketId);
+  assert.equal(deadViewDuring.game.myGhostBet, "village");
+  assert.equal(deadViewDuring.game.ghostBetBonusXp, 0, "Chưa hết ván chưa cộng XP");
+
+  room.phase = "ended";
+  room.game.winner = "village";
+  const deadViewEnded = publicRoomView(room, deadVillager.socketId);
+  assert.equal(deadViewEnded.game.ghostBetBonusXp, 35, "Đoán trúng phe thắng được thưởng +35 XP Tiên Tri Âm Giới");
+  deleteRoom(room.code);
+
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const badgesDir = path.resolve(__dirname, "../../client/public/portraits/badges");
+  const cardsDir = path.resolve(__dirname, "../../client/public/portraits/cards");
+  const badgeFiles = fs.readdirSync(badgesDir).filter((f) => f.endsWith(".webp"));
+  const cardFiles = fs.readdirSync(cardsDir).filter((f) => f.endsWith(".webp"));
+  assert.equal(badgeFiles.length, 16, "Phải có đủ 16/16 huy hiệu 3D WebP 1:1");
+  assert.equal(cardFiles.length, 16, "Phải có đủ 16/16 thẻ bài Tarot 3D WebP 2:3");
 });
 
 const totalMs = (performance.now() - startTime).toFixed(1);
