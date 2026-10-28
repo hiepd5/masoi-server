@@ -20,6 +20,7 @@ import {
   setScenePreset,
   setRoomAccess,
   setRoomTurbo,
+  setRoomMcPacingMode,
   setSoloPracticeRole,
   addBotsToRoom,
   clearBotsFromRoom,
@@ -1111,6 +1112,21 @@ io.on("connection", (socket) => {
     if (result.error) return cb?.({ ok: false, error: result.error });
     broadcastRoom(result.room);
     cb?.({ ok: true, isTurbo: result.isTurbo });
+  });
+
+  socket.on("room:setMcPacing", ({ mode } = {}, cb) => {
+    if (!checkSocketCooldown(socket, "set_mc_pacing", 250)) {
+      return cb?.({ ok: false, error: "Thao tác quá nhanh." });
+    }
+    const code = socket.data.roomCode;
+    if (!code) return cb?.({ ok: false, error: "Bạn chưa ở trong phòng." });
+    const result = setRoomMcPacingMode(code, socket.data.playerId || socket.id, mode);
+    if (result.error) return cb?.({ ok: false, error: result.error });
+    if (result.room.phase === "playing") {
+      gameCtrl.reapplyMcPacingLive?.(result.room);
+    }
+    broadcastRoom(result.room);
+    cb?.({ ok: true, mcPacingMode: result.mcPacingMode });
   });
 
   socket.on("room:setSoloRole", ({ role } = {}, cb) => {

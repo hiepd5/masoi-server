@@ -6,6 +6,7 @@ import {
   ensureRoleInLobbyConfig,
 } from "./rooms.js";
 import { generateDefaultRoles, isWolfTeamRole, ROLE_LABELS } from "./roles.js";
+import { pickZeroLeakBotSpeech, isRoomFullMcPacing } from "./botVoiceCatalog.js";
 
 // SEC-06: Khóa cứng 100% DevSandbox trên Render/Production & chỉ mở khi ALLOW_LOCAL_STUDIO === "1"
 export const IS_LOCAL_DEV =
@@ -90,23 +91,29 @@ function clearBotDebateTimers(room) {
   }
 }
 
-function emitBotVillageBubble(room, gameCtrl, io, speaker, suspect, text, phaseName = "day_discuss") {
+function emitBotVillageBubble(room, gameCtrl, io, speaker, suspect, speech, phaseName = "day_discuss") {
   if (!room || room.phase !== "playing" || !room.game || room.game.winner) return;
   if (!speaker?.alive) return;
+  const bubbleText = typeof speech === "string" ? speech : speech?.bubbleText || "";
+  if (!bubbleText) return;
   gameCtrl.recordReplayEvent?.(room, {
     kind: "village_chat",
     phase: phaseName,
     actorId: speaker.id,
     targetId: suspect && suspect.id !== speaker.id ? suspect.id : null,
-    chatText: text,
-    caption: `💬 ${speaker.name}: "${text}"`,
+    chatText: bubbleText,
+    caption: `${phaseName === "day_defense" ? "⚖️" : "💬"} ${speaker.name}: "${bubbleText}"`,
   });
   io?.to(room.code)?.emit("village:chat", {
     senderId: speaker.id,
     senderName: speaker.name,
-    personaLabel: speaker.personaLabel || null,
+    personaId: speech?.personaId || speaker.personaId || "sharp_fox",
+    personaLabel: speech?.personaLabel || speaker.personaLabel || null,
     isBot: true,
-    message: text,
+    message: bubbleText,
+    spokenText: speech?.spokenText || bubbleText,
+    botAudioUrl: speech?.botAudioUrl || null,
+    durationMs: speech?.durationMs || null,
   });
 }
 
@@ -133,6 +140,11 @@ export function checkBotVoteConsensus(room, gameCtrl) {
   }
 
   if (!everyoneVoted) return;
+
+  if (isRoomFullMcPacing(room)) {
+    const mcFloor = gameCtrl.getRemainingMcFloorMs?.(room) || 0;
+    delayMs = Math.max(delayMs + 600, mcFloor);
+  }
 
   const targetPhaseKey = `${g.dayNumber}:${g.phase}:${g.hotSeatIndex ?? -1}`;
   if (room.devConsensusTimer) {
@@ -204,17 +216,44 @@ export function flushBotInteractionsForCurrentPhase(
           }
         }
       }
-      const whisperFn = pickRandom(WOLF_BOT_WHISPERS);
-      const whisperText = whisperFn ? whisperFn(finalTarget.name) : `Chốt ${finalTarget.name}!`;
+      const leadWolfBot = botWolves[0];
+      const wolfSpeech = pickZeroLeakBotSpeech({
+        personaId: leadWolfBot.personaId || "sharp_fox",
+        context: "night_wolf",
+        targetName: finalTarget.name,
+      });
       gameCtrl.recordReplayEvent?.(room, {
         kind: "wolf_chat",
         phase: "night_wolf",
-        actorId: botWolves[0].id,
-        actorRole: botWolves[0].role,
+        actorId: leadWolfBot.id,
+        actorRole: leadWolfBot.role,
         targetId: finalTarget.id,
-        chatText: whisperText,
-        caption: `🐺 [Mật đàm Sói] ${botWolves[0].name}: "${whisperText}"`,
+        chatText: wolfSpeech.bubbleText,
+        caption: `🐺 [Mật đàm Sói] ${leadWolfBot.name}: "${wolfSpeech.bubbleText}"`,
       });
+      // ZERO-LEAK ABSOLUTE ISOLATION: Chỉ gửi mật đàm + file MP3 thì thầm tới socket của đồng bọn Sói NGƯỜI THẬT còn sống!
+      if (io) {
+        const livingHumanWolves = room.players.filter(
+          (p) => !p.isBot && p.alive && p.connected && p.socketId && isWolfTeamRole(p.role)
+        );
+        livingHumanWolves.forEach((hw) => {
+          io.to(hw.socketId).emit("wolf:chat", {
+            senderId: leadWolfBot.id,
+            senderName: leadWolfBot.name,
+            personaId: wolfSpeech.personaId,
+            personaLabel: wolfSpeech.personaLabel,
+            isBot: true,
+            message: wolfSpeech.bubbleText,
+            spokenText: wolfSpeech.spokenText,
+            botAudioUrl: wolfSpeech.botAudioUrl,
+            durationMs: wolfSpeech.durationMs,
+          });
+        });
+        if (livingHumanWolves.length > 0 && isRoomFullMcPacing(room)) {
+          const startAfterMc = Math.max(Date.now(), g.mcBusyUntilAt || Date.now());
+          g.botAudioBusyUntilAt = startAfterMc + (wolfSpeech.durationMs || 4800) + 500;
+        }
+      }
       botWolves.forEach((botWolf) => {
         gameCtrl.wolfPick(room, botWolf.id, finalTarget.id);
       });
@@ -255,8 +294,9 @@ export function flushBotInteractionsForCurrentPhase(
       gameCtrl.mayorReveal(room, botMayor.id);
     }
 
-    // Dữ liệu 100% CÔNG KHAI (tuyệt đối không đọc p.role để sinh câu chat!)
-    const buildPublicSpeechForBot = (speakerBot, avoidSuspectId = null) => {
+    // Dữ liệu 100% CÔNG KHAI (tuyệt đối không đọc p.role để sinh câu chat & giọng nói!)
+    const usedClipIdsToday = new Set();
+    const buildPublicSpeechForBot = (speakerBot, avoidSuspectId = null, speechContext = "day_opening") => {
       const publicAlive = room.players
         .filter((p) => p.alive)
         .map((p) => ({ id: p.id, name: p.name }));
@@ -267,18 +307,16 @@ export function flushBotInteractionsForCurrentPhase(
       const nightDeathNames = (g.nightDeaths || [])
         .map((id) => room.players.find((p) => p.id === id)?.name)
         .filter(Boolean);
-      const mayorName = g.mayorRevealedId
-        ? room.players.find((p) => p.id === g.mayorRevealedId)?.name || null
-        : null;
-      const text = buildZeroLeakBotLine({
+      const hasMayor = Boolean(g.mayorRevealedId);
+      const speech = pickZeroLeakBotSpeech({
         personaId: speakerBot.personaId || "sharp_fox",
-        dayNumber: g.dayNumber,
-        nightDeathNames,
-        suspectName: suspect.name,
-        mayorName,
-        aliveCount: publicAlive.length,
+        context: speechContext,
+        hasVictim: nightDeathNames.length > 0,
+        hasMayor,
+        targetName: suspect.name,
+        usedClipIds: usedClipIdsToday,
       });
-      return { suspect, text };
+      return { suspect, speech };
     };
 
     const hasChatToday = (g.replayTimeline || []).some(
@@ -287,24 +325,26 @@ export function flushBotInteractionsForCurrentPhase(
     if (!hasChatToday && aliveBots.length > 0) {
       const shuffledBots = [...aliveBots].sort(() => Math.random() - 0.5);
       const firstSpeaker = shuffledBots[0];
-      const firstSpeech = buildPublicSpeechForBot(firstSpeaker);
+      const firstTurn = buildPublicSpeechForBot(firstSpeaker, null, "day_opening");
       emitBotVillageBubble(
         room,
         gameCtrl,
         io,
         firstSpeaker,
-        firstSpeech.suspect,
-        firstSpeech.text,
+        firstTurn.suspect,
+        firstTurn.speech,
         "day_discuss"
       );
 
-      // Rải thêm 1–2 bóng thoại 3D tự nhiên cách quãng 6.5s & 13.5s nếu có người thật đang nghe & không đang gõ liên tục
+      // Rải thêm 1–2 câu tranh biện có giọng đọc tự nhiên (kể cả khi người chơi thật đã hy sinh đang xem ở chế độ Đọc Trọn!)
       clearBotDebateTimers(room);
       const aliveHumansCount = alivePlayers.filter((p) => !p.isBot).length;
-      if (aliveHumansCount > 0 && shuffledBots.length >= 2) {
+      const fullPacing = isRoomFullMcPacing(room);
+      if ((aliveHumansCount > 0 || fullPacing) && shuffledBots.length >= 2) {
         room.devDebateTimers = [];
-        const followUps = shuffledBots.slice(1, 3);
-        const scheduleOffsetsMs = [6500, 13800];
+        const maxFollowUps = aliveHumansCount > 0 ? 2 : 1;
+        const followUps = shuffledBots.slice(1, 1 + maxFollowUps);
+        const scheduleOffsetsMs = fullPacing ? [8800, 17800] : [6500, 13800];
         const expectedDay = g.dayNumber;
 
         followUps.forEach((botSpeaker, idx) => {
@@ -314,17 +354,21 @@ export function flushBotInteractionsForCurrentPhase(
             if (!botSpeaker.alive) return;
             // Nhường lời ngay nếu người chơi thật vừa nhắn tin trong 4.5s gần nhất!
             if (Date.now() - (room.lastHumanVillageChatAt || 0) < 4500) return;
-            const nextSpeech = buildPublicSpeechForBot(botSpeaker, firstSpeech.suspect?.id);
+            const nextTurn = buildPublicSpeechForBot(
+              botSpeaker,
+              firstTurn.suspect?.id,
+              "day_followup"
+            );
             emitBotVillageBubble(
               room,
               gameCtrl,
               io,
               botSpeaker,
-              nextSpeech.suspect,
-              nextSpeech.text,
+              nextTurn.suspect,
+              nextTurn.speech,
               "day_discuss"
             );
-          }, scheduleOffsetsMs[idx] || 7000);
+          }, scheduleOffsetsMs[idx] || 8800);
           timer.unref?.();
           room.devDebateTimers.push(timer);
         });
@@ -335,19 +379,19 @@ export function flushBotInteractionsForCurrentPhase(
     const defendantId = g.hotSeatQueue?.[g.hotSeatIndex];
     const defendant = aliveBots.find((b) => b.id === defendantId);
     if (defendant) {
-      const plea = pickRandom(DEFENSE_BOT_LINES);
-      gameCtrl.recordReplayEvent?.(room, {
-        kind: "village_chat",
-        phase: "day_defense",
-        actorId: defendant.id,
-        chatText: plea,
-        caption: `⚖️ ${defendant.name}: "${plea}"`,
+      const defenseSpeech = pickZeroLeakBotSpeech({
+        personaId: defendant.personaId || "sharp_fox",
+        context: "day_defense",
       });
-      io?.to(room.code)?.emit("village:chat", {
-        senderId: defendant.id,
-        senderName: defendant.name,
-        message: plea,
-      });
+      emitBotVillageBubble(
+        room,
+        gameCtrl,
+        io,
+        defendant,
+        null,
+        defenseSpeech,
+        "day_defense"
+      );
     }
   } else if (includeDayActions && g.phase === "day_nominate") {
     const humanVotes = Object.entries(g.nominationVotes || {})
@@ -433,12 +477,30 @@ export function setupDevPhaseHook(gameCtrl, io = null) {
       room.devBotTimer = null;
     }
 
+    if (room.devDeadAdvanceTimer) {
+      clearTimeout(room.devDeadAdvanceTimer);
+      room.devDeadAdvanceTimer = null;
+    }
+
+    const fullPacing = isRoomFullMcPacing(room);
+    const mcFloorMs = fullPacing ? gameCtrl.getRemainingMcFloorMs?.(room) || 0 : 0;
+    const isTiedFirstDefense =
+      g.phase === "day_defense" &&
+      (g.hotSeatQueue?.length || 0) >= 2 &&
+      g.hotSeatIndex === 0;
+
     const delayMs = activeRole
       ? 1200
       : g.phase === "day_defense"
-        ? 1500
+        ? fullPacing
+          ? isTiedFirstDefense
+            ? 5200
+            : 2800
+          : 1500
         : g.phase === "day_discuss"
-          ? 2200
+          ? fullPacing
+            ? Math.max(4200, Math.min(6800, mcFloorMs - 800))
+            : 2200
           : 2600;
 
     room.devBotTimer = setTimeout(() => {
@@ -462,7 +524,7 @@ export function setupDevPhaseHook(gameCtrl, io = null) {
       if (activeRole) {
         flushBotInteractionsForCurrentPhase(room, gameCtrl, { includeDayActions: false, io });
         gameCtrl.broadcast(room);
-        // Giao cho Smart Pacing + Random Jitter điều tiết thời gian chuyển pha (Solo 1 người = 1.8s; Bàn >=2 người = 5.5s-8.5s chống lộ vai!)
+        // Giao cho Smart Pacing + Floor MC + Random Jitter điều tiết thời gian chuyển pha
         gameCtrl.notifyBotNightReady?.(room);
         return;
       }
@@ -472,23 +534,30 @@ export function setupDevPhaseHook(gameCtrl, io = null) {
       gameCtrl.broadcast(room);
 
       if (g.phase === "day_discuss") {
-        // Nếu người chơi thật đã hy sinh (đang xem đàn AI Bot đấu nốt ván) -> tự chuyển sang Đề cử sau 3.2s!
+        // Nếu người chơi thật đã hy sinh (đang xem đàn AI Bot đấu nốt ván):
+        // Ở chế độ Đọc Trọn giữ ~16s để nghe trọn 2 AI Bot tranh biện; ở chế độ Nhanh chuyển sau 3.2s!
         if (aliveHumans.length === 0) {
-          const tNext = setTimeout(() => {
+          const deadDiscussWaitMs = isRoomFullMcPacing(room) ? 16000 : 3200;
+          room.devDeadAdvanceTimer = setTimeout(() => {
+            room.devDeadAdvanceTimer = null;
             if (room.phase === "playing" && room.game?.phase === "day_discuss" && !room.game.winner) {
               gameCtrl.advanceCurrentPhase(room);
             }
-          }, 3200);
-          tNext.unref?.();
+          }, deadDiscussWaitMs);
+          room.devDeadAdvanceTimer.unref?.();
         }
       } else if (g.phase === "day_nominate" || g.phase === "day_final_vote") {
         if (aliveHumans.length === 0) {
-          const tNext = setTimeout(() => {
+          const deadVoteWaitMs = isRoomFullMcPacing(room)
+            ? Math.max(5200, gameCtrl.getRemainingMcFloorMs?.(room) || 0)
+            : 1800;
+          room.devDeadAdvanceTimer = setTimeout(() => {
+            room.devDeadAdvanceTimer = null;
             if (room.phase === "playing" && room.game?.phase === g.phase && !room.game.winner) {
               gameCtrl.advanceCurrentPhase(room);
             }
-          }, 1800);
-          tNext.unref?.();
+          }, deadVoteWaitMs);
+          room.devDeadAdvanceTimer.unref?.();
         } else {
           checkBotVoteConsensus(room, gameCtrl);
         }

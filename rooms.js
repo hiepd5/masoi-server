@@ -22,6 +22,7 @@ import {
   sanitizeDeviceId,
 } from "./securityGuard.js";
 import { getVietnamGoldenHourInfo } from "./moderationAndStats.js";
+import { resolveEffectiveMcPacingMode } from "./botVoiceCatalog.js";
 
 // rooms: Map<roomCode, RoomState>
 const rooms = new Map();
@@ -200,6 +201,10 @@ export function createRoom(hostSocketId, options = {}) {
     accessMode, // 'public' | 'password' | 'hidden'
     password: accessMode === "password" ? cleanPassword : "",
     isTurbo: Boolean(options.isTurbo),
+    mcPacingMode:
+      options.mcPacingMode === "full" || options.mcPacingMode === "fast"
+        ? options.mcPacingMode
+        : null,
     soloPracticeRole: null,
     createdAt: Date.now(),
     scenePresetId: "nordic_village_v3",
@@ -226,6 +231,14 @@ export function clearRoomExtraTimers(room) {
   if (room.devConsensusTimer) {
     clearTimeout(room.devConsensusTimer);
     room.devConsensusTimer = null;
+  }
+  if (room.devDeadAdvanceTimer) {
+    clearTimeout(room.devDeadAdvanceTimer);
+    room.devDeadAdvanceTimer = null;
+  }
+  if (room.nominationTransitionTimer) {
+    clearTimeout(room.nominationTransitionTimer);
+    room.nominationTransitionTimer = null;
   }
   if (Array.isArray(room.devDebateTimers)) {
     room.devDebateTimers.forEach((t) => clearTimeout(t));
@@ -782,6 +795,28 @@ export function setRoomTurbo(code, requesterSocketId, isTurbo) {
   return { ok: true, room, isTurbo: room.isTurbo };
 }
 
+export function setRoomMcPacingMode(code, requesterSocketId, requestedMode) {
+  const room = getRoom(code);
+  if (!room) return { error: "Phòng không tồn tại." };
+  const player = room.players.find(
+    (p) => p.socketId === requesterSocketId || p.id === requesterSocketId
+  );
+  const realHumans = room.players.filter((p) => !p.isBot);
+  const isSoloHuman = realHumans.length === 1 && realHumans[0]?.id === player?.id;
+  if (!player || (!player.isHost && !isSoloHuman)) {
+    return { error: "Chỉ chủ phòng (hoặc người chơi Solo) mới có thể đổi nhịp đọc MC." };
+  }
+  const currentEffective = resolveEffectiveMcPacingMode(room);
+  const nextMode =
+    requestedMode === "full" || requestedMode === "fast"
+      ? requestedMode
+      : currentEffective === "full"
+        ? "fast"
+        : "full";
+  room.mcPacingMode = nextMode;
+  return { ok: true, room, mcPacingMode: nextMode };
+}
+
 export function toggleReady(code, socketId) {
   const room = getRoom(code);
   if (!room) return { error: "Phòng không tồn tại." };
@@ -1199,6 +1234,10 @@ export function publicRoomView(room, forSocketId) {
     accessMode: room.accessMode || "public", // 'public' | 'password' | 'hidden'
     hasPassword: room.accessMode === "password",
     isTurbo: Boolean(room.isTurbo),
+    mcPacingMode: resolveEffectiveMcPacingMode(room),
+    canToggleMcPacing: Boolean(
+      me && (me.isHost || (realHumans.length === 1 && realHumans[0]?.id === me.id))
+    ),
     humanCount: realHumans.length,
     botCount: room.players.length - realHumans.length,
     spectatorCount: (room.spectators || []).filter((s) => s.connected).length,
@@ -1223,6 +1262,8 @@ export function publicRoomView(room, forSocketId) {
       seatIndex: typeof p.seatIndex === "number" ? p.seatIndex : idx,
       isHost: p.isHost,
       isBot: Boolean(p.isBot),
+      personaId: p.isBot ? p.personaId || "sharp_fox" : undefined,
+      personaLabel: p.isBot ? p.personaLabel || null : undefined,
       ready: p.isHost ? true : Boolean(p.ready),
       alive: p.alive,
       connected: p.connected,
@@ -1258,6 +1299,7 @@ export function publicRoomView(room, forSocketId) {
       phaseEndsAt: g.phaseEndsAt,
       phaseDurationSec: g.phaseDurationSec || null,
       isTurbo: Boolean(room.isTurbo),
+      mcPacingMode: resolveEffectiveMcPacingMode(room),
       roleRevealReadyIds: g.phase === "role_reveal" ? g.roleRevealReadyIds || {} : undefined,
       discussEndsAt: g.discussEndsAt,
       nominees: g.nominees,

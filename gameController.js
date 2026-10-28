@@ -17,6 +17,7 @@ import {
   warmEndGameFinaleVoice,
   warmPhrasesInBackground,
 } from "./storyVoiceEngine.js";
+import { estimateMcSpeechMs, isRoomFullMcPacing } from "./botVoiceCatalog.js";
 
 // timers: Map<roomCode, Timeout> (Timer chính của từng phase)
 const timers = new Map();
@@ -119,7 +120,33 @@ export function createGameController(io) {
     }
   }
 
+  function getRemainingMcFloorMs(room) {
+    if (!room?.game || !isRoomFullMcPacing(room)) return 0;
+    return Math.max(0, (room.game.mcBusyUntilAt || 0) - Date.now());
+  }
+
+  function getRemainingBotAudioFloorMs(room) {
+    if (!room?.game || !isRoomFullMcPacing(room)) return 0;
+    return Math.max(0, (room.game.botAudioBusyUntilAt || 0) - Date.now());
+  }
+
   function announce(room, message) {
+    if (room?.game && message) {
+      const now = Date.now();
+      const speechMs = estimateMcSpeechMs(message, {
+        speed: 0.82,
+        bufferMs: 1550,
+        minMs: 3600,
+        maxMs: 11500,
+      });
+      const prevRemain = Math.max(0, (room.game.mcBusyUntilAt || 0) - now);
+      room.game.lastMcAnnounceAt = now;
+      room.game.lastMcRequiredMs = speechMs;
+      room.game.mcBusyUntilAt =
+        prevRemain > 250
+          ? now + Math.min(15000, prevRemain + speechMs - 700)
+          : now + speechMs;
+    }
     if (
       message &&
       room?.phase !== "ended" &&
@@ -229,37 +256,51 @@ export function createGameController(io) {
 
     let waitMs;
     if (isSoloPractice) {
-      // Luyện tập 1 mình với AI Bot: lướt nhanh 1.4s - 1.8s để không phải chờ đợi
-      waitMs = triggeredByHuman ? 1400 : 1800;
+      if (isRoomFullMcPacing(room)) {
+        // Nhịp Đọc Trọn (New-Player Friendly): Đợi MC đọc trọn câu dẫn + đệm hiểu tình huống (& câu thì thầm của đồng bọn Sói Bot nếu có)
+        const baseSoloMs = triggeredByHuman ? 1900 : 2500;
+        waitMs = Math.max(
+          baseSoloMs,
+          getRemainingMcFloorMs(room),
+          getRemainingBotAudioFloorMs(room)
+        );
+      } else {
+        // Chế độ Nhanh: lướt nhanh 1.4s - 1.8s
+        waitMs = triggeredByHuman ? 1400 : 1800;
+      }
     } else {
       // Bàn nhiều người chơi thật (>= 2 người):
-      // Khóa Random Jitter 5.5s – 8.5s tính từ đầu pha (tối thiểu 1.8s sau cú click để xem trọn VFX 3D)
-      // -> Rút ngắn đêm từ 115s xuống ~32-38s mà 0% lộ vai đó còn sống, đã chết hay là AI Bot!
-      const targetSpanMs = 5500 + Math.floor(Math.random() * 3000);
-      waitMs = Math.max(1800, targetSpanMs - elapsedMs);
+      // Khóa Random Jitter phía Server 100% độc lập Client (0% lộ vai đó còn sống, đã chết hay là AI Bot!)
+      const minSpan = isRoomFullMcPacing(room) ? 6800 : 5500;
+      const jitterSpan = isRoomFullMcPacing(room) ? 2800 : 3000;
+      const targetSpanMs = minSpan + Math.floor(Math.random() * jitterSpan);
+      waitMs = Math.max(1900, targetSpanMs - elapsedMs);
     }
 
     const phaseKey = `${g.dayNumber}:${g.phase}:${g.hotSeatIndex ?? -1}`;
     setSmartTimer(room.code, phaseKey, waitMs, nextFn);
   }
 
-  // Tự chốt sớm sau 2.0s khi 100% người sống đã bỏ phiếu (Hoạt động cho cả phòng 100% người thật lẫn phòng có Bot!)
+  // Tự chốt sớm khi 100% người sống đã bỏ phiếu (Tôn trọng sàn thời lượng đọc câu MC ở chế độ Đọc Trọn!)
   function checkUniversalDayVoteConsensus(room) {
     if (!room || room.phase !== "playing" || !room.game || room.game.winner) return;
     const g = room.game;
     const alive = room.players.filter((p) => p.alive);
     if (alive.length === 0) return;
 
+    const waitMs = isRoomFullMcPacing(room)
+      ? Math.max(2800, getRemainingMcFloorMs(room))
+      : 2000;
     const phaseKey = `${g.dayNumber}:${g.phase}:${g.hotSeatIndex ?? -1}`;
     if (g.phase === "day_nominate") {
       const allVoted = alive.every((p) => Boolean(g.nominationVotes?.[p.id]?.targetId));
       if (allVoted) {
-        setSmartTimer(room.code, phaseKey, 2000, finalizeNominationPhase);
+        setSmartTimer(room.code, phaseKey, waitMs, finalizeNominationPhase);
       }
     } else if (g.phase === "day_final_vote") {
       const allVoted = alive.every((p) => Boolean(g.finalVotes?.[p.id]));
       if (allVoted) {
-        setSmartTimer(room.code, phaseKey, 2000, finishFinalVoteTurn);
+        setSmartTimer(room.code, phaseKey, waitMs, finishFinalVoteTurn);
       }
     }
   }
@@ -399,7 +440,13 @@ export function createGameController(io) {
       );
     }
 
-    setRoomTimer(room.code, GE.TIMERS.roleReveal * 1000, beginFirstNightAfterReveal);
+    room.game.phaseDurationSec = GE.TIMERS.roleReveal;
+    const roleRevealMs = isRoomFullMcPacing(room)
+      ? Math.max(GE.TIMERS.roleReveal * 1000, getRemainingMcFloorMs(room))
+      : GE.TIMERS.roleReveal * 1000;
+    setRoomTimer(room.code, roleRevealMs, beginFirstNightAfterReveal, {
+      updateDurationSec: false,
+    });
     broadcast(room);
     notifyRoomList(room);
     return { ok: true, autoAddedBots };
@@ -494,7 +541,10 @@ export function createGameController(io) {
     const winner = GE.checkWinCondition(room);
     if (winner) return endGame(room, winner);
 
-    setRoomTimer(room.code, 5000, beginDiscussion);
+    const dawnWaitMs = isRoomFullMcPacing(room)
+      ? Math.max(5800, getRemainingMcFloorMs(room) + 600)
+      : 5000;
+    setRoomTimer(room.code, dawnWaitMs, beginDiscussion);
     broadcast(room);
     notifyRoomList(room);
   }
@@ -546,11 +596,14 @@ export function createGameController(io) {
       `🏹 ĐOÀNG!! Đạn bạc cuối cùng của Thợ Săn ${hunter?.name || ""} đã hạ gục ${killedNames}!`
     );
 
-    // Đệm điện ảnh 2.8s để người chơi kịp nhìn trọn đường đạn bạc 3D & thông báo hạ gục trước khi chuyển cảnh!
+    // Đệm điện ảnh để người chơi kịp nhìn trọn đường đạn bạc 3D & nghe trọn thông báo hạ gục trước khi chuyển cảnh!
     broadcast(room);
+    const shotWaitMs = isRoomFullMcPacing(room)
+      ? Math.max(3800, getRemainingMcFloorMs(room))
+      : 2800;
     setRoomTimer(
       room.code,
-      2800,
+      shotWaitMs,
       (freshRoom) => resumeAfterHunterRevenge(freshRoom, res.returnContext),
       { updateDurationSec: false }
     );
@@ -597,7 +650,10 @@ export function createGameController(io) {
     }
     warmExactNomineesVoices(room, nominees, GE.getPhaseDurationSec(room, "day_defense"));
     const allNames = nominees.map((n) => room.players.find((p) => p.id === n.playerId)?.name).join(", ");
-    announce(room, `${allNames} bị đề cử nhiều nhất. Mời lần lượt lên biện hộ.`);
+    // Ở nhịp Đọc Trọn khi chỉ có 1 bị cáo duy nhất: không phát chồng 2 câu mời trùng nhau trong 1ms
+    if (nominees.length >= 2 || !isRoomFullMcPacing(room)) {
+      announce(room, `${allNames} bị đề cử nhiều nhất. Mời lần lượt lên biện hộ.`);
+    }
     finishDefenseTurn(room);
   }
 
@@ -606,8 +662,15 @@ export function createGameController(io) {
     if (result.phase === "day_defense") {
       const defendantPlayer = room.players.find((p) => p.id === result.currentDefendantId);
       const name = defendantPlayer?.name;
+      const fullPacing = isRoomFullMcPacing(room);
+      const isTiedFirstTurn =
+        (room.game?.hotSeatQueue?.length || 0) >= 2 && room.game?.hotSeatIndex === 0;
       const defenseSec = defendantPlayer?.isBot
-        ? 8
+        ? fullPacing
+          ? isTiedFirstTurn
+            ? 18
+            : 14
+          : 8
         : GE.getPhaseDurationSec(room, "day_defense");
       if (room.game) {
         room.game.hotSeatEndsAt = Date.now() + defenseSec * 1000;
@@ -789,12 +852,48 @@ export function createGameController(io) {
     return { ok: true, fromPhase: p, toPhase: room.game.phase };
   }
 
+  function reapplyMcPacingLive(room) {
+    if (!room || room.phase !== "playing" || !room.game || room.game.winner) return;
+    const g = room.game;
+    const fullPacing = isRoomFullMcPacing(room);
+    if (!fullPacing) {
+      g.mcBusyUntilAt = 0;
+      g.botAudioBusyUntilAt = 0;
+      if (room.devDeadAdvanceTimer) {
+        clearTimeout(room.devDeadAdvanceTimer);
+        room.devDeadAdvanceTimer = setTimeout(() => {
+          room.devDeadAdvanceTimer = null;
+          if (room.phase === "playing" && room.game && !room.game.winner) {
+            advanceCurrentPhase(room);
+          }
+        }, 1600);
+        room.devDeadAdvanceTimer.unref?.();
+      }
+      if (g.phase === "day_defense") {
+        const curDefId = g.hotSeatQueue?.[g.hotSeatIndex];
+        const curDef = room.players.find((p) => p.id === curDefId);
+        const msLeft = (g.phaseEndsAt || 0) - Date.now();
+        if (curDef?.isBot && msLeft > 4500) {
+          g.hotSeatEndsAt = Date.now() + 4000;
+          setRoomTimer(room.code, 4000, finishDefenseTurn);
+        }
+      }
+    }
+    if (g.phase?.startsWith("night_")) {
+      scheduleSmartNightCheck(room, { triggeredByHuman: false });
+    } else if (g.phase === "day_nominate" || g.phase === "day_final_vote") {
+      checkUniversalDayVoteConsensus(room);
+    }
+  }
+
   // ============ EXPORT HANDLERS CHO index.js ============
   return {
     startGame,
     markRoleRevealReady,
     markRematchReady,
     reopenRoomLobby,
+    reapplyMcPacingLive,
+    getRemainingMcFloorMs,
     notifyBotNightReady: (room) => scheduleSmartNightCheck(room, { triggeredByHuman: false }),
     checkUniversalDayVoteConsensus,
     broadcast,

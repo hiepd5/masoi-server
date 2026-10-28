@@ -1,6 +1,7 @@
 import "./envLoader.js";
 import http from "http";
 import https from "https";
+import { isRoomFullMcPacing } from "./botVoiceCatalog.js";
 import { ROLE_LABELS, isWolfTeamRole } from "./roles.js";
 
 export const DEFAULT_VOICE_ID = process.env.VOICESTUDIO_VOICE_ID || "b5d182f3";
@@ -672,13 +673,20 @@ export function warmExactNightVictimVoice(room) {
 export function warmExactNomineesVoices(room, nominees = [], defenseTimerSec = 60) {
   if (!room?.players?.length || !Array.isArray(nominees) || nominees.length === 0) return;
   const phrases = [];
-  for (const nom of nominees) {
+  const fullPacing = isRoomFullMcPacing(room);
+  nominees.forEach((nom, idx) => {
     const p = room.players.find((pl) => pl.id === nom.playerId);
-    if (!p?.name) continue;
-    const defSec = p.isBot ? 8 : defenseTimerSec;
+    if (!p?.name) return;
+    const defSec = p.isBot
+      ? fullPacing
+        ? nominees.length >= 2 && idx === 0
+          ? 18
+          : 14
+        : 8
+      : defenseTimerSec;
     phrases.push(`🎤 Mời ${p.name} lên biện hộ. (${defSec} giây)`);
     phrases.push(`⚖️ Mời cả làng vote cho ${p.name}: Treo cổ hay Tha.`);
-  }
+  });
   warmPhrasesInBackground(phrases, "live_hint");
 }
 

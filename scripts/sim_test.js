@@ -16,6 +16,7 @@ import {
   reconnectByToken,
   setRoomAccess,
   setRoomTurbo,
+  setRoomMcPacingMode,
   setSoloPracticeRole,
   setPlayerCitizenModel,
   addBotsToRoom,
@@ -48,7 +49,18 @@ import {
   isSafeReactionEmoji,
 } from "../securityGuard.js";
 import { createGameController } from "../gameController.js";
-import { registerDevSocketHandlers, buildZeroLeakBotLine } from "../devSandbox.js";
+import {
+  registerDevSocketHandlers,
+  buildZeroLeakBotLine,
+  flushBotInteractionsForCurrentPhase,
+} from "../devSandbox.js";
+import {
+  FORBIDDEN_MC_VOICE_ID,
+  BOT_VOICE_CATALOG,
+  estimateMcSpeechMs,
+  resolveEffectiveMcPacingMode,
+  pickZeroLeakBotSpeech,
+} from "../botVoiceCatalog.js";
 import {
   normalizeTtsText,
   getTtsCacheKey,
@@ -1654,8 +1666,8 @@ runScenario("48. V4.1: SeatHudBatchOverlay 1 lớp DOM, Draco nội bộ '/draco
 
   const swSrc = fs.readFileSync(path.join(rootDir, "client/public/sw.js"), "utf8");
   assert.ok(
-    swSrc.includes("masoi-assets-v4.1") && swSrc.includes("masoi-shell-v4.1") && swSrc.includes("/socket.io/"),
-    "Chốt #14: Service Worker phải tách bạch Cache-First cho GLB/WebP/Audio và Network-First cho HTML/JS"
+    swSrc.includes("masoi-assets-v4.3") && swSrc.includes("masoi-shell-v4.3") && swSrc.includes("/socket.io/"),
+    "Chốt #14: Service Worker phải tách bạch Cache-First cho GLB/WebP/Audio (v4.3) và Network-First cho HTML/JS"
   );
 
   const capConfig = JSON.parse(fs.readFileSync(path.join(rootDir, "client/capacitor.config.json"), "utf8"));
@@ -1799,6 +1811,194 @@ runScenario("50. V4.2: VoiceSessionProvider liên thông Sảnh <-> Trận, Voic
     p2pSrc.includes("maxaveragebitrate=16000") && p2pSrc.includes("usedtx=1") && p2pSrc.includes("stereo=0"),
     "p2pVoiceEngine.js phải ép chuẩn nén Opus 16kbps Mono + DTX 0 kbps khi im lặng"
   );
+});
+
+// 51. V4.3 — Nhịp Đọc Trọn MC (Full-Read Pacing) Cho Người Mới, Ghế Nóng Bot 14s/18s Không Đè Câu & Đổi Nóng Giữa Trận
+runScenario("51. V4.3: Nhịp Đọc Trọn MC không cắt lời cho người mới, Ghế Nóng Bot 14s/18s & đổi nóng room:setMcPacing (kể cả khi đã chết)", () => {
+  const wakeEstimate = estimateMcSpeechMs(
+    "Đêm đầu tiên buông xuống... Bảo Vệ ơi, thức dậy! Hãy chọn người bạn muốn bảo vệ đêm nay."
+  );
+  assert.ok(wakeEstimate >= 5800 && wakeEstimate <= 11500, `estimateMcSpeechMs phải >= 5.8s (đo được ${wakeEstimate}ms)`);
+
+  const mcEmitted = [];
+  const ioStub = {
+    to: () => ({
+      emit: (ev, payload) => {
+        if (ev === "mc:message") mcEmitted.push(payload);
+      },
+    }),
+  };
+  const ctrl = createGameController(ioStub);
+
+  // Phòng thường có Bot -> tự mặc định 'full'; phòng Turbo -> mặc định 'fast'
+  const botRoom = createRoom("pacing_host", { isTurbo: false });
+  const { player: host } = addPlayer(botRoom.code, "pacing_host", "Người Mới");
+  addBotsToRoom(botRoom.code, 5);
+  assert.equal(resolveEffectiveMcPacingMode(botRoom), "full", "Phòng có Bot không Turbo phải tự bật Nhịp Đọc Trọn");
+
+  const turboRoom = createRoom("turbo_host", { isTurbo: true });
+  addPlayer(turboRoom.code, "turbo_host", "Tốc Chiến");
+  addBotsToRoom(turboRoom.code, 5);
+  assert.equal(resolveEffectiveMcPacingMode(turboRoom), "fast", "Phòng Turbo mặc định Nhịp Nhanh");
+  deleteRoom(turboRoom.code);
+
+  // Bắt đầu Đêm 1: kiểm tra sàn thời lượng đọc câu MC > 5s (chống cắt cụt 2.6s)
+  ctrl.startGame(botRoom, { skipRoleReveal: true });
+  assert.ok(
+    ctrl.getRemainingMcFloorMs(botRoom) >= 5000,
+    "Đêm Solo phải giữ sàn thời lượng MC >= 5s để đọc hết câu gọi dậy"
+  );
+
+  // Kiểm tra Đề cử 1 Bot duy nhất ở chế độ 'full' -> Không phát trùng 2 câu, ghế nóng Bot 14 giây!
+  const bots = botRoom.players.filter((p) => p.isBot);
+  GE.startNomination(botRoom);
+  GE.nominationVote(botRoom, host.id, bots[0].id);
+  mcEmitted.length = 0;
+  ctrl.advanceCurrentPhase(botRoom); // day_nominate -> day_defense
+  assert.equal(botRoom.game.phase, "day_defense");
+  assert.equal(botRoom.game.phaseDurationSec, 14, "1 Bot bị đề cử ở chế độ Đọc Trọn phải có 14s (MC mời + Bot biện hộ trọn câu)");
+  assert.equal(
+    mcEmitted.length,
+    1,
+    "Khi chỉ có 1 bị cáo ở chế độ Đọc Trọn, không được bắn chồng 2 câu thông báo MC liên tiếp trong 1ms"
+  );
+
+  // Kiểm tra Hòa phiếu 2 Bot bị đề cử -> Bị cáo đầu 18s (2 câu MC + câu Bot), bị cáo hai 14s
+  GE.startNomination(botRoom);
+  GE.nominationVote(botRoom, host.id, bots[0].id);
+  GE.nominationVote(botRoom, bots[1].id, bots[2].id);
+  ctrl.advanceCurrentPhase(botRoom);
+  assert.equal(botRoom.game.phase, "day_defense");
+  assert.equal(botRoom.game.phaseDurationSec, 18, "Đồng phiếu 2 Bot: lượt đầu cần 18s để nghe trọn 2 câu MC + lời biện hộ Bot");
+  ctrl.advanceCurrentPhase(botRoom);
+  assert.equal(botRoom.game.phase, "day_defense");
+  assert.equal(botRoom.game.phaseDurationSec, 14, "Lượt Bot thứ 2 cần 14s");
+
+  // Người chơi Solo dù đã chết (alive = false) vẫn đổi nóng từ 'full' -> 'fast' ngay giữa trận thành công!
+  host.alive = false;
+  const toggleFast = setRoomMcPacingMode(botRoom.code, "pacing_host", "fast");
+  assert.equal(toggleFast.ok, true);
+  assert.equal(toggleFast.mcPacingMode, "fast");
+  ctrl.reapplyMcPacingLive(botRoom);
+  assert.equal(ctrl.getRemainingMcFloorMs(botRoom), 0, "Gạt sang Nhanh phải giải phóng sàn chờ MC ngay lập tức (0ms)");
+
+  ctrl.clearRoomTimer(botRoom.code);
+  deleteRoom(botRoom.code);
+});
+
+// 52. V4.3 — Bộ 48 File MP3 Giọng Nói 4 AI Bot (0% Trùng MC b5d182f3), Khớp Chữ-Tiếng 1:1 & Cô Lập Zero-Leak Sói Đêm
+runScenario("52. V4.3: Đủ 48/48 MP3 4 AI Bot (0% trùng MC b5d182f3), khớp chữ-tiếng 1:1 & cô lập Zero-Leak thì thầm Sói đêm", () => {
+  assert.equal(FORBIDDEN_MC_VOICE_ID, "b5d182f3");
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const rootDir = path.resolve(__dirname, "../..");
+
+  const manifestPath = path.join(rootDir, "client/public/audio/bots/bot_voices_manifest.json");
+  const durationsPath = path.join(rootDir, "server/botVoiceDurations.json");
+  assert.equal(fs.existsSync(manifestPath), true, "Phải có bot_voices_manifest.json");
+  assert.equal(fs.existsSync(durationsPath), true, "Phải có server/botVoiceDurations.json cho Render");
+
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  const durations = JSON.parse(fs.readFileSync(durationsPath, "utf8"));
+  assert.equal(manifest.totalClips, 48, "Manifest phải có đúng 48 câu thoại thu sẵn");
+  assert.equal(Object.keys(durations).length, 48, "Bảng thời lượng Server phải có đủ 48 khóa");
+
+  const personaIds = ["sharp_fox", "calm_owl", "bold_bear", "cautious_raven"];
+  for (const pid of personaIds) {
+    assert.ok(manifest.personas[pid], `Thiếu nhân cách ${pid}`);
+    assert.equal(manifest.personas[pid].voiceSource, "omnivoice_voice_design_non_mc");
+    const clipKeys = Object.keys(BOT_VOICE_CATALOG[pid].clips);
+    assert.equal(clipKeys.length, 12, `Mỗi nhân cách phải có đúng 12 câu (${pid})`);
+    for (const cid of clipKeys) {
+      const mp3DiskPath = path.join(rootDir, `client/public/audio/bots/${pid}/${cid}.mp3`);
+      assert.equal(fs.existsSync(mp3DiskPath), true, `Thiếu file vật lý ${pid}/${cid}.mp3`);
+      const stat = fs.statSync(mp3DiskPath);
+      assert.ok(stat.size > 40_000, `File ${pid}/${cid}.mp3 phải có âm thanh thật (> 40KB)`);
+      assert.equal(
+        manifest.personas[pid].clips[cid].text,
+        BOT_VOICE_CATALOG[pid].clips[cid].text,
+        `Nội dung chữ của ${pid}/${cid} phải khớp 100% giữa Manifest MP3 và Server Catalog`
+      );
+      assert.ok(durations[`${pid}/${cid}`] >= 3500, `Thời lượng đo thật của ${pid}/${cid} phải >= 3.5s`);
+    }
+  }
+
+  // Kiểm tra tiền tố @Tên trên bóng thoại 3D trong khi spokenText giữ nguyên 100% chữ thu sẵn
+  const sampleSpeech = pickZeroLeakBotSpeech({
+    personaId: "sharp_fox",
+    context: "day_followup",
+    hasVictim: true,
+    targetName: "Minh Tuấn",
+  });
+  assert.ok(sampleSpeech.botAudioUrl.startsWith("/audio/bots/sharp_fox/"));
+  assert.equal(sampleSpeech.botAudioUrl.includes("b5d182f3"), false);
+  if (sampleSpeech.bubbleText.startsWith("👉 @")) {
+    assert.ok(sampleSpeech.bubbleText.startsWith("👉 @Minh Tuấn: "));
+    assert.equal(sampleSpeech.bubbleText.endsWith(sampleSpeech.spokenText), true);
+  }
+
+  // KIỂM ĐỊNH CÔ LẬP ZERO-LEAK BAN ĐÊM: Bot Sói thì thầm CHỈ gửi tới Sói người thật còn sống!
+  const emittedByTarget = new Map();
+  const mockIo = {
+    to(target) {
+      return {
+        emit(ev, payload) {
+          if (!emittedByTarget.has(target)) emittedByTarget.set(target, []);
+          emittedByTarget.get(target).push({ ev, payload });
+        },
+      };
+    },
+  };
+  const ctrl = createGameController(mockIo);
+  const room = createRoom("sock_human_wolf");
+  const { player: pHumanWolf } = addPlayer(room.code, "sock_human_wolf", "Sói Người Sống");
+  const { player: pDeadWolf } = addPlayer(room.code, "sock_dead_wolf", "Sói Đã Chết");
+  const { player: pVillager } = addPlayer(room.code, "sock_villager", "Dân Thường");
+  pDeadWolf.ready = true;
+  pVillager.ready = true;
+  addBotsToRoom(room.code, 3);
+  GE.initGameState(room);
+  room.phase = "playing";
+  addSpectator(room.code, "sock_spectator", "Khán Giả Xem");
+
+  const botSeats = room.players.filter((p) => p.isBot);
+  pHumanWolf.role = "wolf";
+  pHumanWolf.alive = true;
+  pDeadWolf.role = "alpha_wolf";
+  pDeadWolf.alive = false;
+  pVillager.role = "villager";
+  pVillager.alive = true;
+  botSeats[0].role = "wolf";
+  botSeats[0].personaId = "cautious_raven";
+  botSeats[1].role = "seer";
+  botSeats[2].role = "guard";
+  room.game.phase = "night_wolf";
+  room.game.wolfPicks = {};
+
+  flushBotInteractionsForCurrentPhase(room, ctrl, { includeDayActions: false, io: mockIo });
+
+  const hwWolfChats = (emittedByTarget.get("sock_human_wolf") || []).filter((e) => e.ev === "wolf:chat");
+  const vilWolfChats = (emittedByTarget.get("sock_villager") || []).filter((e) => e.ev === "wolf:chat");
+  const deadWolfChats = (emittedByTarget.get("sock_dead_wolf") || []).filter((e) => e.ev === "wolf:chat");
+  const specWolfChats = (emittedByTarget.get("sock_spectator") || []).filter((e) => e.ev === "wolf:chat");
+  const roomBroadcastWolfChats = (emittedByTarget.get(room.code) || []).filter((e) => e.ev === "wolf:chat");
+
+  assert.equal(hwWolfChats.length, 1, "Đồng bọn Sói người thật còn sống phải nhận được mật đàm + giọng thì thầm của Bot Sói");
+  assert.ok(hwWolfChats[0].payload.botAudioUrl.startsWith("/audio/bots/cautious_raven/wolf_"));
+  assert.equal(vilWolfChats.length, 0, "ZERO-LEAK: Dân làng tuyệt đối nhận 0 sự kiện wolf:chat");
+  assert.equal(deadWolfChats.length, 0, "ZERO-LEAK: Người đã chết nhận 0 sự kiện wolf:chat trực tiếp");
+  assert.equal(specWolfChats.length, 0, "ZERO-LEAK: Khán giả nhận 0 sự kiện wolf:chat");
+  assert.equal(roomBroadcastWolfChats.length, 0, "ZERO-LEAK: Tuyệt đối cấm broadcast wolf:chat ra room.code");
+
+  // Kiểm tra tích hợp Client Queue Ưu tiên 3 tầng & Nút Gạt HUD
+  const roomSrc = fs.readFileSync(path.join(rootDir, "client/src/components/Room.jsx"), "utf8");
+  const playingSrc = fs.readFileSync(path.join(rootDir, "client/src/components/PlayingView.jsx"), "utf8");
+  const botPlayerSrc = fs.readFileSync(path.join(rootDir, "client/src/utils/botVoicePlayer.js"), "utf8");
+  assert.ok(roomSrc.includes("mcPlayQueueRef") && roomSrc.includes("drainMcQueue"), "Room.jsx phải tuần tự hóa hàng đợi đọc MC không tự ngắt câu");
+  assert.ok(playingSrc.includes("useBotVoicePlayer") && playingSrc.includes("🐢 Đọc Trọn") && playingSrc.includes("🤖🔊"));
+  assert.ok(botPlayerSrc.includes("POST_MC_BREATH_MS") && !botPlayerSrc.includes("speechSynthesis"));
+
+  ctrl.clearRoomTimer(room.code);
+  deleteRoom(room.code);
 });
 
 const totalMs = (performance.now() - startTime).toFixed(1);
