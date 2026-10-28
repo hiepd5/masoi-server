@@ -203,7 +203,13 @@ async function checkLivekitHealth(force = false) {
       identity: "srv_health_probe",
       ttl: "30s",
     });
-    probeToken.addGrant({ roomJoin: false });
+    probeToken.addGrant({
+      roomJoin: true,
+      room: "_srv_health_probe",
+      canPublish: false,
+      canPublishData: false,
+      canSubscribe: false,
+    });
     probeJwt = await probeToken.toJwt();
   } catch (err) {
     livekitHealthCache = {
