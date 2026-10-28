@@ -1788,15 +1788,15 @@ runScenario("49. V4.2: voiceRelayHub P2P Zero-Leak (khóa role_reveal, cô lập
   assert.ok(serverIndexSrc.includes("/rtc/validate?access_token="), "checkLivekitHealth phải xác thực qua /rtc/validate");
 });
 
-// 50. V4.2 — Liên Thông Voice Cấp Phòng (Sảnh <-> Trận <-> Ván Mới), Nút Nổi 3D, Auto-Ducking 0.6x & Opus 16kbps P2P
-runScenario("50. V4.2: VoiceSessionProvider liên thông Sảnh <-> Trận, VoiceQuickMicPill 3D, Auto-Ducking 0.6x & Opus 16kbps", () => {
+// 50. V4.3.2 — Thuần LiveKit SFU Cấp Phòng (Sảnh <-> Trận <-> Ván Mới), Khóa Cứng Bộ Đàm Giữ-Để-Nói (PTT 14kbps + 0 kbps nhả tay) & Auto-Ducking 0.6x
+runScenario("50. Thuần LiveKit SFU: VoiceSessionProvider liên thông, Khóa Bộ Đàm PTT (14kbps / 0kbps nhả tay), Auto-Ducking 0.6x & Tạm nghỉ Recap", () => {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const rootDir = path.resolve(__dirname, "../..");
 
   const roomSrc = fs.readFileSync(path.join(rootDir, "client/src/components/Room.jsx"), "utf8");
   const playingSrc = fs.readFileSync(path.join(rootDir, "client/src/components/PlayingView.jsx"), "utf8");
   const voiceRoomSrc = fs.readFileSync(path.join(rootDir, "client/src/components/VoiceRoom.jsx"), "utf8");
-  const p2pSrc = fs.readFileSync(path.join(rootDir, "client/src/utils/p2pVoiceEngine.js"), "utf8");
+  const serverIndexSrc = fs.readFileSync(path.join(rootDir, "server/index.js"), "utf8");
 
   assert.ok(roomSrc.includes("<VoiceSessionProvider"), "Room.jsx phải bọc VoiceSessionProvider ở gốc giữ kết nối Sảnh <-> Trận");
   assert.ok(roomSrc.includes("mcDuckingActive={isMcSpeakingNow}"), "Room.jsx phải truyền trạng thái MC đang đọc để Auto-Ducking");
@@ -1806,14 +1806,14 @@ runScenario("50. V4.2: VoiceSessionProvider liên thông Sảnh <-> Trận, Voic
   assert.ok(playingSrc.includes("voice-stage-floating-anchor"), "Nút nổi Voice phải neo ở góc sân khấu không che nút Camera");
 
   assert.ok(voiceRoomSrc.includes("audio={false}"), "LiveKitRoom phải truyền audio={false} để máy không cắm Mic vẫn vào Chỉ Nghe mượt mà");
+  assert.ok(voiceRoomSrc.includes("connect={!isSuppressedForRecap && !isSoloBotMatch}"), "LiveKitRoom phải tạm ngắt kết nối SFU khi xem Phim Kể Chuyện & Đấu Solo Bot để tiết kiệm phút Quota");
+  assert.ok(voiceRoomSrc.includes("key={roomInstanceKey}"), "LiveKitRoom phải gắn key làm mới phiên khi nâng quyền nói sang ván mới");
   assert.ok(voiceRoomSrc.includes('nightDayPhase === "role_reveal"'), "VoiceRoom phải khóa Mic trong 6s nhận vai định mệnh");
   assert.ok(voiceRoomSrc.includes("mcDuckingActive ? 0.6 : 1"), "VoiceRoom phải tự động hạ âm lượng về 0.6x (-40%) khi MC đọc");
-  assert.ok(voiceRoomSrc.includes('setEngineMode("p2p")'), "VoiceRoom phải tự động chuyển sang P2P Mesh khi LiveKit lỗi/hết hạn mức");
-
-  assert.ok(
-    p2pSrc.includes("maxaveragebitrate=16000") && p2pSrc.includes("usedtx=1") && p2pSrc.includes("stereo=0"),
-    "p2pVoiceEngine.js phải ép chuẩn nén Opus 16kbps Mono + DTX 0 kbps khi im lặng"
-  );
+  assert.ok(voiceRoomSrc.includes('const inputMode = "ptt"'), "VoiceRoom phải khóa cứng chế độ Bộ Đàm Giữ-Để-Nói (PTT)");
+  assert.ok(voiceRoomSrc.includes("maxBitrate: 14_000") && voiceRoomSrc.includes("dtx: true"), "VoiceRoom phải ép chuẩn nén Opus 14kbps Mono + DTX 0 kbps");
+  assert.equal(voiceRoomSrc.includes("useP2PVoiceMesh"), false, "VoiceRoom thuần LiveKit không được gọi nhảy sang P2P Mesh");
+  assert.ok(serverIndexSrc.includes('inputPolicy: "ptt_only"'), "Server /api/voice-status & livekit:token phải khai báo chính sách ptt_only");
 });
 
 // 51. V4.3 — Nhịp Đọc Trọn MC (Full-Read Pacing) Cho Người Mới, Ghế Nóng Bot 14s/18s Không Đè Câu & Đổi Nóng Giữa Trận

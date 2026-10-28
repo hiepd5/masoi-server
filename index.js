@@ -402,7 +402,7 @@ app.get("/api/tts-status", async (req, res) => {
   return res.json(getVoiceEngineStatus());
 });
 
-// Chẩn đoán công khai trạng thái Kênh Thoại Đôi (LiveKit Cloud SFU + P2P Mesh Fallback — 0% lộ khóa bí mật)
+// Chẩn đoán công khai trạng thái Kênh Thoại Thuần LiveKit Cloud SFU (Chế độ Bộ Đàm Giữ-Để-Nói — 0% lộ khóa bí mật)
 app.get("/api/voice-status", async (req, res) => {
   const clientIp = extractClientIp(req);
   const allowForce =
@@ -410,13 +410,11 @@ app.get("/api/voice-status", async (req, res) => {
   const health = await checkLivekitHealth(allowForce);
   return res.json({
     ok: true,
-    recommendedMode: health.ok ? "livekit" : "p2p",
+    recommendedMode: "livekit",
+    inputPolicy: "ptt_only",
     livekitConfigured: Boolean(LIVEKIT_API_KEY && LIVEKIT_API_SECRET && LIVEKIT_URL),
     livekitHealthy: Boolean(health.ok),
     livekitStatus: health.reason || "UNKNOWN",
-    p2pFallbackReady: true,
-    stunCount: DEFAULT_STUN_SERVERS.length,
-    relay: getVoiceRelayRuntimeStats(),
   });
 });
 
@@ -1315,35 +1313,22 @@ io.on("connection", (socket) => {
       : null;
     if (!player && !spectator) return cb?.({ ok: false, error: "Không tìm thấy người chơi." });
 
-    // Khán giả (Spectator) & Người đã chết bị khóa cứng canPublish: false trên cả SFU lẫn P2P!
+    // Khán giả (Spectator) & Người đã chết bị khóa cứng canPublish: false ngay từ chữ ký JWT LiveKit SFU!
     const canPublishAudio = Boolean(player && player.alive !== false);
     const identity = player ? player.id : `spec_${spectator.id}`;
     const displayName = player ? player.name : `👀 ${spectator.name}`;
 
     if (!LIVEKIT_API_KEY || !LIVEKIT_API_SECRET || !LIVEKIT_URL) {
       return cb?.({
-        ok: true,
-        mode: "p2p",
-        fallbackReason: "LIVEKIT_NOT_CONFIGURED",
-        canPublish: canPublishAudio,
-        identity,
-        displayName,
-        iceServers: DEFAULT_STUN_SERVERS,
+        ok: false,
+        mode: "livekit",
+        reason: "LIVEKIT_NOT_CONFIGURED",
+        error: "Máy chủ chưa cấu hình đủ khóa LiveKit Cloud (LIVEKIT_URL / API_KEY / API_SECRET).",
       });
     }
 
-    const health = await checkLivekitHealth();
-    if (!health.ok) {
-      return cb?.({
-        ok: true,
-        mode: "p2p",
-        fallbackReason: health.reason || "LIVEKIT_QUOTA_EXCEEDED",
-        canPublish: canPublishAudio,
-        identity,
-        displayName,
-        iceServers: DEFAULT_STUN_SERVERS,
-      });
-    }
+    // Hâm nóng chẩn đoán ngầm (không chặn luồng ký JWT < 1ms để trình duyệt kết nối thẳng cụm Edge LiveKit)
+    checkLivekitHealth(false).catch(() => {});
 
     try {
       const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
@@ -1361,22 +1346,20 @@ io.on("connection", (socket) => {
       cb?.({
         ok: true,
         mode: "livekit",
+        inputPolicy: "ptt_only",
         token: await at.toJwt(),
         url: LIVEKIT_URL,
         canPublish: canPublishAudio,
         identity,
         displayName,
-        iceServers: DEFAULT_STUN_SERVERS,
+        healthStatus: livekitHealthCache.reason || "healthy",
       });
     } catch {
       cb?.({
-        ok: true,
-        mode: "p2p",
-        fallbackReason: "LIVEKIT_SIGN_ERROR",
-        canPublish: canPublishAudio,
-        identity,
-        displayName,
-        iceServers: DEFAULT_STUN_SERVERS,
+        ok: false,
+        mode: "livekit",
+        reason: "LIVEKIT_SIGN_ERROR",
+        error: "Không thể ký khóa phiên LiveKit lúc này.",
       });
     }
   });
