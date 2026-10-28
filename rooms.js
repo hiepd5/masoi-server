@@ -621,6 +621,18 @@ export function addBotsToRoom(code, count = 1, { syncRolesMode = null } = {}) {
     room.rolesConfig = useV33
       ? generateExpandedV33Roles(Math.max(6, room.players.length))
       : generateDefaultRoles(Math.max(6, room.players.length));
+  } else {
+    // preserve (Mặc định): Bảo toàn 100% số Sói & Vai đặc biệt Chủ phòng đã chọn, chỉ tự bù Nông Dân nếu vượt tổng bài
+    const currentCfg = room.rolesConfig || generateDefaultRoles(Math.max(6, room.players.length));
+    const totalRolesNow = Object.values(currentCfg).reduce((s, v) => s + (Number(v) || 0), 0);
+    if (room.players.length > totalRolesNow) {
+      room.rolesConfig = {
+        ...currentCfg,
+        villager: (Number(currentCfg.villager) || 0) + (room.players.length - totalRolesNow),
+      };
+    } else if (!room.rolesConfig) {
+      room.rolesConfig = currentCfg;
+    }
   }
 
   const realHumans = room.players.filter((p) => !p.isBot);
@@ -636,7 +648,27 @@ export function addBotsToRoom(code, count = 1, { syncRolesMode = null } = {}) {
   return { ok: true, room, added: canAdd, total: room.players.length };
 }
 
-export function clearBotsFromRoom(code, { syncRoles = true } = {}) {
+export function removeBotsFromRoom(code, count = 1) {
+  const room = getRoom(code);
+  if (!room) return { error: "Phòng không tồn tại." };
+  if (room.phase !== "lobby") {
+    return { error: "Hãy về sảnh chờ trước khi bớt AI Bot." };
+  }
+  const wantRemove = Math.max(1, Math.min(18, Number(count) || 1));
+  let removed = 0;
+  for (let i = room.players.length - 1; i >= 0 && removed < wantRemove; i--) {
+    if (room.players[i]?.isBot) {
+      room.players.splice(i, 1);
+      removed += 1;
+    }
+  }
+  if (removed > 0) {
+    reindexSeats(room);
+  }
+  return { ok: true, room, removed, total: room.players.length };
+}
+
+export function clearBotsFromRoom(code, { syncRoles = false } = {}) {
   const room = getRoom(code);
   if (!room) return { error: "Phòng không tồn tại." };
   if (room.phase !== "lobby") {
@@ -843,7 +875,21 @@ export function setRolesConfig(code, requesterSocketId, newConfig) {
   if (!newConfig || typeof newConfig !== "object") {
     return { error: "Cấu hình vai trò không hợp lệ." };
   }
-  room.rolesConfig = newConfig;
+  const sanitized = {};
+  let totalSanitized = 0;
+  for (const rk of Object.keys(ROLE_LABELS)) {
+    const val = Math.max(0, Math.min(18, Math.floor(Number(newConfig[rk]) || 0)));
+    sanitized[rk] = val;
+    totalSanitized += val;
+  }
+  if (totalSanitized > 18) {
+    return { error: "Tổng số vai trò không được vượt quá 18 người." };
+  }
+  const totalWolves = (sanitized.wolf || 0) + (sanitized.alpha_wolf || 0);
+  if (totalWolves < 1) {
+    return { error: "Bàn chơi bắt buộc phải có ít nhất 1 Ma Sói hoặc Sói Đầu Đàn." };
+  }
+  room.rolesConfig = sanitized;
   if (room.soloPracticeRole && !(Number(room.rolesConfig[room.soloPracticeRole]) > 0)) {
     room.soloPracticeRole = null;
   }
@@ -1242,6 +1288,7 @@ export function publicRoomView(room, forSocketId) {
     botCount: room.players.length - realHumans.length,
     spectatorCount: (room.spectators || []).filter((s) => s.connected).length,
     isSpectator: false,
+    mySessionToken: me?.sessionToken || undefined,
     serverGoldenHour: getVietnamGoldenHourInfo(),
     soloPracticeRole: realHumans.length === 1 ? room.soloPracticeRole || null : null,
     scenePresetId: room.scenePresetId || "nordic_village_v3",
@@ -1378,5 +1425,6 @@ export function publicSpectatorView(room, forSocketId) {
     mySpectatorId: spec?.id || null,
     mySpectatorName: spec?.name || "Khán giả",
     spectatorSessionToken: spec?.sessionToken || undefined,
+    mySessionToken: spec?.sessionToken || undefined,
   };
 }

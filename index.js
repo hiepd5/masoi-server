@@ -23,6 +23,7 @@ import {
   setRoomMcPacingMode,
   setSoloPracticeRole,
   addBotsToRoom,
+  removeBotsFromRoom,
   clearBotsFromRoom,
   getPublicRoomsList,
   addLobbyMessage,
@@ -1154,10 +1155,17 @@ io.on("connection", (socket) => {
     }
 
     if (action === "clear") {
-      const res = clearBotsFromRoom(code, { syncRoles: true });
+      const res = clearBotsFromRoom(code, { syncRoles: false });
       if (res.error) return cb?.({ ok: false, error: res.error });
       broadcastRoom(res.room);
       return cb?.({ ok: true, total: res.total });
+    }
+
+    if (action === "remove") {
+      const res = removeBotsFromRoom(code, count);
+      if (res.error) return cb?.({ ok: false, error: res.error });
+      broadcastRoom(res.room);
+      return cb?.({ ok: true, removed: res.removed, total: res.total });
     }
 
     if (action === "fill_v33_8") {
@@ -1165,7 +1173,7 @@ io.on("connection", (socket) => {
       const targetSeats = Math.max(8, realHumans);
       room.rolesConfig = generateExpandedV33Roles(targetSeats);
       const needed = Math.max(0, targetSeats - room.players.length);
-      const res = addBotsToRoom(code, needed);
+      const res = needed > 0 ? addBotsToRoom(code, needed, { syncRolesMode: "preserve" }) : { room, added: 0, total: room.players.length };
       if (res.error) return cb?.({ ok: false, error: res.error });
       broadcastRoom(res.room);
       return cb?.({ ok: true, added: res.added, total: res.total });
@@ -1176,15 +1184,26 @@ io.on("connection", (socket) => {
         (s, v) => s + (Number(v) || 0),
         0
       );
-      const targetSeats = Math.max(6, totalRoles);
+      const targetSeats = Math.min(18, Math.max(6, totalRoles));
+      if (room.players.length > targetSeats) {
+        const excess = room.players.length - targetSeats;
+        const res = removeBotsFromRoom(code, excess);
+        if (res.error) return cb?.({ ok: false, error: res.error });
+        broadcastRoom(res.room);
+        return cb?.({ ok: true, removed: res.removed, total: res.total });
+      }
       const needed = Math.max(0, targetSeats - room.players.length);
-      const res = addBotsToRoom(code, needed);
+      if (needed === 0) {
+        broadcastRoom(room);
+        return cb?.({ ok: true, added: 0, total: room.players.length });
+      }
+      const res = addBotsToRoom(code, needed, { syncRolesMode: "preserve" });
       if (res.error) return cb?.({ ok: false, error: res.error });
       broadcastRoom(res.room);
       return cb?.({ ok: true, added: res.added, total: res.total });
     }
 
-    const res = addBotsToRoom(code, count, { syncRolesMode: "match" });
+    const res = addBotsToRoom(code, count, { syncRolesMode: "preserve" });
     if (res.error) return cb?.({ ok: false, error: res.error });
     broadcastRoom(res.room);
     cb?.({ ok: true, added: res.added, total: res.total });

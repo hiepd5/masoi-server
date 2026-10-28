@@ -114,7 +114,8 @@ export function initGameState(room) {
     nightDeaths: [], // playerId chết đêm qua (để công bố)
 
     // Trạng thái nhân vật đặc biệt
-    toughGuyPoisonedDay: null, // Ngày Người Cứng Cỏi bị cắn (đêm sau mới chết)
+    toughGuyPoisonedDay: null, // Ngày Người Cứng Cỏi bị cắn (tương thích ngược)
+    toughGuyWoundedById: {}, // { [playerId]: dayNumber } — Hỗ trợ chuẩn xác >= 2 Người Cứng Cỏi cùng bàn
     mayorRevealedId: null, // ID Trưởng Làng đã giơ Quyền Trượng công bố (phiếu x2)
     hunterUsedShot: false, // Thợ Săn đã bóp cò trả thù chưa
     hunterPendingId: null, // ID Thợ Săn vừa ngã xuống đang chờ bắn 15s
@@ -740,14 +741,27 @@ export function resolveNightDeaths(room) {
   const g = room.game;
   const deaths = new Set();
 
-  // Kiểm tra Người Cứng Cỏi (tough_guy) bị cắn từ đêm trước -> đến đêm nay chết
-  if (g.toughGuyPoisonedDay && g.toughGuyPoisonedDay < g.dayNumber) {
+  // Kiểm tra Người Cứng Cỏi (tough_guy) bị cắn từ đêm trước -> đến đêm nay chết (hỗ trợ chuẩn xác >= 2 tough_guy)
+  if (!g.toughGuyWoundedById || typeof g.toughGuyWoundedById !== "object") {
+    g.toughGuyWoundedById = {};
+  }
+  const woundedEntries = Object.entries(g.toughGuyWoundedById);
+  if (woundedEntries.length > 0) {
+    for (const [tgId, woundedDay] of woundedEntries) {
+      if (woundedDay && woundedDay < g.dayNumber) {
+        const tgPlayer = getPlayer(room, tgId);
+        if (tgPlayer && tgPlayer.alive && tgPlayer.role === "tough_guy") {
+          deaths.add(tgPlayer.id);
+        }
+        delete g.toughGuyWoundedById[tgId];
+      }
+    }
+  } else if (g.toughGuyPoisonedDay && g.toughGuyPoisonedDay < g.dayNumber) {
     const toughGuy = room.players.find((p) => p.role === "tough_guy" && p.alive);
     if (toughGuy) {
       deaths.add(toughGuy.id);
-      // BUG C FIX: KHÔNG push history ở đây vì forEach bên dưới đã xử lý.
-      // Push ở đây sẽ gây duplicate "death" event trong Recap.
     }
+    g.toughGuyPoisonedDay = null;
   }
 
   const guardPlayer = room.players.find((p) => p.role === "guard");
@@ -786,6 +800,9 @@ export function resolveNightDeaths(room) {
       // Sói Đầu Đàn kích hoạt Huyết Nguyệt Đồng Hóa: biến con mồi thành Sói thay vì chết!
       g.alphaUsedConvert = true;
       g.alphaConvertTonight = false;
+      if (g.toughGuyWoundedById?.[victim.id]) {
+        delete g.toughGuyWoundedById[victim.id];
+      }
       victim.role = "wolf";
       g.history.push({
         type: "alpha_converted",
@@ -822,8 +839,9 @@ export function resolveNightDeaths(room) {
         caption: `🩸 Huyết nguyền bùng cháy! ${victim.name} không chết sau cú cắn mà thức tỉnh thành Ma Sói mới!`,
       });
     } else if (victim?.role === "tough_guy") {
-      // Người Cứng Cỏi: Bị Sói cắn -> Không chết ngay đêm nay, đánh dấu để đêm sau chết
-      if (!g.toughGuyPoisonedDay) {
+      // Người Cứng Cỏi: Bị Sói cắn lần đầu -> Không chết ngay đêm nay, đánh dấu riêng theo ID để đêm sau chết
+      if (!g.toughGuyWoundedById?.[victim.id]) {
+        g.toughGuyWoundedById[victim.id] = g.dayNumber;
         g.toughGuyPoisonedDay = g.dayNumber;
         g.history.push({
           type: "tough_guy_endured",
@@ -840,6 +858,8 @@ export function resolveNightDeaths(room) {
           targetRole: "tough_guy",
           caption: `💪 ${victim.name} nghiến răng chịu đựng vết cắn sâu của Sói, gồng mình trụ vững đón bình minh!`,
         });
+      } else {
+        deaths.add(g.wolfVictimId);
       }
     } else {
       deaths.add(g.wolfVictimId);

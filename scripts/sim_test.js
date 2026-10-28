@@ -19,7 +19,10 @@ import {
   setRoomMcPacingMode,
   setSoloPracticeRole,
   setPlayerCitizenModel,
+  setRolesConfig,
   addBotsToRoom,
+  removeBotsFromRoom,
+  clearBotsFromRoom,
   getPublicRoomsList,
   getRoom,
   deleteRoom,
@@ -1999,6 +2002,114 @@ runScenario("52. V4.3: Đủ 48/48 MP3 4 AI Bot (0% trùng MC b5d182f3), khớp 
 
   ctrl.clearRoomTimer(room.code);
   deleteRoom(room.code);
+});
+
+// 53. LEVEL 3.4 — Mở Khóa Chọn Sói/Người Không Ghi Đè Khi Thêm/Xóa Bot, Đa Tough Guy, Reset Ván Mới & Cổng mySessionToken
+runScenario("53. Level 3.4: Bảo toàn cấu hình Sói khi thêm/bớt/xóa Bot, đa Tough Guy (>=2), Reset state ván 2 & mySessionToken", () => {
+  // 1) Kiểm tra bảo toàn cấu hình Sói & Vai đặc biệt khi thêm / bớt / xóa Bot + mySessionToken
+  const room = createRoom("host_lvl34");
+  const { player: host } = addPlayer(room.code, "host_lvl34", "Chủ Phòng Test");
+
+  const customCfg = {
+    wolf: 2,
+    alpha_wolf: 1,
+    seer: 1,
+    guard: 1,
+    witch: 1,
+    hunter: 0,
+    cupid: 1,
+    mayor: 0,
+    tanner: 1,
+    cursed: 0,
+    tough_guy: 2,
+    villager: 0, // Tổng = 10 vai (3 Sói, 2 Tough Guy)
+  };
+  const cfgRes = setRolesConfig(room.code, "host_lvl34", customCfg);
+  assert.equal(cfgRes.ok, true);
+  assert.equal(room.rolesConfig.wolf, 2);
+  assert.equal(room.rolesConfig.alpha_wolf, 1);
+  assert.equal(room.rolesConfig.tough_guy, 2);
+
+  // Bấm +1 Bot liên tiếp & thêm đủ 9 Bot -> giữ nguyên 100% số Sói (2 + 1 = 3) và 2 Tough Guy!
+  addBotsToRoom(room.code, 1);
+  assert.equal(room.rolesConfig.wolf, 2, "Thêm +1 Bot không được xóa đè số Sói tùy chỉnh");
+  assert.equal(room.rolesConfig.alpha_wolf, 1, "Thêm +1 Bot không được xóa đè Sói Đầu Đàn");
+  assert.equal(room.rolesConfig.tough_guy, 2);
+
+  addBotsToRoom(room.code, 8); // Tổng ghế = 10
+  assert.equal(room.players.length, 10);
+  assert.equal(room.rolesConfig.villager, 0, "Khi ghế <= tổng vai (10), không tự cộng thừa Nông Dân");
+
+  // Thêm vượt lên ghế 11 -> tự bù đúng +1 Nông Dân, bảo toàn nguyên vẹn 3 Sói!
+  addBotsToRoom(room.code, 1);
+  assert.equal(room.players.length, 11);
+  assert.equal(room.rolesConfig.wolf, 2);
+  assert.equal(room.rolesConfig.alpha_wolf, 1);
+  assert.equal(room.rolesConfig.villager, 1, "Khi thêm Bot vượt số bài (11 > 10), chỉ tự bù đúng +1 Nông Dân");
+
+  // Bấm -1 Bot & Xóa toàn bộ Bot -> cấu hình 3 Sói vẫn giữ nguyên 100%!
+  const rmOne = removeBotsFromRoom(room.code, 1);
+  assert.equal(rmOne.ok, true);
+  assert.equal(room.players.length, 10);
+  assert.equal(room.rolesConfig.wolf, 2);
+  assert.equal(room.rolesConfig.alpha_wolf, 1);
+
+  const clrRes = clearBotsFromRoom(room.code);
+  assert.equal(clrRes.ok, true);
+  assert.equal(room.players.length, 1);
+  assert.equal(room.rolesConfig.wolf, 2, "Xóa Bot phải bảo toàn cấu hình Sói của Chủ phòng");
+  assert.equal(room.rolesConfig.alpha_wolf, 1);
+
+  // Chặn đặt 0 Sói
+  const zeroWolfRes = setRolesConfig(room.code, "host_lvl34", { ...customCfg, wolf: 0, alpha_wolf: 0, villager: 5 });
+  assert.ok(zeroWolfRes.error, "setRolesConfig phải từ chối cấu hình 0 Sói");
+
+  // Kiểm tra mySessionToken cấp gốc trong publicRoomView
+  const pubView = publicRoomView(room, "host_lvl34");
+  assert.equal(pubView.mySessionToken, host.sessionToken, "publicRoomView phải có mySessionToken cấp gốc cho /api/tts");
+
+  // 2) Kiểm tra Đa Tough Guy (2 Người Cứng Cỏi bị Sói cắn ở 2 đêm liên tiếp)
+  addBotsToRoom(room.code, 9);
+  GE.initGameState(room);
+  room.phase = "playing";
+  const allP = room.players;
+  allP.forEach((p, idx) => {
+    p.alive = true;
+    p.role = idx === 0 ? "wolf" : idx === 1 ? "tough_guy" : idx === 2 ? "tough_guy" : "villager";
+  });
+  const tg1 = allP[1];
+  const tg2 = allP[2];
+
+  // Đêm 1: Sói cắn tg1 -> tg1 gồng mình sống qua Đêm 1
+  room.game.dayNumber = 1;
+  room.game.wolfVictimId = tg1.id;
+  GE.resolveNightDeaths(room);
+  assert.equal(tg1.alive, true, "Đêm 1: Tough Guy #1 phải sống sót nhờ nội tại");
+  assert.equal(tg2.alive, true);
+
+  // Đêm 2: tg1 gục ngã do vết thương Đêm 1, ĐỒNG THỜI Sói cắn sang tg2 -> tg2 vẫn phải kích hoạt nội tại sống qua Đêm 2!
+  room.game.dayNumber = 2;
+  room.game.wolfVictimId = tg2.id;
+  GE.resolveNightDeaths(room);
+  assert.equal(tg1.alive, false, "Đêm 2: Tough Guy #1 phải hy sinh do vết thương từ Đêm 1");
+  assert.equal(tg2.alive, true, "Đêm 2: Tough Guy #2 bị cắn lần đầu vẫn phải sống sót nhờ theo dõi riêng theo ID!");
+
+  // Đêm 3: tg2 hy sinh đúng hẹn
+  room.game.dayNumber = 3;
+  room.game.wolfVictimId = null;
+  GE.resolveNightDeaths(room);
+  assert.equal(tg2.alive, false, "Đêm 3: Tough Guy #2 phải hy sinh do vết thương từ Đêm 2");
+
+  deleteRoom(room.code);
+
+  // 3) Kiểm tra mã nguồn Room.jsx & PlayingView.jsx
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const rootDir = path.resolve(__dirname, "../..");
+  const roomSrc = fs.readFileSync(path.join(rootDir, "client/src/components/Room.jsx"), "utf8");
+  const playingSrc = fs.readFileSync(path.join(rootDir, "client/src/components/PlayingView.jsx"), "utf8");
+  assert.ok(roomSrc.includes("handleSetTableScale") && roomSrc.includes("handleChangeTotalWolves"), "Room.jsx phải có bộ chỉnh nhanh Quy Mô Bàn & Số Sói");
+  assert.equal(roomSrc.includes("else {\n    const me ="), false, "Room.jsx tuyệt đối không được khai báo lùi const me trong nhánh else");
+  assert.ok(playingSrc.includes("setSeerHistory([])") && playingSrc.includes('handleGhostBet("lovers")'), "PlayingView.jsx phải reset sạch state ván mới và mở đủ 4 phe Cược Cõi Âm");
 });
 
 const totalMs = (performance.now() - startTime).toFixed(1);
