@@ -58,6 +58,16 @@ import {
   DEFAULT_VOICE_ID,
   DEFAULT_TTS_SPEED,
 } from "../storyVoiceEngine.js";
+import {
+  DEFAULT_STUN_SERVERS,
+  resolveVoiceParticipant,
+  canListenerHearSpeakerInRoom,
+  canSpeakerTransmitNow,
+  isValidSignalPayload,
+  registerVoiceRelaySocketHandlers,
+  removeSocketFromVoiceRelay,
+  getVoiceRelayRuntimeStats,
+} from "../voiceRelayHub.js";
 
 const startTime = performance.now();
 const results = [];
@@ -1654,6 +1664,141 @@ runScenario("48. V4.1: SeatHudBatchOverlay 1 lớp DOM, Draco nội bộ '/draco
 
   const runtimeEnvSrc = fs.readFileSync(path.join(rootDir, "client/src/config/runtimeEnv.js"), "utf8");
   assert.ok(runtimeEnvSrc.includes("isNativeCapacitor") && runtimeEnvSrc.includes("GRAPHICS_PRESETS"));
+});
+
+// 49. V4.2 — Trạm Tín Hiệu P2P Mesh Zero-Leak (Khóa role_reveal, Cô Lập Sói Ban Đêm, Trần SDP <= 16KB & /api/voice-status 0 Lộ Khóa)
+runScenario("49. V4.2: voiceRelayHub P2P Zero-Leak (khóa role_reveal, cô lập Bầy Sói ban đêm, trần SDP <= 16KB & /api/voice-status)", () => {
+  assert.ok(Array.isArray(DEFAULT_STUN_SERVERS) && DEFAULT_STUN_SERVERS.length >= 2);
+  assert.equal(isValidSignalPayload({ type: "offer", sdp: "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n" }), true);
+  assert.equal(isValidSignalPayload({ type: "evil", sdp: "x" }), false);
+  assert.equal(isValidSignalPayload({ type: "offer", sdp: "A".repeat(17_000) }), false, "Phải chặn gói SDP vượt 16KB");
+
+  const room = createRoom("vr_wolf_sock");
+  const { player: pWolf } = addPlayer(room.code, "vr_wolf_sock", "Sói Một");
+  const { player: pAlpha } = addPlayer(room.code, "vr_alpha_sock", "Sói Đầu Đàn");
+  const { player: pVil } = addPlayer(room.code, "vr_vil_sock", "Dân Làng");
+  addBotsToRoom(room.code, 3);
+
+  const makeMockSocket = (id, playerId) => {
+    const handlers = {};
+    return {
+      id,
+      data: { roomCode: room.code, playerId },
+      handlers,
+      on(ev, fn) {
+        handlers[ev] = fn;
+      },
+    };
+  };
+
+  const emitted = new Map();
+  const mockSocketsMap = new Map();
+  const sWolf = makeMockSocket("vr_wolf_sock", pWolf.id);
+  const sAlpha = makeMockSocket("vr_alpha_sock", pAlpha.id);
+  const sVil = makeMockSocket("vr_vil_sock", pVil.id);
+  mockSocketsMap.set(sWolf.id, sWolf);
+  mockSocketsMap.set(sAlpha.id, sAlpha);
+  mockSocketsMap.set(sVil.id, sVil);
+
+  const mockIo = {
+    sockets: { sockets: mockSocketsMap },
+    to(sockId) {
+      return {
+        emit(ev, payload) {
+          if (!emitted.has(sockId)) emitted.set(sockId, []);
+          emitted.get(sockId).push({ ev, payload });
+        },
+      };
+    },
+  };
+
+  registerVoiceRelaySocketHandlers(mockIo, sWolf, getRoom);
+  registerVoiceRelaySocketHandlers(mockIo, sAlpha, getRoom);
+  registerVoiceRelaySocketHandlers(mockIo, sVil, getRoom);
+
+  let joinWolfRes = null;
+  sWolf.handlers["voice:join"]({}, (r) => (joinWolfRes = r));
+  sAlpha.handlers["voice:join"]({}, () => {});
+  sVil.handlers["voice:join"]({}, () => {});
+  assert.equal(joinWolfRes?.ok, true);
+  assert.equal(getVoiceRelayRuntimeStats().activeP2pPeers, 3);
+
+  // Vào trận: gán vai Sói, Sói Đầu Đàn & Dân Làng
+  GE.initGameState(room);
+  room.phase = "playing";
+  pWolf.role = "wolf";
+  pAlpha.role = "alpha_wolf";
+  pVil.role = "villager";
+
+  // 1) Pha role_reveal (6s lật bài): khóa im lặng 100%
+  room.game.phase = "role_reveal";
+  const wolfActor = resolveVoiceParticipant(room, sWolf);
+  const alphaActor = resolveVoiceParticipant(room, sAlpha);
+  const vilActor = resolveVoiceParticipant(room, sVil);
+  assert.equal(canSpeakerTransmitNow(room, wolfActor), false, "role_reveal phải khóa Mic cả Sói");
+  assert.equal(canListenerHearSpeakerInRoom(room, alphaActor, pWolf.id), false, "role_reveal phải chặn nghe 100%");
+
+  // 2) Pha night_wolf: Sói nói -> Sói Đầu Đàn nhận speakingIds, Dân Làng nhận mảng rỗng [] (Zero-Leak!)
+  room.game.phase = "night_wolf";
+  assert.equal(canSpeakerTransmitNow(room, wolfActor), true);
+  assert.equal(canSpeakerTransmitNow(room, vilActor), false);
+  assert.equal(canListenerHearSpeakerInRoom(room, alphaActor, pWolf.id), true);
+  assert.equal(canListenerHearSpeakerInRoom(room, vilActor, pWolf.id), false);
+
+  emitted.clear();
+  sWolf.handlers["voice:speaking"]({ speaking: true });
+  const alphaUpdates = (emitted.get(sAlpha.id) || []).filter((e) => e.ev === "voice:speaking_update");
+  const vilUpdates = (emitted.get(sVil.id) || []).filter((e) => e.ev === "voice:speaking_update");
+  assert.deepEqual(alphaUpdates.at(-1)?.payload?.speakingIds, [pWolf.id], "Đồng bọn Sói Đầu Đàn phải thấy Sói đang nói");
+  assert.deepEqual(vilUpdates.at(-1)?.payload?.speakingIds, [], "Dân làng tuyệt đối nhận 0% ID Sói đang nói ban đêm");
+
+  // 3) Khi người chơi chết vào ban ngày: canPublish = false nhưng vẫn nghe được bàn thảo luận (Chỉ Nghe)
+  room.game.phase = "day_discuss";
+  pVil.alive = false;
+  const deadVilActor = resolveVoiceParticipant(room, sVil);
+  assert.equal(deadVilActor.canPublish, false, "Người chết phải hạ canPublish=false");
+  assert.equal(canSpeakerTransmitNow(room, deadVilActor), false);
+  assert.equal(canListenerHearSpeakerInRoom(room, deadVilActor, pWolf.id), true, "Người chết vẫn nghe được thảo luận ban ngày");
+
+  // Dọn dẹp 100% RAM khi rời phòng
+  removeSocketFromVoiceRelay(mockIo, room.code, sWolf.id, getRoom);
+  removeSocketFromVoiceRelay(mockIo, room.code, sAlpha.id, getRoom);
+  removeSocketFromVoiceRelay(mockIo, room.code, sVil.id, getRoom);
+  assert.equal(getVoiceRelayRuntimeStats().activeVoiceRooms, 0);
+  deleteRoom(room.code);
+
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const serverIndexSrc = fs.readFileSync(path.resolve(__dirname, "../index.js"), "utf8");
+  assert.ok(serverIndexSrc.includes('app.get("/api/voice-status"'), "Server phải có cổng chẩn đoán /api/voice-status");
+  assert.ok(serverIndexSrc.includes("/rtc/validate?access_token="), "checkLivekitHealth phải xác thực qua /rtc/validate");
+});
+
+// 50. V4.2 — Liên Thông Voice Cấp Phòng (Sảnh <-> Trận <-> Ván Mới), Nút Nổi 3D, Auto-Ducking 0.6x & Opus 16kbps P2P
+runScenario("50. V4.2: VoiceSessionProvider liên thông Sảnh <-> Trận, VoiceQuickMicPill 3D, Auto-Ducking 0.6x & Opus 16kbps", () => {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const rootDir = path.resolve(__dirname, "../..");
+
+  const roomSrc = fs.readFileSync(path.join(rootDir, "client/src/components/Room.jsx"), "utf8");
+  const playingSrc = fs.readFileSync(path.join(rootDir, "client/src/components/PlayingView.jsx"), "utf8");
+  const voiceRoomSrc = fs.readFileSync(path.join(rootDir, "client/src/components/VoiceRoom.jsx"), "utf8");
+  const p2pSrc = fs.readFileSync(path.join(rootDir, "client/src/utils/p2pVoiceEngine.js"), "utf8");
+
+  assert.ok(roomSrc.includes("<VoiceSessionProvider"), "Room.jsx phải bọc VoiceSessionProvider ở gốc giữ kết nối Sảnh <-> Trận");
+  assert.ok(roomSrc.includes("mcDuckingActive={isMcSpeakingNow}"), "Room.jsx phải truyền trạng thái MC đang đọc để Auto-Ducking");
+  assert.ok(roomSrc.includes("isSuppressedForRecap={isWatchingPersonalRecap}"), "Room.jsx phải tạm ngắt thoại khi đang xem Phim Kể Chuyện");
+
+  assert.ok(playingSrc.includes("<VoiceQuickMicPill"), "PlayingView.jsx phải gắn nút nổi VoiceQuickMicPill trên sân khấu 3D");
+  assert.ok(playingSrc.includes("voice-stage-floating-anchor"), "Nút nổi Voice phải neo ở góc sân khấu không che nút Camera");
+
+  assert.ok(voiceRoomSrc.includes("audio={false}"), "LiveKitRoom phải truyền audio={false} để máy không cắm Mic vẫn vào Chỉ Nghe mượt mà");
+  assert.ok(voiceRoomSrc.includes('nightDayPhase === "role_reveal"'), "VoiceRoom phải khóa Mic trong 6s nhận vai định mệnh");
+  assert.ok(voiceRoomSrc.includes("mcDuckingActive ? 0.6 : 1"), "VoiceRoom phải tự động hạ âm lượng về 0.6x (-40%) khi MC đọc");
+  assert.ok(voiceRoomSrc.includes('setEngineMode("p2p")'), "VoiceRoom phải tự động chuyển sang P2P Mesh khi LiveKit lỗi/hết hạn mức");
+
+  assert.ok(
+    p2pSrc.includes("maxaveragebitrate=16000") && p2pSrc.includes("usedtx=1") && p2pSrc.includes("stereo=0"),
+    "p2pVoiceEngine.js phải ép chuẩn nén Opus 16kbps Mono + DTX 0 kbps khi im lặng"
+  );
 });
 
 const totalMs = (performance.now() - startTime).toFixed(1);

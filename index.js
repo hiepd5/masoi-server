@@ -64,6 +64,12 @@ import {
   registerDevSocketHandlers,
   checkBotVoteConsensus,
 } from "./devSandbox.js";
+import {
+  DEFAULT_STUN_SERVERS,
+  registerVoiceRelaySocketHandlers,
+  removeSocketFromVoiceRelay,
+  getVoiceRelayRuntimeStats,
+} from "./voiceRelayHub.js";
 import { AccessToken } from "livekit-server-sdk";
 import https from "https";
 import fs from "fs";
@@ -164,33 +170,127 @@ const LIVEKIT_URL = String(
 const LIVEKIT_API_KEY = String(process.env.LIVEKIT_API_KEY || "").trim();
 const LIVEKIT_API_SECRET = String(process.env.LIVEKIT_API_SECRET || "").trim();
 
-// LiveKit health check cache (60s TTL)
-let livekitHealthCache = { ok: true, checkedAt: 0, message: null };
-const LIVEKIT_HEALTH_TTL = 60_000;
+// LiveKit health check cache (45s TTL — xác thực thật qua /rtc/validate bằng JWT ngắn hạn 30s)
+let livekitHealthCache = {
+  ok: false,
+  configured: Boolean(LIVEKIT_API_KEY && LIVEKIT_API_SECRET && LIVEKIT_URL),
+  reason: "UNCHECKED",
+  checkedAt: 0,
+  message: null,
+};
+const LIVEKIT_HEALTH_TTL = 45_000;
 
-function checkLivekitHealth() {
+async function checkLivekitHealth(force = false) {
+  const now = Date.now();
+  if (!LIVEKIT_API_KEY || !LIVEKIT_API_SECRET || !LIVEKIT_URL) {
+    livekitHealthCache = {
+      ok: false,
+      configured: false,
+      reason: "LIVEKIT_NOT_CONFIGURED",
+      checkedAt: now,
+      message: null,
+    };
+    return livekitHealthCache;
+  }
+
+  if (!force && livekitHealthCache.checkedAt > 0 && now - livekitHealthCache.checkedAt < LIVEKIT_HEALTH_TTL) {
+    return livekitHealthCache;
+  }
+
+  let probeJwt = "";
+  try {
+    const probeToken = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+      identity: "srv_health_probe",
+      ttl: "30s",
+    });
+    probeToken.addGrant({ roomJoin: false });
+    probeJwt = await probeToken.toJwt();
+  } catch (err) {
+    livekitHealthCache = {
+      ok: false,
+      configured: true,
+      reason: "LIVEKIT_AUTH_INVALID",
+      checkedAt: Date.now(),
+      message: err?.message || null,
+    };
+    return livekitHealthCache;
+  }
+
   return new Promise((resolve) => {
-    const now = Date.now();
-    if (now - livekitHealthCache.checkedAt < LIVEKIT_HEALTH_TTL) {
-      return resolve(livekitHealthCache);
-    }
-    const httpUrl = LIVEKIT_URL.replace(/^wss?:\/\//, "https://") + "/rtc?access_token=probe&protocol=11";
-    const req = https.get(httpUrl, { timeout: 5000 }, (res) => {
-      const is429 = res.statusCode === 429;
+    const httpUrl =
+      LIVEKIT_URL.replace(/^wss?:\/\//, "https://").replace(/\/+$/, "") +
+      `/rtc/validate?access_token=${encodeURIComponent(probeJwt)}&protocol=11`;
+
+    let settled = false;
+    const finish = (nextState) => {
+      if (settled) return;
+      settled = true;
+      livekitHealthCache = nextState;
+      resolve(livekitHealthCache);
+    };
+
+    const req = https.get(httpUrl, { timeout: 4500 }, (res) => {
+      const code = Number(res.statusCode || 0);
       let body = "";
-      res.on("data", (d) => (body += d));
+      res.on("data", (d) => {
+        if (body.length < 512) body += d;
+      });
       res.on("end", () => {
-        livekitHealthCache = { ok: !is429, checkedAt: Date.now(), message: is429 ? body.trim() : null };
-        resolve(livekitHealthCache);
+        if (code >= 200 && code < 300) {
+          finish({
+            ok: true,
+            configured: true,
+            reason: "healthy",
+            checkedAt: Date.now(),
+            message: null,
+          });
+        } else if (code === 429) {
+          finish({
+            ok: false,
+            configured: true,
+            reason: "LIVEKIT_QUOTA_EXCEEDED",
+            checkedAt: Date.now(),
+            message: body.trim() || null,
+          });
+        } else if (code === 401 || code === 403) {
+          finish({
+            ok: false,
+            configured: true,
+            reason: "LIVEKIT_AUTH_INVALID",
+            checkedAt: Date.now(),
+            message: body.trim() || null,
+          });
+        } else {
+          finish({
+            ok: false,
+            configured: true,
+            reason: "LIVEKIT_UNREACHABLE",
+            checkedAt: Date.now(),
+            message: `HTTP_${code}`,
+          });
+        }
       });
     });
-    req.on("error", () => {
-      livekitHealthCache = { ok: true, checkedAt: Date.now(), message: null };
-      resolve(livekitHealthCache);
+
+    req.on("error", (err) => {
+      finish({
+        ok: false,
+        configured: true,
+        reason: "LIVEKIT_UNREACHABLE",
+        checkedAt: Date.now(),
+        message: err?.code || "NETWORK_ERROR",
+      });
     });
+
     req.on("timeout", () => {
       req.destroy();
-      resolve({ ok: true, checkedAt: Date.now(), message: null });
+      finish({
+        ok: false,
+        configured: true,
+        reason: "LIVEKIT_UNREACHABLE",
+        checkedAt: Date.now(),
+        message: "TIMEOUT",
+      });
     });
   });
 }
@@ -237,7 +337,7 @@ app.get("/", (req, res) =>
   res.json({
     status: "ok",
     game: "Ma Soi Online",
-    version: "4.1.0",
+    version: "4.2.0",
     uptime: process.uptime(),
   })
 );
@@ -271,7 +371,7 @@ app.get("/api/admin/stats", (req, res) => {
   const mem = process.memoryUsage();
   return res.json({
     ok: true,
-    version: "4.1.0",
+    version: "4.2.0",
     uptimeSec: Math.round(process.uptime()),
     memory: {
       rssMB: Math.round((mem.rss / (1024 * 1024)) * 10) / 10,
@@ -280,6 +380,7 @@ app.get("/api/admin/stats", (req, res) => {
     runtime: getGlobalServerRuntimeMetrics(),
     goldenHour: getVietnamGoldenHourInfo(),
     voiceStudio: getVoiceEngineStatus(),
+    voiceRelay: getVoiceRelayRuntimeStats(),
     moderation: getModerationStats(),
   });
 });
@@ -291,6 +392,24 @@ app.get("/api/tts-status", async (req, res) => {
     req.query?.force === "1" && checkIpRateLimit("tts_probe", clientIp, 6, 60_000).allowed;
   await checkVoiceStudioHealth(allowForce);
   return res.json(getVoiceEngineStatus());
+});
+
+// Chẩn đoán công khai trạng thái Kênh Thoại Đôi (LiveKit Cloud SFU + P2P Mesh Fallback — 0% lộ khóa bí mật)
+app.get("/api/voice-status", async (req, res) => {
+  const clientIp = extractClientIp(req);
+  const allowForce =
+    req.query?.force === "1" && checkIpRateLimit("voice_probe", clientIp, 6, 60_000).allowed;
+  const health = await checkLivekitHealth(allowForce);
+  return res.json({
+    ok: true,
+    recommendedMode: health.ok ? "livekit" : "p2p",
+    livekitConfigured: Boolean(LIVEKIT_API_KEY && LIVEKIT_API_SECRET && LIVEKIT_URL),
+    livekitHealthy: Boolean(health.ok),
+    livekitStatus: health.reason || "UNKNOWN",
+    p2pFallbackReady: true,
+    stunCount: DEFAULT_STUN_SERVERS.length,
+    relay: getVoiceRelayRuntimeStats(),
+  });
 });
 
 // ── TTS Proxy + LRU RAM Cache (SEC-02: Xác thực phiên chơi thật + Rate-Limit bảo vệ GPU RTX 3090 tại nhà) ──
@@ -1089,6 +1208,7 @@ io.on("connection", (socket) => {
   socket.on("room:leave", () => {
     const code = socket.data.roomCode;
     if (!code) return;
+    removeSocketFromVoiceRelay(io, code, socket.id, getRoom);
     const room = removePlayer(code, socket.id, { explicitLeave: true });
     socket.leave(code);
     socket.data.roomCode = null;
@@ -1141,12 +1261,9 @@ io.on("connection", (socket) => {
   });
 
   socket.on("livekit:token", async (_, cb) => {
-    if (!LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
-      return cb?.({ error: "LIVEKIT_NOT_CONFIGURED" });
-    }
     const code = socket.data.roomCode;
     const room = getRoom(code);
-    if (!room) return cb?.({ error: "Không tìm thấy phòng." });
+    if (!room) return cb?.({ ok: false, error: "Không tìm thấy phòng." });
     const player =
       room.players.find((p) => p.socketId === socket.id) ||
       room.players.find((p) => p.id === socket.data.playerId);
@@ -1155,18 +1272,39 @@ io.on("connection", (socket) => {
           (s) => s.socketId === socket.id || s.id === socket.data.playerId
         )
       : null;
-    if (!player && !spectator) return cb?.({ error: "Không tìm thấy người chơi." });
+    if (!player && !spectator) return cb?.({ ok: false, error: "Không tìm thấy người chơi." });
+
+    // Khán giả (Spectator) & Người đã chết bị khóa cứng canPublish: false trên cả SFU lẫn P2P!
+    const canPublishAudio = Boolean(player && player.alive !== false);
+    const identity = player ? player.id : `spec_${spectator.id}`;
+    const displayName = player ? player.name : `👀 ${spectator.name}`;
+
+    if (!LIVEKIT_API_KEY || !LIVEKIT_API_SECRET || !LIVEKIT_URL) {
+      return cb?.({
+        ok: true,
+        mode: "p2p",
+        fallbackReason: "LIVEKIT_NOT_CONFIGURED",
+        canPublish: canPublishAudio,
+        identity,
+        displayName,
+        iceServers: DEFAULT_STUN_SERVERS,
+      });
+    }
 
     const health = await checkLivekitHealth();
     if (!health.ok) {
-      return cb?.({ error: "LIVEKIT_QUOTA_EXCEEDED" });
+      return cb?.({
+        ok: true,
+        mode: "p2p",
+        fallbackReason: health.reason || "LIVEKIT_QUOTA_EXCEEDED",
+        canPublish: canPublishAudio,
+        identity,
+        displayName,
+        iceServers: DEFAULT_STUN_SERVERS,
+      });
     }
 
     try {
-      // Khán giả (Spectator) & Người đã chết bị khóa cứng canPublish: false trên LiveKit Token!
-      const canPublishAudio = Boolean(player && player.alive !== false);
-      const identity = player ? player.id : `spec_${spectator.id}`;
-      const displayName = player ? player.name : `👀 ${spectator.name}`;
       const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
         identity,
         name: displayName,
@@ -1179,9 +1317,26 @@ io.on("connection", (socket) => {
         canPublishData: false,
         canSubscribe: true,
       });
-      cb?.({ token: await at.toJwt(), url: LIVEKIT_URL, canPublish: canPublishAudio });
-    } catch (e) {
-      cb?.({ error: e.message });
+      cb?.({
+        ok: true,
+        mode: "livekit",
+        token: await at.toJwt(),
+        url: LIVEKIT_URL,
+        canPublish: canPublishAudio,
+        identity,
+        displayName,
+        iceServers: DEFAULT_STUN_SERVERS,
+      });
+    } catch {
+      cb?.({
+        ok: true,
+        mode: "p2p",
+        fallbackReason: "LIVEKIT_SIGN_ERROR",
+        canPublish: canPublishAudio,
+        identity,
+        displayName,
+        iceServers: DEFAULT_STUN_SERVERS,
+      });
     }
   });
 
@@ -1189,6 +1344,7 @@ io.on("connection", (socket) => {
     clearInterval(heartbeatInterval);
     const code = socket.data.roomCode;
     if (!code) return;
+    removeSocketFromVoiceRelay(io, code, socket.id, getRoom);
     const room = removePlayer(code, socket.id, {
       explicitLeave: false,
       onOrphanExpire: (expiredCode) => {
@@ -1549,6 +1705,7 @@ io.on("connection", (socket) => {
       targetSocket.leave(code);
     }
 
+    removeSocketFromVoiceRelay(io, code, target.socketId || target.id, getRoom);
     const updatedRoom = removePlayer(code, target.socketId || target.id);
     if (updatedRoom) {
       broadcastRoom(updatedRoom);
@@ -1601,13 +1758,16 @@ io.on("connection", (socket) => {
     cb?.({ ok: true, reportId: entry.id });
   });
 
+  // Đăng ký trạm tín hiệu Voice P2P Mesh Zero-Leak ($0/tháng dự phòng cho LiveKit SFU)
+  registerVoiceRelaySocketHandlers(io, socket, getRoom);
+
   // [LOCAL DEV ONLY] Đăng ký bộ công cụ DevSandbox (tự khóa cứng trên Render/Production)
   registerDevSocketHandlers(socket, gameCtrl, broadcastRoom);
 });
 
 const PORT = process.env.PORT || 3001;
 httpServer.listen(PORT, () => {
-  console.log(`Server ma sói V4.1 đang chạy tại http://localhost:${PORT}`);
+  console.log(`Server ma sói V4.2 đang chạy tại http://localhost:${PORT}`);
 });
 
 // ── TTS Batch: Tra LRU RAM Cache + giới hạn giữ HTTP <= 18s + Bảo vệ GPU RTX 3090 (SEC-02) ──
