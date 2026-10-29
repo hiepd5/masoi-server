@@ -37,6 +37,7 @@ import {
   getModerationStats,
 } from "../moderationAndStats.js";
 import {
+  TEEN_ACADEMY_SPECS,
   BUILTIN_VILLAGER_IDS,
   resolveCitizenAvatarSpec,
 } from "../defaultNames.js";
@@ -2110,6 +2111,153 @@ runScenario("53. Level 3.4: Bảo toàn cấu hình Sói khi thêm/bớt/xóa Bo
   assert.ok(roomSrc.includes("handleSetTableScale") && roomSrc.includes("handleChangeTotalWolves"), "Room.jsx phải có bộ chỉnh nhanh Quy Mô Bàn & Số Sói");
   assert.equal(roomSrc.includes("else {\n    const me ="), false, "Room.jsx tuyệt đối không được khai báo lùi const me trong nhánh else");
   assert.ok(playingSrc.includes("setSeerHistory([])") && playingSrc.includes('handleGhostBet("lovers")'), "PlayingView.jsx phải reset sạch state ván mới và mở đủ 4 phe Cược Cõi Âm");
+});
+
+// 54. V4.4 — UI "Quy Tắc 3 Giây", 36 Tài Sản 3D UE5 Chân Thật, PBR Normal/Rim-Light & Bối Cảnh Rừng Huyết Nguyệt
+runScenario("54. V4.4: Giao diện Quy Tắc 3 Giây, 36 ảnh 3D UE5 PBR, Normal/Roughness Map & Bản đồ 3D Rừng Huyết Nguyệt", () => {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const rootDir = path.resolve(__dirname, "../..");
+
+  // 1) Kiểm tra 4 ảnh bối cảnh 3D UE5 Widescreen
+  const bgDir = path.join(rootDir, "client/public/backgrounds");
+  const expectedBgs = [
+    "home_bloodmoon_village.webp",
+    "preset_nordic_mist.webp",
+    "preset_blood_moon.webp",
+    "preset_stone_arena.webp",
+  ];
+  for (const fn of expectedBgs) {
+    const full = path.join(bgDir, fn);
+    assert.ok(fs.existsSync(full), `Thiếu ảnh bối cảnh 3D UE5: ${fn}`);
+    assert.ok(fs.statSync(full).size > 5000, `Ảnh bối cảnh ${fn} dung lượng bất thường`);
+  }
+
+  // 2) Kiểm tra Scene Presets Index & Vùng Cấm Ghế R >= 6.2m trên Rừng Huyết Nguyệt
+  const presetsIdx = JSON.parse(
+    fs.readFileSync(path.join(rootDir, "client/public/config/scene_presets_index.json"), "utf8")
+  );
+  assert.ok(presetsIdx.presets.some((p) => p.id === "blood_moon_sanctuary" && p.thumbnailUrl), "Phải có bản đồ 3D Rừng Huyết Nguyệt kèm thumbnail");
+
+  const bloodMoonLayout = JSON.parse(
+    fs.readFileSync(path.join(rootDir, "client/public/config/presets/preset_blood_moon_forest.json"), "utf8")
+  );
+  assert.ok(Array.isArray(bloodMoonLayout.nodes) && bloodMoonLayout.nodes.length >= 25);
+  for (const node of bloodMoonLayout.nodes) {
+    if (node.allowCenterZone) continue;
+    const dist = Math.hypot(Number(node.position?.[0] || 0), Number(node.position?.[2] || 0));
+    assert.ok(dist >= 6.2, `Thực thể ${node.id} vi phạm vùng cấm ghế 3D (${dist.toFixed(2)}m < 6.2m)`);
+  }
+
+  // 3) Khóa bố cục 2 cột thiêng liêng + UI Quy tắc 3 Giây + Shader 3D PBR
+  const lobbyCss = fs.readFileSync(path.join(rootDir, "client/src/components/Lobby.css"), "utf8");
+  const playingCss = fs.readFileSync(path.join(rootDir, "client/src/components/PlayingView.css"), "utf8");
+  const lobbySrc = fs.readFileSync(path.join(rootDir, "client/src/components/Lobby.jsx"), "utf8");
+  const roomSrc = fs.readFileSync(path.join(rootDir, "client/src/components/Room.jsx"), "utf8");
+  const pbrSrc = fs.readFileSync(path.join(rootDir, "client/src/3d/utils/proceduralGroundPBR.js"), "utf8");
+  const char3dSrc = fs.readFileSync(path.join(rootDir, "client/src/3d/actors/SkinnedCharacterGLB.jsx"), "utf8");
+
+  assert.ok(lobbyCss.includes("400px minmax(0, 1fr)"), "Lobby.css phải giữ chuẩn bố cục 2 cột 400px | 1fr");
+  assert.ok(playingCss.includes("1fr 380px"), "PlayingView.css phải giữ chuẩn bố cục 2 cột 1fr | 380px");
+  assert.ok(lobbySrc.includes("showCreatePanel") && lobbySrc.includes("home-arcane-keyart"), "Lobby.jsx phải áp dụng Progressive Disclosure & nền Làng 3D UE5");
+  assert.ok(roomSrc.includes("scene-map-cards-grid") && roomSrc.includes("showRoomSettings"), "Room.jsx phải có bộ chọn 3 Bản đồ 3D trực quan & Popover Cài đặt ⚙️");
+  assert.ok(pbrSrc.includes("cobbleNormalMap") && pbrSrc.includes("cobbleRoughnessMap"), "proceduralGroundPBR.js phải xuất Normal Map & Roughness Map thật");
+  assert.ok(char3dSrc.includes("enhanceCharacterMaterialPBR"), "SkinnedCharacterGLB.jsx phải tiêm Fresnel Rim-Light & Bonfire Bounce PBR");
+});
+
+// 55. V4.5 — Học Viện Huyết Nguyệt (8 Socket Box-Blockout 0 Lỗi 404), 6 Cổng Chờ Nhân Vật Teen 3D, Vá Lỗi UI Thực Tế & Pipeline Tripo->Blender->Web
+runScenario("55. V4.5: Map Học Viện Huyết Nguyệt (8 Socket Box->GLB, R>=6.2m), 6 Cổng Chờ Teen 3D, Vá UI RoleReveal/DevSandbox & Pipeline Blender", () => {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const rootDir = path.resolve(__dirname, "../..");
+
+  // 1) Kiểm tra 6 Cổng Chờ Nhân Vật Teen 3D (chỉ cấp cho Người thật, AI Bot vẫn khóa cứng 4 Dân Làng Bắc Âu)
+  const expectedTeenSlots = [
+    "teen_detective",
+    "teen_occult",
+    "teen_idol",
+    "teen_hacker",
+    "teen_varsity",
+    "teen_rebel",
+  ];
+  const charManifestSrc = fs.readFileSync(
+    path.join(rootDir, "client/src/3d/config/characterManifest.js"),
+    "utf8"
+  );
+  const citizenCfgSrc = fs.readFileSync(
+    path.join(rootDir, "client/src/config/citizenAvatars.config.js"),
+    "utf8"
+  );
+  for (const tid of expectedTeenSlots) {
+    assert.ok(TEEN_ACADEMY_SPECS[tid], `Server defaultNames.js thiếu cổng Teen ${tid}`);
+    assert.ok(charManifestSrc.includes(`${tid}:`), `characterManifest.js thiếu cổng Teen ${tid}`);
+    assert.ok(citizenCfgSrc.includes(`id: "${tid}"`), `citizenAvatars.config.js thiếu cổng Teen ${tid}`);
+  }
+  const humanPickTeen = resolveCitizenAvatarSpec("teen_detective", { forBot: false });
+  assert.equal(humanPickTeen.citizenModelId, "teen_detective");
+  assert.equal(humanPickTeen.avatarSource, "teen_academy_3d");
+  const botTryTeen = resolveCitizenAvatarSpec("teen_detective", { forBot: true, fallbackSeed: "bot9" });
+  assert.ok(BUILTIN_VILLAGER_IDS.includes(botTryTeen.citizenModelId), "AI Bot không được chiếm cổng chờ Teen của người thật");
+
+  // 2) Kiểm tra Map Box-Blockout Học Viện Huyết Nguyệt & 8 Socket Kiến Trúc Hot-Swap .GLB (R >= 6.2m)
+  const presetsIdx = JSON.parse(
+    fs.readFileSync(path.join(rootDir, "client/public/config/scene_presets_index.json"), "utf8")
+  );
+  assert.ok(
+    presetsIdx.presets.some((p) => p.id === "dark_academia_courtyard" && p.slotMode === "blockout_ready"),
+    "scene_presets_index.json phải có bản đồ Học Viện Huyết Nguyệt (dark_academia_courtyard)"
+  );
+
+  const acadLayout = JSON.parse(
+    fs.readFileSync(path.join(rootDir, "client/public/config/presets/preset_dark_academia_teen.json"), "utf8")
+  );
+  assert.ok(Array.isArray(acadLayout.nodes) && acadLayout.nodes.length >= 28);
+  for (const node of acadLayout.nodes) {
+    if (node.allowCenterZone) continue;
+    const dist = Math.hypot(Number(node.position?.[0] || 0), Number(node.position?.[2] || 0));
+    assert.ok(dist >= 6.2, `Node Học Viện ${node.id} vi phạm vùng cấm ghế 3D (${dist.toFixed(2)}m < 6.2m)`);
+  }
+
+  const expectedAcadProps = [
+    "acad_clocktower",
+    "acad_cloister_wing",
+    "acad_iron_gate",
+    "acad_owl_statue",
+    "acad_floating_candles",
+    "acad_alchemy_brazier",
+    "acad_stone_bench",
+    "acad_cypress_tree",
+  ];
+  const propManifestSrc = fs.readFileSync(path.join(rootDir, "client/src/3d/config/propManifest.js"), "utf8");
+  const blockoutSrc = fs.readFileSync(path.join(rootDir, "client/src/3d/props/DarkAcademiaBlockout3D.jsx"), "utf8");
+  for (const pk of expectedAcadProps) {
+    assert.ok(propManifestSrc.includes(`${pk}:`), `propManifest.js thiếu socket ${pk}`);
+    assert.ok(blockoutSrc.includes(`"${pk}"`), `DarkAcademiaBlockout3D.jsx thiếu khối Box ${pk}`);
+  }
+  assert.ok(
+    fs.existsSync(path.join(rootDir, "client/public/backgrounds/preset_dark_academia.webp")) &&
+      fs.existsSync(path.join(rootDir, "client/public/backgrounds/preset_neon_market_slot.webp")),
+    "Phải có đủ 2 ảnh thumbnail WebP cho Học Viện Huyết Nguyệt & Cổng Chờ Phố Đêm"
+  );
+
+  // 3) Kiểm tra Vá lỗi UI Thực tế + Hybrid Blender Animation + Pipeline Tripo->Blender->Web
+  const mainJsx = fs.readFileSync(path.join(rootDir, "client/src/main.jsx"), "utf8");
+  assert.ok(
+    mainJsx.indexOf('import "./index.css"') < mainJsx.indexOf('import App from "./App.jsx"'),
+    "main.jsx phải nạp index.css trước App.jsx để không đè trắng nút component"
+  );
+  const arcaneCss = fs.readFileSync(path.join(rootDir, "client/src/arcane-theme.css"), "utf8");
+  assert.ok(arcaneCss.includes("width: auto !important;"), "role-reveal-ready-cta phải khóa width: auto chống ép chữ dọc");
+  const devSandboxCss = fs.readFileSync(path.join(rootDir, "client/src/components/DevSandbox.css"), "utf8");
+  assert.ok(devSandboxCss.includes(".in-room-lobby"), "DevSandbox phải né nút Bắt Đầu Ván Đấu ở sảnh phòng");
+  const skinnedSrc = fs.readFileSync(path.join(rootDir, "client/src/3d/actors/SkinnedCharacterGLB.jsx"), "utf8");
+  assert.ok(
+    skinnedSrc.includes("hasNativeSitClip") && skinnedSrc.includes("seatStyle"),
+    "SkinnedCharacterGLB.jsx phải hỗ trợ Hybrid Blender Sit Clip & Organic Teen Idle V4.5"
+  );
+  assert.ok(
+    fs.existsSync(path.join(rootDir, "tools/blender_tripo_to_web.py")) &&
+      fs.existsSync(path.join(rootDir, "OPTIMIZE_TRIPO_BLENDER.bat")),
+    "Phải có đủ bộ công cụ tự động hóa Tripo -> Blender -> Web (.py + .bat)"
+  );
 });
 
 const totalMs = (performance.now() - startTime).toFixed(1);

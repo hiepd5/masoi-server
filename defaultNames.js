@@ -53,6 +53,46 @@ export const BUILTIN_VILLAGER_SPECS = Object.freeze({
 
 export const BUILTIN_VILLAGER_IDS = Object.freeze(Object.keys(BUILTIN_VILLAGER_SPECS));
 
+// 6 Cổng Chờ Nhân Vật Teen Học Viện 3D (chỉ cấp cho Người chơi thật, AI Bot vẫn khóa cứng 4 Dân Làng Bắc Âu)
+export const TEEN_ACADEMY_SPECS = Object.freeze({
+  teen_detective: {
+    id: "teen_detective",
+    avatar: "/portraits/badges/villager_cloak.webp",
+    avatarSource: "teen_academy_3d",
+    botAllowed: false,
+  },
+  teen_occult: {
+    id: "teen_occult",
+    avatar: "/portraits/badges/villager_female.webp",
+    avatarSource: "teen_academy_3d",
+    botAllowed: false,
+  },
+  teen_idol: {
+    id: "teen_idol",
+    avatar: "/portraits/badges/villager_female.webp",
+    avatarSource: "teen_academy_3d",
+    botAllowed: false,
+  },
+  teen_hacker: {
+    id: "teen_hacker",
+    avatar: "/portraits/badges/villager.webp",
+    avatarSource: "teen_academy_3d",
+    botAllowed: false,
+  },
+  teen_varsity: {
+    id: "teen_varsity",
+    avatar: "/portraits/badges/villager.webp",
+    avatarSource: "teen_academy_3d",
+    botAllowed: false,
+  },
+  teen_rebel: {
+    id: "teen_rebel",
+    avatar: "/portraits/badges/villager_cloak.webp",
+    avatarSource: "teen_academy_3d",
+    botAllowed: false,
+  },
+});
+
 let cachedCustomReadyMap = null;
 let cachedAtMs = 0;
 
@@ -146,8 +186,16 @@ export function resolveCitizenAvatarSpec(
     };
   }
 
-  // Chỉ Người chơi thật / User mới được phép dùng Kho Avatar 3D Người Thật (AI Bot bị khóa 100%)
+  // Chỉ Người chơi thật / User mới được phép dùng Kho Avatar 3D Người Thật & Cổng Teen 3D (AI Bot bị khóa 100%)
   if (!forBot && cleanId) {
+    if (TEEN_ACADEMY_SPECS[cleanId]) {
+      const teenSpec = TEEN_ACADEMY_SPECS[cleanId];
+      return {
+        citizenModelId: teenSpec.id,
+        avatar: teenSpec.avatar,
+        avatarSource: teenSpec.avatarSource,
+      };
+    }
     const customMap = getReadyCustomHumanAvatarMap();
     if (customMap[cleanId]) {
       return {
