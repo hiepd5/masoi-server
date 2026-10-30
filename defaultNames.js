@@ -93,6 +93,82 @@ export const TEEN_ACADEMY_SPECS = Object.freeze({
   },
 });
 
+// 12 Avatar Không gian Công Sở & Học Đường V4.6.2 (Chỉ cấp cho Người chơi thật !forBot; AI Bot khóa cứng 4 Dân Làng Bắc Âu)
+export const UNIVERSE_ANIME_SPECS = Object.freeze({
+  office_suit_m: {
+    id: "office_suit_m",
+    avatar: "/portraits/universe/office_suit_m.svg",
+    avatarSource: "office_anime_3d",
+    botAllowed: false,
+  },
+  office_blazer_f: {
+    id: "office_blazer_f",
+    avatar: "/portraits/universe/office_blazer_f.svg",
+    avatarSource: "office_anime_3d",
+    botAllowed: false,
+  },
+  office_it_tech: {
+    id: "office_it_tech",
+    avatar: "/portraits/universe/office_it_tech.svg",
+    avatarSource: "office_anime_3d",
+    botAllowed: false,
+  },
+  office_hr_lead: {
+    id: "office_hr_lead",
+    avatar: "/portraits/universe/office_hr_lead.svg",
+    avatarSource: "office_anime_3d",
+    botAllowed: false,
+  },
+  office_intern_m: {
+    id: "office_intern_m",
+    avatar: "/portraits/universe/office_intern_m.svg",
+    avatarSource: "office_anime_3d",
+    botAllowed: false,
+  },
+  office_finance_f: {
+    id: "office_finance_f",
+    avatar: "/portraits/universe/office_finance_f.svg",
+    avatarSource: "office_anime_3d",
+    botAllowed: false,
+  },
+  school_boy_blazer: {
+    id: "school_boy_blazer",
+    avatar: "/portraits/universe/school_boy_blazer.svg",
+    avatarSource: "school_anime_3d",
+    botAllowed: false,
+  },
+  school_girl_sailor: {
+    id: "school_girl_sailor",
+    avatar: "/portraits/universe/school_girl_sailor.svg",
+    avatarSource: "school_anime_3d",
+    botAllowed: false,
+  },
+  school_class_rep: {
+    id: "school_class_rep",
+    avatar: "/portraits/universe/school_class_rep.svg",
+    avatarSource: "school_anime_3d",
+    botAllowed: false,
+  },
+  school_monitor_m: {
+    id: "school_monitor_m",
+    avatar: "/portraits/universe/school_monitor_m.svg",
+    avatarSource: "school_anime_3d",
+    botAllowed: false,
+  },
+  school_club_pres: {
+    id: "school_club_pres",
+    avatar: "/portraits/universe/school_club_pres.svg",
+    avatarSource: "school_anime_3d",
+    botAllowed: false,
+  },
+  school_scholar_f: {
+    id: "school_scholar_f",
+    avatar: "/portraits/universe/school_scholar_f.svg",
+    avatarSource: "school_anime_3d",
+    botAllowed: false,
+  },
+});
+
 let cachedCustomReadyMap = null;
 let cachedAtMs = 0;
 
@@ -186,8 +262,16 @@ export function resolveCitizenAvatarSpec(
     };
   }
 
-  // Chỉ Người chơi thật / User mới được phép dùng Kho Avatar 3D Người Thật & Cổng Teen 3D (AI Bot bị khóa 100%)
+  // Chỉ Người chơi thật / User mới được phép dùng Kho Avatar 3D Người Thật, Anime 3 Vũ Trụ & Cổng Teen 3D (AI Bot bị khóa 100%)
   if (!forBot && cleanId) {
+    if (UNIVERSE_ANIME_SPECS[cleanId]) {
+      const animeSpec = UNIVERSE_ANIME_SPECS[cleanId];
+      return {
+        citizenModelId: animeSpec.id,
+        avatar: animeSpec.avatar,
+        avatarSource: animeSpec.avatarSource,
+      };
+    }
     if (TEEN_ACADEMY_SPECS[cleanId]) {
       const teenSpec = TEEN_ACADEMY_SPECS[cleanId];
       return {

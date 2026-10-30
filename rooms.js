@@ -23,6 +23,12 @@ import {
 } from "./securityGuard.js";
 import { getVietnamGoldenHourInfo } from "./moderationAndStats.js";
 import { resolveEffectiveMcPacingMode } from "./botVoiceCatalog.js";
+import {
+  sanitizeUniverseId,
+  UNIVERSE_BOT_NAMES,
+  UNIVERSE_DEFAULT_SCENE_PRESET,
+  UNIVERSE_QUICK_MATCH_TITLES,
+} from "./universeThemes.js";
 
 // rooms: Map<roomCode, RoomState>
 const rooms = new Map();
@@ -192,11 +198,14 @@ export function createRoom(hostSocketId, options = {}) {
   const cleanPassword = String(options.password || "").trim().slice(0, 32);
   const accessMode = validMode === "password" && !cleanPassword ? "public" : validMode;
   const cleanTitle = sanitizeChatText(String(options.roomTitle || ""), 36);
+  const universeId = sanitizeUniverseId(options.universeId);
+  const defaultPreset = UNIVERSE_DEFAULT_SCENE_PRESET[universeId] || "nordic_village_v3";
 
   const room = {
     code,
     hostId: hostSocketId,
     phase: "lobby",
+    universeId, // 'classic' | 'office' | 'school'
     roomTitle: cleanTitle,
     accessMode, // 'public' | 'password' | 'hidden'
     password: accessMode === "password" ? cleanPassword : "",
@@ -207,7 +216,7 @@ export function createRoom(hostSocketId, options = {}) {
         : null,
     soloPracticeRole: null,
     createdAt: Date.now(),
-    scenePresetId: "nordic_village_v3",
+    scenePresetId: defaultPreset,
     players: [],
     spectators: [],
     rolesConfig: generateDefaultRoles(6),
@@ -580,10 +589,11 @@ export function addBotsToRoom(code, count = 1, { syncRolesMode = null } = {}) {
   const wanted = Math.max(0, Number(count) || 0);
   const canAdd = Math.min(wanted, 18 - room.players.length);
   const existingNames = new Set(room.players.map((p) => p.name));
+  const botNamePool = UNIVERSE_BOT_NAMES[sanitizeUniverseId(room.universeId)] || BOT_NAMES;
 
   for (let i = 0; i < canAdd; i++) {
     const idx = room.players.filter((p) => p.isBot).length;
-    let botName = BOT_NAMES[idx % BOT_NAMES.length];
+    let botName = botNamePool[idx % botNamePool.length];
     if (existingNames.has(botName)) botName = `${botName} #${idx + 1}`;
     existingNames.add(botName);
 
@@ -720,6 +730,7 @@ export function getPublicRoomsList() {
     // Zero-Leak: KHÔNG bao giờ gửi room.password hoặc vai trò của bất kỳ ai ra ngoài danh sách sảnh!
     list.push({
       code: room.code,
+      universeId: sanitizeUniverseId(room.universeId),
       roomTitle: room.roomTitle || `Bàn của ${hostPlayer?.name || "Chủ phòng"}`,
       hostName: hostPlayer?.name || "Chủ phòng",
       hostAvatar: hostPlayer?.avatar || null,
@@ -918,6 +929,43 @@ export function setScenePreset(code, requesterSocketId, presetId) {
   return { ok: true, room, scenePresetId: safeId };
 }
 
+export function setRoomUniverse(code, requesterSocketId, requestedUniverseId) {
+  const room = getRoom(code);
+  if (!room) return { error: "Phòng không tồn tại." };
+  if (room.phase !== "lobby") {
+    return { error: "Chỉ có thể đổi Không gian Vũ trụ khi đang ở phòng chờ." };
+  }
+  const player = room.players.find(
+    (p) => p.socketId === requesterSocketId || p.id === requesterSocketId
+  );
+  if (!player || !player.isHost) {
+    return { error: "Chỉ chủ phòng mới có quyền chuyển đổi Không gian Vũ trụ." };
+  }
+  const nextUniverse = sanitizeUniverseId(requestedUniverseId);
+  room.universeId = nextUniverse;
+  room.scenePresetId = UNIVERSE_DEFAULT_SCENE_PRESET[nextUniverse] || "nordic_village_v3";
+
+  // Đổi tên các AI Bot đang ngồi trong sảnh sang đúng tông Vũ trụ mới
+  const botNamePool = UNIVERSE_BOT_NAMES[nextUniverse] || BOT_NAMES;
+  const usedHumanNames = new Set(room.players.filter((p) => !p.isBot).map((p) => p.name));
+  let botCounter = 0;
+  room.players.forEach((p) => {
+    if (!p.isBot) return;
+    let candidate = botNamePool[botCounter % botNamePool.length];
+    if (usedHumanNames.has(candidate)) candidate = `${candidate} #${botCounter + 1}`;
+    usedHumanNames.add(candidate);
+    p.name = candidate;
+    botCounter += 1;
+  });
+
+  return {
+    ok: true,
+    room,
+    universeId: room.universeId,
+    scenePresetId: room.scenePresetId,
+  };
+}
+
 export function addLobbyMessage(code, senderSocketId, text) {
   const room = getRoom(code);
   if (!room) return null;
@@ -1060,11 +1108,13 @@ export function findOrCreateQuickMatchRoom(
     avatarUrl = null,
     citizenModelId = null,
     preferTurbo = false,
+    universeId = "classic",
     deviceId = null,
     enforceAntiMultiTab = undefined,
   } = {}
 ) {
   const cleanDeviceId = sanitizeDeviceId(deviceId);
+  const targetUniverse = sanitizeUniverseId(universeId);
   const shouldEnforceDevice =
     enforceAntiMultiTab !== undefined ? Boolean(enforceAntiMultiTab) : IS_PRODUCTION_ENV;
 
@@ -1072,6 +1122,7 @@ export function findOrCreateQuickMatchRoom(
   for (const room of rooms.values()) {
     if (room.phase !== "lobby") continue;
     if (room.accessMode !== "public") continue;
+    if (sanitizeUniverseId(room.universeId) !== targetUniverse) continue;
     const realHumans = room.players.filter((p) => !p.isBot);
     const connectedHumans = realHumans.filter((p) => p.connected);
     if (connectedHumans.length === 0) continue;
@@ -1122,10 +1173,13 @@ export function findOrCreateQuickMatchRoom(
     };
   }
 
+  const titlePack =
+    UNIVERSE_QUICK_MATCH_TITLES[targetUniverse] || UNIVERSE_QUICK_MATCH_TITLES.classic;
   const newRoom = createRoom(socketId, {
-    roomTitle: preferTurbo ? "⚡ Bàn Ghép Nhanh (5 Phút)" : "🔥 Bàn Ghép Nhanh Sôi Động",
+    roomTitle: preferTurbo ? titlePack.turbo : titlePack.normal,
     accessMode: "public",
     isTurbo: Boolean(preferTurbo),
+    universeId: targetUniverse,
   });
   const createdJoin = addPlayer(
     newRoom.code,
@@ -1274,6 +1328,7 @@ export function publicRoomView(room, forSocketId) {
 
   const base = {
     code: room.code,
+    universeId: sanitizeUniverseId(room.universeId),
     phase: room.phase, // 'lobby' | 'playing' | 'ended'
     roomTitle: room.roomTitle || `Bàn của ${hostPlayer?.name || "Chủ phòng"}`,
     rawRoomTitle: room.roomTitle || "",

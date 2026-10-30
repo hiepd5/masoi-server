@@ -18,6 +18,7 @@ import {
   warmPhrasesInBackground,
 } from "./storyVoiceEngine.js";
 import { estimateMcSpeechMs, isRoomFullMcPacing } from "./botVoiceCatalog.js";
+import { adaptTextForUniverse } from "./universeThemes.js";
 
 // timers: Map<roomCode, Timeout> (Timer chính của từng phase)
 const timers = new Map();
@@ -131,9 +132,10 @@ export function createGameController(io) {
   }
 
   function announce(room, message) {
-    if (room?.game && message) {
+    const finalMsg = adaptTextForUniverse(message, room?.universeId);
+    if (room?.game && finalMsg) {
       const now = Date.now();
-      const speechMs = estimateMcSpeechMs(message, {
+      const speechMs = estimateMcSpeechMs(finalMsg, {
         speed: 0.82,
         bufferMs: 1550,
         minMs: 3600,
@@ -148,15 +150,15 @@ export function createGameController(io) {
           : now + speechMs;
     }
     if (
-      message &&
+      finalMsg &&
       room?.phase !== "ended" &&
       !room?.game?.winner &&
-      (message.includes("AI Bot") ||
-        room?.players?.some((p) => p?.name && message.includes(p.name)))
+      (finalMsg.includes("AI Bot") ||
+        room?.players?.some((p) => p?.name && finalMsg.includes(p.name)))
     ) {
-      warmPhrasesInBackground([message], "urgent");
+      warmPhrasesInBackground([finalMsg], "urgent");
     }
-    io.to(room.code).emit("mc:message", message);
+    io.to(room.code).emit("mc:message", finalMsg);
   }
 
   // ============ CHỐT MẠCH GAME ĐÊM: SMART PACING + RANDOM JITTER (ZERO META-LEAK) ============

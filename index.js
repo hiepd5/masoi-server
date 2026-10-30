@@ -18,6 +18,7 @@ import {
   toggleReady,
   setRolesConfig,
   setScenePreset,
+  setRoomUniverse,
   setRoomAccess,
   setRoomTurbo,
   setRoomMcPacingMode,
@@ -864,6 +865,7 @@ io.on("connection", (socket) => {
       accessMode = "public",
       password = "",
       isTurbo = false,
+      universeId = "classic",
       soloQuickStart = false,
       deviceId = null,
     } = payload || {};
@@ -873,7 +875,13 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const room = createRoom(socket.id, { roomTitle, accessMode, password, isTurbo });
+    const room = createRoom(socket.id, {
+      roomTitle,
+      accessMode,
+      password,
+      isTurbo,
+      universeId,
+    });
     const { room: joinedRoom, player } = addPlayer(
       room.code,
       socket.id,
@@ -947,6 +955,7 @@ io.on("connection", (socket) => {
       avatarUrl = null,
       citizenModelId = null,
       preferTurbo = false,
+      universeId = "classic",
       deviceId = null,
     } = payload || {};
 
@@ -956,6 +965,7 @@ io.on("connection", (socket) => {
       avatarUrl,
       citizenModelId,
       preferTurbo,
+      universeId,
       deviceId,
     });
     if (res.error) {
@@ -1285,6 +1295,22 @@ io.on("connection", (socket) => {
     if (result.error) return cb?.({ ok: false, error: result.error });
     broadcastRoom(result.room);
     cb?.({ ok: true, scenePresetId: result.scenePresetId });
+  });
+
+  socket.on("room:setUniverse", ({ universeId } = {}, cb) => {
+    if (!checkSocketCooldown(socket, "set_universe", 300)) {
+      return cb?.({ ok: false, error: "Thao tác quá nhanh." });
+    }
+    const code = socket.data.roomCode;
+    if (!code) return cb?.({ ok: false, error: "Bạn chưa ở trong phòng." });
+    const result = setRoomUniverse(code, socket.data.playerId || socket.id, universeId);
+    if (result.error) return cb?.({ ok: false, error: result.error });
+    broadcastRoom(result.room);
+    cb?.({
+      ok: true,
+      universeId: result.universeId,
+      scenePresetId: result.scenePresetId,
+    });
   });
 
   socket.on("room:lobbyChat", ({ message } = {}, cb) => {

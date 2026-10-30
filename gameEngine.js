@@ -3,6 +3,7 @@ import {
   warmStoryTimelineProgressively,
   scheduleStoryTimelineWarm,
 } from "./storyVoiceEngine.js";
+import { sanitizeUniverseId } from "./universeThemes.js";
 
 // ============ HẰNG SỐ THỜI GIAN (giây) ============
 export const TIMERS = {
@@ -1559,35 +1560,88 @@ export function computeMatchAwards(room) {
     }
   });
 
+  const uId = sanitizeUniverseId(room?.universeId);
   const awards = [];
 
   if (mvpPlayer) {
+    let mvpTitle = "👑 MVP Ván Đấu";
     let mvpReason = "Có đóng góp xuất sắc nhất trận đấu!";
-    if (winner === "lovers" && Array.isArray(g.lovers) && g.lovers.includes(mvpPlayer.id)) {
-      mvpReason = "Tình yêu vượt chiến tuyến! Cặp đôi định mệnh nắm tay nhau chiến thắng cả ngôi làng!";
-    } else if (isWolfTeamRole(mvpPlayer.role)) {
-      mvpReason = mvpPlayer.alive
-        ? "Thủ lĩnh Bầy Sói tinh quái dẫn dắt thế trận và sống sót đến phút cuối!"
-        : "Đóng góp chiến thuật then chốt cho chiến thắng của Bầy Sói!";
-    } else if (mvpPlayer.role === "hunter") {
-      mvpReason = "Xạ thủ máu lạnh với phát đạn bạc quyết định cục diện ván đấu!";
-    } else if (mvpPlayer.role === "mayor") {
-      mvpReason = "Quyền Trượng uy nghiêm dẫn dắt lá phiếu phán quyết của cả ngôi làng!";
-    } else if (mvpPlayer.role === "cupid") {
-      mvpReason = "Mũi tên Tơ Hồng tạo nên bước ngoặt định mệnh cho ván đấu!";
-    } else if (mvpPlayer.role === "guard") {
-      mvpReason = `Bảo vệ thần thánh với ${stats[mvpPlayer.id].saves} lần cứu người chuẩn xác!`;
-    } else if (mvpPlayer.role === "seer") {
-      mvpReason = `Mắt thần soi đúng ${stats[mvpPlayer.id].seerWolvesFound} Sói, định hướng cho cả làng!`;
-    } else if (mvpPlayer.role === "tanner") {
-      mvpReason = "Cú lừa ngoạn mục dẫn dụ cả làng treo cổ mình thành công!";
+
+    if (uId === "office") {
+      mvpTitle = "👑 Nhân Sự Xuất Sắc (MVP)";
+      mvpReason = "Có đóng góp xuất sắc nhất kỳ họp bảng lương!";
+      if (winner === "lovers" && Array.isArray(g.lovers) && g.lovers.includes(mvpPlayer.id)) {
+        mvpReason = "Đồng minh ăn ý vượt qua mọi đợt rà soát KPI! Cặp đôi chung hợp đồng bảo toàn trọn thưởng quý!";
+      } else if (isWolfTeamRole(mvpPlayer.role)) {
+        mvpReason = mvpPlayer.alive
+          ? "Lãnh đạo Ban Giám Đốc điều phối sắc sảo, giữ kín danh tính đến tận cuối kỳ họp!"
+          : "Đóng góp chiến lược then chốt giúp Ban Giám Đốc chốt sổ bảng lương!";
+      } else if (mvpPlayer.role === "hunter") {
+        mvpReason = "Senior cao tay với cú phóng Email CC toàn công ty xoay chuyển cục diện phòng họp!";
+      } else if (mvpPlayer.role === "mayor") {
+        mvpReason = "Cúp Vàng Công Đoàn uy tín dẫn dắt lá phiếu biểu quyết (x2) của cả văn phòng!";
+      } else if (mvpPlayer.role === "cupid") {
+        mvpReason = "Màn ghép Hợp Đồng Trà Sữa tạo nên bước ngoặt ngoạn mục cho cuộc họp!";
+      } else if (mvpPlayer.role === "guard") {
+        mvpReason = `Team Lead tận tâm với ${stats[mvpPlayer.id].saves} lần bật Tường Lửa bảo lãnh KPI chuẩn xác!`;
+      } else if (mvpPlayer.role === "seer") {
+        mvpReason = `Nhân Viên IT quét trúng ${stats[mvpPlayer.id].seerWolvesFound} nick Sếp Vi Hành, định hướng cho cả phòng!`;
+      } else if (mvpPlayer.role === "tanner") {
+        mvpReason = "Màn kịch đỉnh cao để cả phòng mời nghỉ việc và ôm trọn gói đền bù 6 tháng lương!";
+      } else {
+        mvpReason = `Đóng góp ${stats[mvpPlayer.id].votesToHangWolf} phiếu biểu quyết lật tẩy Sếp Vi Hành chuẩn xác!`;
+      }
+    } else if (uId === "school") {
+      mvpTitle = "👑 Ngôi Sao Lớp Học (MVP)";
+      mvpReason = "Có đóng góp xuất sắc nhất tiết sinh hoạt lớp!";
+      if (winner === "lovers" && Array.isArray(g.lovers) && g.lovers.includes(mvpPlayer.id)) {
+        mvpReason = "Đôi bạn cùng tiến bọc lót hoàn hảo! Nắm tay nhau giữ vững điểm thi đua đến cuối tiết!";
+      } else if (isWolfTeamRole(mvpPlayer.role)) {
+        mvpReason = mvpPlayer.alive
+          ? "Tổ trưởng Giám Thị vi hành khéo léo dẫn dắt tiết sinh hoạt đến phút chót!"
+          : "Đóng góp chiến thuật then chốt giúp Phe Giáo Viên chốt Sổ Đầu Bài!";
+      } else if (mvpPlayer.role === "hunter") {
+        mvpReason = "Chiến thần phát biểu với màn 'Em thưa cô' xoay chuyển toàn bộ tiết sinh hoạt!";
+      } else if (mvpPlayer.role === "mayor") {
+        mvpReason = "Huy hiệu Sao Thi Đua của Lớp Trưởng dẫn dắt lá phiếu biểu quyết (x2) toàn lớp!";
+      } else if (mvpPlayer.role === "cupid") {
+        mvpReason = "Bức thư tay ghép Đôi Bạn Cùng Bàn tạo nên bước ngoặt thú vị cho cả lớp!";
+      } else if (mvpPlayer.role === "guard") {
+        mvpReason = `Lớp Phó Học Tập xuất sắc với ${stats[mvpPlayer.id].saves} lần đỡ lời cứu bạn thoát Sổ Đầu Bài!`;
+      } else if (mvpPlayer.role === "seer") {
+        mvpReason = `Sao Đỏ tinh anh rọi trúng ${stats[mvpPlayer.id].seerWolvesFound} nick Giáo Viên Vi Hành, dẫn lối cả lớp!`;
+      } else if (mvpPlayer.role === "tanner") {
+        mvpReason = "Diễn xuất thần sầu để cả lớp mời ra ngoài, ung dung chuồn thẳng xuống căng-tin!";
+      } else {
+        mvpReason = `Đóng góp ${stats[mvpPlayer.id].votesToHangWolf} phiếu biểu quyết phát hiện đúng nick Giáo Viên!`;
+      }
     } else {
-      mvpReason = `Đóng góp ${stats[mvpPlayer.id].votesToHangWolf} phiếu treo cổ Sói chuẩn xác!`;
+      if (winner === "lovers" && Array.isArray(g.lovers) && g.lovers.includes(mvpPlayer.id)) {
+        mvpReason = "Tình yêu vượt chiến tuyến! Cặp đôi định mệnh nắm tay nhau chiến thắng cả ngôi làng!";
+      } else if (isWolfTeamRole(mvpPlayer.role)) {
+        mvpReason = mvpPlayer.alive
+          ? "Thủ lĩnh Bầy Sói tinh quái dẫn dắt thế trận và sống sót đến phút cuối!"
+          : "Đóng góp chiến thuật then chốt cho chiến thắng của Bầy Sói!";
+      } else if (mvpPlayer.role === "hunter") {
+        mvpReason = "Xạ thủ máu lạnh với phát đạn bạc quyết định cục diện ván đấu!";
+      } else if (mvpPlayer.role === "mayor") {
+        mvpReason = "Quyền Trượng uy nghiêm dẫn dắt lá phiếu phán quyết của cả ngôi làng!";
+      } else if (mvpPlayer.role === "cupid") {
+        mvpReason = "Mũi tên Tơ Hồng tạo nên bước ngoặt định mệnh cho ván đấu!";
+      } else if (mvpPlayer.role === "guard") {
+        mvpReason = `Bảo vệ thần thánh với ${stats[mvpPlayer.id].saves} lần cứu người chuẩn xác!`;
+      } else if (mvpPlayer.role === "seer") {
+        mvpReason = `Mắt thần soi đúng ${stats[mvpPlayer.id].seerWolvesFound} Sói, định hướng cho cả làng!`;
+      } else if (mvpPlayer.role === "tanner") {
+        mvpReason = "Cú lừa ngoạn mục dẫn dụ cả làng treo cổ mình thành công!";
+      } else {
+        mvpReason = `Đóng góp ${stats[mvpPlayer.id].votesToHangWolf} phiếu treo cổ Sói chuẩn xác!`;
+      }
     }
 
     awards.push({
       id: "mvp",
-      title: "👑 MVP Ván Đấu",
+      title: mvpTitle,
       playerId: mvpPlayer.id,
       name: mvpPlayer.name,
       avatar: mvpPlayer.avatar,
@@ -1603,12 +1657,22 @@ export function computeMatchAwards(room) {
   if (guard && stats[guard.id].saves > 0 && guard.id !== mvpPlayer?.id) {
     awards.push({
       id: "best_guard",
-      title: "🛡️ Hộ Vệ Thần Thánh",
+      title:
+        uId === "office"
+          ? "🛡️ Team Lead Vàng"
+          : uId === "school"
+            ? "📚 Lớp Phó Đỡ Lời Vàng"
+            : "🛡️ Hộ Vệ Thần Thánh",
       playerId: guard.id,
       name: guard.name,
       avatar: guard.avatar,
       role: guard.role,
-      description: `Đã ${stats[guard.id].saves} lần chặn đứng móng vuốt của Sói trong đêm!`,
+      description:
+        uId === "office"
+          ? `Đã ${stats[guard.id].saves} lần bật Tường Lửa chặn đứng mộc cắt thưởng KPI!`
+          : uId === "school"
+            ? `Đã ${stats[guard.id].saves} lần đứng dậy đỡ lời giúp bạn thoát ghi Sổ Đầu Bài!`
+            : `Đã ${stats[guard.id].saves} lần chặn đứng móng vuốt của Sói trong đêm!`,
       color: "#3b82f6",
     });
   }
@@ -1618,12 +1682,22 @@ export function computeMatchAwards(room) {
   if (seer && stats[seer.id].seerWolvesFound > 0 && seer.id !== mvpPlayer?.id) {
     awards.push({
       id: "best_seer",
-      title: "🔮 Mắt Thần Vô Song",
+      title:
+        uId === "office"
+          ? "💻 Chuyên Gia An Ninh Mạng"
+          : uId === "school"
+            ? "🔦 Sao Đỏ Tinh Anh"
+            : "🔮 Mắt Thần Vô Song",
       playerId: seer.id,
       name: seer.name,
       avatar: seer.avatar,
       role: seer.role,
-      description: `Đã vạch trần ${stats[seer.id].seerWolvesFound} Sói ẩn mình trong làng!`,
+      description:
+        uId === "office"
+          ? `Đã quét IP vạch trần ${stats[seer.id].seerWolvesFound} nick Sếp ẩn danh trong phòng họp!`
+          : uId === "school"
+            ? `Đã rọi phù hiệu phát hiện ${stats[seer.id].seerWolvesFound} nick Giáo Viên ẩn danh trong lớp!`
+            : `Đã vạch trần ${stats[seer.id].seerWolvesFound} Sói ẩn mình trong làng!`,
       color: "#6366f1",
     });
   }
@@ -1633,25 +1707,45 @@ export function computeMatchAwards(room) {
   if (winner === "tanner" && tanner && tanner.id !== mvpPlayer?.id) {
     awards.push({
       id: "best_actor",
-      title: "🎭 Cú Lừa Thế Kỷ",
+      title:
+        uId === "office"
+          ? "🏖️ Thánh Đền Bù Của Năm"
+          : uId === "school"
+            ? "🧋 Thánh Chuồn Căng-Tin"
+            : "🎭 Cú Lừa Thế Kỷ",
       playerId: tanner.id,
       name: tanner.name,
       avatar: tanner.avatar,
       role: tanner.role,
-      description: "Đánh lừa cả làng treo cổ mình để giành chiến thắng vang dội!",
+      description:
+        uId === "office"
+          ? "Khéo léo để cả phòng chốt biên bản bàn giao, ung dung ẵm 6 tháng lương đi nghỉ dưỡng!"
+          : uId === "school"
+            ? "Để cả lớp biểu quyết mời ra ngoài thành công, ung dung đi uống trà sữa giờ tự học!"
+            : "Đánh lừa cả làng treo cổ mình để giành chiến thắng vang dội!",
       color: "#ec4899",
     });
   } else if (winner === "wolf") {
-    const survivingWolf = players.find((p) => p.role === "wolf" && p.alive && p.id !== mvpPlayer?.id);
+    const survivingWolf = players.find((p) => isWolfTeamRole(p.role) && p.alive && p.id !== mvpPlayer?.id);
     if (survivingWolf) {
       awards.push({
         id: "best_actor",
-        title: "🎭 Diễn Viên Oscar",
+        title:
+          uId === "office"
+            ? "🎭 Bậc Thầy Ngụy Trang Phòng Họp"
+            : uId === "school"
+              ? "🎭 Cao Thủ Nhập Vai Bàn Cuối"
+              : "🎭 Diễn Viên Oscar",
         playerId: survivingWolf.id,
         name: survivingWolf.name,
         avatar: survivingWolf.avatar,
         role: survivingWolf.role,
-        description: "Ngụy trang hoàn hảo, sống sót qua mọi nghi ngờ của dân làng!",
+        description:
+          uId === "office"
+            ? "Đóng vai nhân viên gương mẫu hoàn hảo, vượt qua mọi đợt chất vấn của đồng nghiệp!"
+            : uId === "school"
+              ? "Hòa nhập hội học sinh bàn cuối quá mượt, không một ai trong lớp mảy may nghi ngờ!"
+              : "Ngụy trang hoàn hảo, sống sót qua mọi nghi ngờ của dân làng!",
         color: "#f43f5e",
       });
     }
@@ -1669,12 +1763,22 @@ export function computeMatchAwards(room) {
   if (executioner && maxHangVotes >= 1) {
     awards.push({
       id: "executioner",
-      title: "🪓 Đao Phủ Quyết Đoán",
+      title:
+        uId === "office"
+          ? "📋 Chuyên Viên Chốt Biên Bản"
+          : uId === "school"
+            ? "🙋 Thành Viên Năng Nổ Biểu Quyết"
+            : "🪓 Đao Phủ Quyết Đoán",
       playerId: executioner.id,
       name: executioner.name,
       avatar: executioner.avatar,
       role: executioner.role,
-      description: `Bỏ ${maxHangVotes} phiếu treo cổ, kiên quyết diệt trừ hiểm họa!`,
+      description:
+        uId === "office"
+          ? `Bỏ ${maxHangVotes} phiếu mời bàn giao việc, quyết liệt rà soát tài khoản nghi vấn!`
+          : uId === "school"
+            ? `Giơ bảng biểu quyết ${maxHangVotes} lần, sôi nổi giữ gìn cờ thi đua của lớp!`
+            : `Bỏ ${maxHangVotes} phiếu treo cổ, kiên quyết diệt trừ hiểm họa!`,
       color: "#f97316",
     });
   }
@@ -1686,12 +1790,22 @@ export function computeMatchAwards(room) {
     if (victim) {
       awards.push({
         id: "martyr",
-        title: "🕊️ Nạn Nhân Vô Tội",
+        title:
+          uId === "office"
+            ? "📦 Bàn Giao Sớm Ca Đầu"
+            : uId === "school"
+              ? "📒 Lên Sổ Tiết Đầu"
+              : "🕊️ Nạn Nhân Vô Tội",
         playerId: victim.id,
         name: victim.name,
         avatar: victim.avatar,
         role: victim.role,
-        description: "Chưa kịp cất lời đã bị tiễn về cõi vĩnh hằng ngay Đêm 1!",
+        description:
+          uId === "office"
+            ? "Chưa kịp uống ngụm trà chiều đã bị đóng mộc cắt KPI ngay ca trực đầu tiên!"
+            : uId === "school"
+              ? "Chưa kịp mở vở nháp đã bị ghi tên vào Sổ Đầu Bài ngay tiết truy bài đầu tiên!"
+              : "Chưa kịp cất lời đã bị tiễn về cõi vĩnh hằng ngay Đêm 1!",
         color: "#94a3b8",
       });
     }
@@ -1699,3 +1813,5 @@ export function computeMatchAwards(room) {
 
   return awards;
 }
+
+export { computeMatchAwards as computeAwards };

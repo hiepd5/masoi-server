@@ -6,7 +6,14 @@ import {
   ensureRoleInLobbyConfig,
 } from "./rooms.js";
 import { generateDefaultRoles, isWolfTeamRole, ROLE_LABELS } from "./roles.js";
+import { initGameState, computeMatchAwards } from "./gameEngine.js";
 import { pickZeroLeakBotSpeech, isRoomFullMcPacing } from "./botVoiceCatalog.js";
+import {
+  adaptTextForUniverse,
+  sanitizeUniverseId,
+  UNIVERSE_BOT_NAMES,
+  UNIVERSE_DEFAULT_SCENE_PRESET,
+} from "./universeThemes.js";
 
 // SEC-06: Khóa cứng 100% DevSandbox trên Render/Production & chỉ mở khi ALLOW_LOCAL_STUDIO === "1"
 export const IS_LOCAL_DEV =
@@ -94,8 +101,15 @@ function clearBotDebateTimers(room) {
 function emitBotVillageBubble(room, gameCtrl, io, speaker, suspect, speech, phaseName = "day_discuss") {
   if (!room || room.phase !== "playing" || !room.game || room.game.winner) return;
   if (!speaker?.alive) return;
-  const bubbleText = typeof speech === "string" ? speech : speech?.bubbleText || "";
-  if (!bubbleText) return;
+  const rawBubbleText = typeof speech === "string" ? speech : speech?.bubbleText || "";
+  if (!rawBubbleText) return;
+  const uId = sanitizeUniverseId(room.universeId);
+  const bubbleText = uId === "classic" ? rawBubbleText : adaptTextForUniverse(rawBubbleText, uId);
+  const spokenText =
+    uId === "classic"
+      ? speech?.spokenText || bubbleText
+      : adaptTextForUniverse(speech?.spokenText || rawBubbleText, uId);
+  const botAudioUrl = uId === "classic" ? speech?.botAudioUrl || null : null;
   gameCtrl.recordReplayEvent?.(room, {
     kind: "village_chat",
     phase: phaseName,
@@ -111,8 +125,8 @@ function emitBotVillageBubble(room, gameCtrl, io, speaker, suspect, speech, phas
     personaLabel: speech?.personaLabel || speaker.personaLabel || null,
     isBot: true,
     message: bubbleText,
-    spokenText: speech?.spokenText || bubbleText,
-    botAudioUrl: speech?.botAudioUrl || null,
+    spokenText,
+    botAudioUrl,
     durationMs: speech?.durationMs || null,
   });
 }
@@ -222,14 +236,28 @@ export function flushBotInteractionsForCurrentPhase(
         context: "night_wolf",
         targetName: finalTarget.name,
       });
+      const uId = sanitizeUniverseId(room.universeId);
+      const wolfBubbleText =
+        uId === "classic" ? wolfSpeech.bubbleText : adaptTextForUniverse(wolfSpeech.bubbleText, uId);
+      const wolfSpokenText =
+        uId === "classic"
+          ? wolfSpeech.spokenText
+          : adaptTextForUniverse(wolfSpeech.spokenText || wolfSpeech.bubbleText, uId);
+      const wolfBotAudioUrl = uId === "classic" ? wolfSpeech.botAudioUrl : null;
+      const whisperPrefix =
+        uId === "office"
+          ? "👔 [Mật đàm Ban Giám Đốc]"
+          : uId === "school"
+            ? "👩‍🏫 [Mật đàm Giáo Viên]"
+            : "🐺 [Mật đàm Sói]";
       gameCtrl.recordReplayEvent?.(room, {
         kind: "wolf_chat",
         phase: "night_wolf",
         actorId: leadWolfBot.id,
         actorRole: leadWolfBot.role,
         targetId: finalTarget.id,
-        chatText: wolfSpeech.bubbleText,
-        caption: `🐺 [Mật đàm Sói] ${leadWolfBot.name}: "${wolfSpeech.bubbleText}"`,
+        chatText: wolfBubbleText,
+        caption: `${whisperPrefix} ${leadWolfBot.name}: "${wolfBubbleText}"`,
       });
       // ZERO-LEAK ABSOLUTE ISOLATION: Chỉ gửi mật đàm + file MP3 thì thầm tới socket của đồng bọn Sói NGƯỜI THẬT còn sống!
       if (io) {
@@ -243,13 +271,13 @@ export function flushBotInteractionsForCurrentPhase(
             personaId: wolfSpeech.personaId,
             personaLabel: wolfSpeech.personaLabel,
             isBot: true,
-            message: wolfSpeech.bubbleText,
-            spokenText: wolfSpeech.spokenText,
-            botAudioUrl: wolfSpeech.botAudioUrl,
+            message: wolfBubbleText,
+            spokenText: wolfSpokenText,
+            botAudioUrl: wolfBotAudioUrl,
             durationMs: wolfSpeech.durationMs,
           });
         });
-        if (livingHumanWolves.length > 0 && isRoomFullMcPacing(room)) {
+        if (livingHumanWolves.length > 0 && isRoomFullMcPacing(room) && wolfBotAudioUrl) {
           const startAfterMc = Math.max(Date.now(), g.mcBusyUntilAt || Date.now());
           g.botAudioBusyUntilAt = startAfterMc + (wolfSpeech.durationMs || 4800) + 500;
         }
@@ -567,6 +595,346 @@ export function setupDevPhaseHook(gameCtrl, io = null) {
   });
 }
 
+/**
+ * Chuyển nóng Vũ Trụ (`classic` | `office` | `school`) ngay lập tức ở MỌI trạng thái phòng
+ * (`lobby`, `playing`, `ended`) kèm đổi tên Bot + Preset 3D + chấm lại danh hiệu `awards`!
+ */
+export function devSwitchUniverseLive(room, nextUniverseRaw) {
+  if (!room) return { ok: false, error: "Phòng không tồn tại." };
+  const uId = sanitizeUniverseId(nextUniverseRaw);
+  room.universeId = uId;
+  room.scenePresetId =
+    UNIVERSE_DEFAULT_SCENE_PRESET[uId] || UNIVERSE_DEFAULT_SCENE_PRESET.classic;
+
+  const botPool = UNIVERSE_BOT_NAMES[uId] || UNIVERSE_BOT_NAMES.classic;
+  const usedNames = new Set(
+    (room.players || []).filter((p) => !p.isBot).map((p) => p.name)
+  );
+  let botIdx = 0;
+  (room.players || []).forEach((p) => {
+    if (!p.isBot) return;
+    let candidate = botPool[botIdx % botPool.length];
+    botIdx += 1;
+    if (usedNames.has(candidate)) candidate = `${candidate} #${botIdx}`;
+    usedNames.add(candidate);
+    p.name = candidate;
+  });
+
+  if (room.game?.winner) {
+    room.game.awards = computeMatchAwards(room);
+  }
+  return { ok: true, universeId: uId, scenePresetId: room.scenePresetId };
+}
+
+/**
+ * Giả lập tức thì (< 0.1s) trọn bộ Kịch Bản Kết Thúc & Phim Điện Ảnh 3D (`EndGameRecap`)
+ * với đủ 15 nhịp kỹ năng cốt lõi cho cả 4 kết cục (`village`, `wolf`, `tanner`, `lovers`).
+ */
+export function devSimulateRecap(room, winnerType = "village", gameCtrl = null) {
+  if (!room) return { ok: false, error: "Phòng không tồn tại." };
+  const validWinners = new Set(["village", "wolf", "tanner", "lovers"]);
+  const cleanWinner = validWinners.has(winnerType) ? winnerType : "village";
+  const uId = sanitizeUniverseId(room.universeId);
+
+  // Dọn sạch toàn bộ Timer đang chạy để tránh nhảy pha đè lên màn Recap
+  gameCtrl?.clearRoomTimer?.(room.code);
+  if (room.devBotTimer) {
+    clearTimeout(room.devBotTimer);
+    room.devBotTimer = null;
+  }
+  if (room.devConsensusTimer) {
+    clearTimeout(room.devConsensusTimer);
+    room.devConsensusTimer = null;
+  }
+  if (room.devDeadAdvanceTimer) {
+    clearTimeout(room.devDeadAdvanceTimer);
+    room.devDeadAdvanceTimer = null;
+  }
+  clearBotDebateTimers(room);
+  if (room.rematchAutoTimer) {
+    clearTimeout(room.rematchAutoTimer);
+    room.rematchAutoTimer = null;
+  }
+
+  // Đảm bảo có tối thiểu 8 ghế với tên Bot khớp đúng Vũ Trụ hiện tại
+  room.phase = "lobby";
+  if ((room.players || []).length < 8) {
+    addBotsToRoom(room.code, 8 - room.players.length);
+  }
+  devSwitchUniverseLive(room, uId);
+
+  initGameState(room);
+  const g = room.game;
+  // Gắn mốc gameStartedAt duy nhất mỗi lần bấm để Room.jsx luôn mở lại Rạp Chiếu ngay tức khắc
+  const baseTs = Date.now() - 180_000 - Math.floor(Math.random() * 997);
+  g.gameStartedAt = baseTs;
+  g.dayNumber = 2;
+
+  const rolePlan = [
+    "guard",
+    "alpha_wolf",
+    "witch",
+    "seer",
+    "hunter",
+    "cupid",
+    cleanWinner === "tanner" ? "tanner" : "mayor",
+    "wolf",
+  ];
+  const counts = {};
+  room.players.forEach((p, idx) => {
+    const r = rolePlan[idx] || "villager";
+    p.role = r;
+    p.initialRole = r;
+    p.seatIndex = idx;
+    p.alive = true;
+    counts[r] = (counts[r] || 0) + 1;
+  });
+  g.roleCounts = counts;
+
+  const [pGuard, pAlpha, pWitch, pSeer, pHunter, pCupid, pSpecial, pWolf] = room.players;
+  g.lovers = [pGuard.id, pWolf.id];
+  g.mayorRevealedId = pSpecial.role === "mayor" ? pSpecial.id : null;
+
+  const wolfWhisperLine =
+    uId === "office"
+      ? `Tối nay chốt đóng mộc cắt KPI bàn của ${pSeer.name} trước giờ họp sáng nhé!`
+      : uId === "school"
+        ? `Tiết tự học này kiểm tra đột xuất bàn của ${pSeer.name} trước nhé!`
+        : `Đêm nay khóa chặt mục tiêu ${pSeer.name} trước bình minh nhé!`;
+
+  const dayDebateLine =
+    uId === "office"
+      ? `Mình kiểm tra log mạng nội bộ thấy tài khoản của ${pSpecial.role === "tanner" ? pSpecial.name : pAlpha.name} rất đáng ngờ!`
+      : uId === "school"
+        ? `Tớ để ý từ đầu tiết ${pSpecial.role === "tanner" ? pSpecial.name : pAlpha.name} cứ lén nhìn sổ trực ban trên bục giảng!`
+        : `Ánh mắt của ${pSpecial.role === "tanner" ? pSpecial.name : pAlpha.name} từ sáng nay cực kỳ bất thường!`;
+
+  const verdictTarget = cleanWinner === "tanner" ? pSpecial : cleanWinner === "wolf" ? pSeer : pWolf;
+  const allIds = room.players.map((p) => p.id);
+  const initialWolfIds = [pAlpha.id, pWolf.id];
+
+  const votesMap = {};
+  room.players.forEach((p) => {
+    if (p.id !== verdictTarget.id) {
+      votesMap[p.id] = "hang";
+    }
+  });
+  const nomVotesMap = {};
+  room.players.forEach((p) => {
+    if (p.id !== verdictTarget.id) {
+      nomVotesMap[p.id] = { targetId: verdictTarget.id, timestamp: baseTs + 75_000 };
+    }
+  });
+
+  let seq = 0;
+  const pushFrame = (offsetMs, day, phase, spec) => {
+    g.replayTimeline.push({
+      seq: ++seq,
+      ts: baseTs + offsetMs,
+      elapsedMs: offsetMs,
+      day,
+      phase,
+      isNight: String(phase).startsWith("night_"),
+      aliveIds: spec.aliveIds || allIds,
+      wolfIdsNow: spec.wolfIdsNow || initialWolfIds,
+      coActorIds: [],
+      caption: "",
+      ...spec,
+    });
+  };
+
+  // Đêm 1: Đủ bộ kỹ năng Đêm + Cứu + Độc + Soi + Đồng hóa
+  pushFrame(4000, 1, "night_cupid", {
+    kind: "cupid_link",
+    actorId: pCupid.id,
+    actorRole: "cupid",
+    targetId: pGuard.id,
+    coActorIds: [pWolf.id],
+  });
+  pushFrame(9000, 1, "night_guard", {
+    kind: "guard_pick",
+    actorId: pGuard.id,
+    actorRole: "guard",
+    targetId: pSeer.id,
+  });
+  pushFrame(15000, 1, "night_wolf", {
+    kind: "wolf_aim",
+    actorId: pAlpha.id,
+    actorRole: "alpha_wolf",
+    prevTargetId: pWitch.id,
+    targetId: pSeer.id,
+  });
+  pushFrame(19000, 1, "night_wolf", {
+    kind: "wolf_chat",
+    actorId: pAlpha.id,
+    actorRole: "alpha_wolf",
+    targetId: pSeer.id,
+    chatText: wolfWhisperLine,
+  });
+  pushFrame(24000, 1, "night_wolf", {
+    kind: "wolf_strike",
+    actorId: pAlpha.id,
+    actorRole: "alpha_wolf",
+    coActorIds: [pAlpha.id, pWolf.id],
+    targetId: pSeer.id,
+  });
+  pushFrame(28000, 1, "night_wolf", {
+    kind: "shield_block",
+    actorId: pGuard.id,
+    actorRole: "guard",
+    targetId: pSeer.id,
+  });
+  pushFrame(34000, 1, "night_witch", {
+    kind: "witch_save",
+    actorId: pWitch.id,
+    actorRole: "witch",
+    targetId: pHunter.id,
+  });
+  pushFrame(39000, 1, "night_witch", {
+    kind: "witch_poison",
+    actorId: pWitch.id,
+    actorRole: "witch",
+    targetId: pCupid.id,
+  });
+  pushFrame(45000, 1, "night_seer", {
+    kind: "seer_scan",
+    actorId: pSeer.id,
+    actorRole: "seer",
+    targetId: pAlpha.id,
+    decision: "wolf",
+  });
+
+  const aliveAfterN1 = allIds.filter((id) => id !== pCupid.id);
+  pushFrame(52000, 1, "day_reveal", {
+    kind: "night_death",
+    targetId: pCupid.id,
+    targetRole: "cupid",
+    aliveIds: aliveAfterN1,
+  });
+
+  if (pSpecial.role === "mayor") {
+    pushFrame(58000, 1, "day_discuss", {
+      kind: "mayor_reveal",
+      actorId: pSpecial.id,
+      actorRole: "mayor",
+      aliveIds: aliveAfterN1,
+    });
+  }
+
+  pushFrame(64000, 1, "day_discuss", {
+    kind: "village_chat",
+    actorId: pSeer.id,
+    actorRole: "seer",
+    chatText: dayDebateLine,
+    aliveIds: aliveAfterN1,
+  });
+  pushFrame(72000, 1, "day_nominate", {
+    kind: "day_nominate",
+    actorId: pSeer.id,
+    actorRole: "seer",
+    targetId: verdictTarget.id,
+    votesSnapshot: nomVotesMap,
+    _isCollectiveNominationSummary: true,
+    aliveIds: aliveAfterN1,
+  });
+  pushFrame(79000, 1, "day_defense", {
+    kind: "day_defense",
+    targetId: verdictTarget.id,
+    targetRole: verdictTarget.role,
+    aliveIds: aliveAfterN1,
+  });
+
+  const aliveAfterVerdict = aliveAfterN1.filter((id) => id !== verdictTarget.id);
+  pushFrame(88000, 1, "day_final_vote", {
+    kind: "day_verdict",
+    targetId: verdictTarget.id,
+    targetRole: verdictTarget.role,
+    decision: "hang",
+    votesSnapshot: votesMap,
+    aliveIds: aliveAfterVerdict,
+  });
+
+  if (cleanWinner === "wolf") {
+    pushFrame(96000, 2, "night_wolf", {
+      kind: "alpha_convert",
+      actorId: pAlpha.id,
+      actorRole: "alpha_wolf",
+      targetId: pWitch.id,
+      targetRole: "witch",
+      aliveIds: aliveAfterVerdict,
+      wolfIdsNow: [pAlpha.id, pWolf.id, pWitch.id],
+    });
+  } else if (cleanWinner === "village") {
+    pushFrame(96000, 1, "hunter_revenge", {
+      kind: "hunter_shot",
+      actorId: pHunter.id,
+      actorRole: "hunter",
+      targetId: pAlpha.id,
+      targetRole: "alpha_wolf",
+      aliveIds: aliveAfterVerdict.filter((id) => id !== pHunter.id && id !== pAlpha.id),
+    });
+  }
+
+  // Lịch sử phục vụ chấm điểm computeMatchAwards chuẩn xác
+  g.history = [
+    { type: "guard", day: 1, sourceId: pGuard.id, targetId: pSeer.id },
+    { type: "wolf", day: 1, sourceId: pAlpha.id, targetId: pSeer.id },
+    { type: "witch_save", day: 1, sourceId: pWitch.id, targetId: pHunter.id },
+    { type: "witch_poison", day: 1, sourceId: pWitch.id, targetId: pCupid.id },
+    { type: "seer", day: 1, sourceId: pSeer.id, targetId: pAlpha.id, isWolf: true },
+    { type: "death", day: 1, targetId: pCupid.id },
+    ...(pSpecial.role === "mayor" ? [{ type: "mayor_reveal", day: 1, sourceId: pSpecial.id }] : []),
+    {
+      type: "hang",
+      day: 1,
+      targetId: verdictTarget.id,
+      votesDetail: votesMap,
+    },
+    ...(cleanWinner === "wolf"
+      ? [{ type: "alpha_converted", day: 2, sourceId: pAlpha.id, targetId: pWitch.id }]
+      : []),
+    ...(cleanWinner === "village"
+      ? [{ type: "hunter_shot", day: 1, sourceId: pHunter.id, targetId: pAlpha.id }]
+      : []),
+  ];
+  g._replaySeq = seq;
+
+  // Thiết lập trạng thái sống/rời bàn cuối trận khớp 100% với phe chiến thắng
+  pCupid.alive = false;
+  if (cleanWinner === "village") {
+    pWolf.alive = false;
+    pAlpha.alive = false;
+    pHunter.alive = false;
+  } else if (cleanWinner === "wolf") {
+    pWitch.role = "wolf";
+    pSeer.alive = false;
+    pGuard.alive = false;
+    pHunter.alive = false;
+  } else if (cleanWinner === "tanner") {
+    pSpecial.alive = false;
+  } else if (cleanWinner === "lovers") {
+    room.players.forEach((p) => {
+      p.alive = g.lovers.includes(p.id);
+    });
+  }
+
+  room.phase = "ended";
+  g.phase = "day_final_vote";
+  g.winner = cleanWinner;
+  g.awards = computeMatchAwards(room);
+  g.rematchReadyIds = {};
+  g.rematchEndsAt = Date.now() + 300_000;
+
+  gameCtrl?.broadcast?.(room);
+  return {
+    ok: true,
+    winner: cleanWinner,
+    universeId: uId,
+    beatFrameCount: g.replayTimeline.length,
+    awardsCount: g.awards.length,
+  };
+}
+
 export function registerDevSocketHandlers(socket, gameCtrl, broadcastRoom) {
   if (!IS_LOCAL_DEV) return;
 
@@ -725,6 +1093,30 @@ export function registerDevSocketHandlers(socket, gameCtrl, broadcastRoom) {
       }
 
       return cb?.({ ok: false, error: `Hành động '${action}' không khớp với phase hiện tại (${g.phase}).` });
+    });
+  });
+
+  // 7. Chuyển nóng Vũ Trụ 1-Click ở mọi màn hình (Sảnh / Đang chơi / Đang chiếu Recap)
+  socket.on("dev:setUniverse", ({ universeId } = {}, cb) => {
+    withDevRoom((room) => {
+      const res = devSwitchUniverseLive(room, universeId);
+      if (!res.ok) return cb?.(res);
+      if (room.phase === "playing" || room.phase === "ended") {
+        gameCtrl.broadcast(room);
+      } else {
+        broadcastRoom(room);
+      }
+      cb?.(res);
+    });
+  });
+
+  // 8. Nhảy thẳng vào Phim Tổng Kết Cuối Trận (< 0.5s) để kiểm chứng Lời Kết & Danh Hiệu 3 Không Gian
+  socket.on("dev:simulateRecap", ({ winner = "village" } = {}, cb) => {
+    withDevRoom((room) => {
+      const res = devSimulateRecap(room, winner, gameCtrl);
+      if (!res.ok) return cb?.(res);
+      if (!gameCtrl?.broadcast) broadcastRoom(room);
+      cb?.(res);
     });
   });
 }

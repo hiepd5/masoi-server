@@ -16,6 +16,7 @@ import {
   reconnectByToken,
   setRoomAccess,
   setRoomTurbo,
+  setRoomUniverse,
   setRoomMcPacingMode,
   setSoloPracticeRole,
   setPlayerCitizenModel,
@@ -38,9 +39,16 @@ import {
 } from "../moderationAndStats.js";
 import {
   TEEN_ACADEMY_SPECS,
+  UNIVERSE_ANIME_SPECS,
   BUILTIN_VILLAGER_IDS,
   resolveCitizenAvatarSpec,
 } from "../defaultNames.js";
+import {
+  getUniverseOnboardingAvatars,
+  resolveAlignedCitizenModelForUniverse,
+  ANIME_AVATAR_3D_LOOKS,
+} from "../../client/src/config/citizenAvatars.config.js";
+import { adaptTextForUniverse, normalizeUniverseId } from "../universeThemes.js";
 import {
   isOriginAllowed,
   checkIpRateLimit,
@@ -57,7 +65,16 @@ import {
   registerDevSocketHandlers,
   buildZeroLeakBotLine,
   flushBotInteractionsForCurrentPhase,
+  devSimulateRecap,
+  devSwitchUniverseLive,
 } from "../devSandbox.js";
+import { UNIVERSE_THEMES } from "../../client/src/config/universeThemes.config.js";
+import {
+  UNIVERSE_RECAP_WINNER_CONFIG,
+  UNIVERSE_RECAP_UI_LABELS,
+  formatUniverseRecapBeat,
+  localizeBeatForUniverse,
+} from "../../client/src/config/universeRecapScripts.js";
 import {
   FORBIDDEN_MC_VOICE_ID,
   BOT_VOICE_CATALOG,
@@ -2257,6 +2274,332 @@ runScenario("55. V4.5: Map Học Viện Huyết Nguyệt (8 Socket Box->GLB, R>=
     fs.existsSync(path.join(rootDir, "tools/blender_tripo_to_web.py")) &&
       fs.existsSync(path.join(rootDir, "OPTIMIZE_TRIPO_BLENDER.bat")),
     "Phải có đủ bộ công cụ tự động hóa Tripo -> Blender -> Web (.py + .bat)"
+  );
+});
+
+runScenario("56. V4.6: Hệ 3 Vũ Trụ (Classic/Công Sở/Học Đường), 36 Vai Zero-Drama, BossKey & Full 3D Anime Stage", () => {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const rootDir = path.resolve(__dirname, "../..");
+
+  // 1) Đồng bộ Room Universe + QuickMatch cô lập theo từng Vũ Trụ
+  assert.equal(normalizeUniverseId("office"), "office");
+  assert.equal(normalizeUniverseId("school"), "school");
+  assert.equal(normalizeUniverseId("unknown_xyz"), "classic");
+
+  const officeRoom = createRoom("sock_off_1", { universeId: "office" });
+  addPlayer(officeRoom.code, "sock_off_1", "HostCongSo");
+  assert.equal(officeRoom.universeId, "office");
+  assert.equal(officeRoom.scenePresetId, "preset_office_penthouse_3d");
+
+  const qmSchool = findOrCreateQuickMatchRoom("sock_sch_1", {
+    name: "HsBanCuoi",
+    universeId: "school",
+  });
+  assert.equal(qmSchool.room.universeId, "school");
+  assert.notEqual(qmSchool.room.code, officeRoom.code, "QuickMatch Học Đường không được ghép nhầm vào phòng Công Sở");
+
+  const switched = setRoomUniverse(officeRoom.code, "sock_off_1", "school");
+  assert.equal(switched.ok, true);
+  assert.equal(officeRoom.universeId, "school");
+  assert.equal(officeRoom.scenePresetId, "preset_school_sunset_3d");
+  assert.equal(publicRoomView(officeRoom).universeId, "school");
+
+  const pubList = getPublicRoomsList();
+  assert.ok(pubList.some((r) => r.code === officeRoom.code && r.universeId === "school"));
+
+  deleteRoom(officeRoom.code);
+  deleteRoom(qmSchool.room.code);
+
+  // 2) Bộ chuyển ngữ MC Zero-Drama (Bảo toàn 100% Classic, hài hước văn minh cho Office & School)
+  const rawMc = "Bầy Ma Sói thức dậy cắn người! Phù Thủy dùng Bình Độc, Tiên Tri soi ra Sói, làng bỏ phiếu treo cổ.";
+  assert.equal(adaptTextForUniverse(rawMc, "classic"), rawMc);
+  const officeMc = adaptTextForUniverse(rawMc, "office");
+  assert.ok(!officeMc.includes("Ma Sói") && !officeMc.includes("treo cổ"), "Công Sở phải xóa sạch từ ngữ bạo lực/Ma Sói");
+  assert.ok(officeMc.includes("Sếp") && officeMc.includes("Kế Toán"), "Công Sở phải chuyển sang Sếp & Kế Toán");
+  const schoolMc = adaptTextForUniverse(rawMc, "school");
+  assert.ok(!schoolMc.includes("Ma Sói") && !schoolMc.includes("treo cổ"), "Học Đường phải xóa sạch từ ngữ bạo lực/Ma Sói");
+  assert.ok(schoolMc.includes("Chủ Nhiệm") && schoolMc.includes("Sổ Đầu Bài"), "Học Đường phải chuyển sang Chủ Nhiệm & Sổ Đầu Bài");
+
+  // 3) Kiểm tra Sân Khấu 3D Anime Zero-Clipping, BossKey Stealth & Pipeline VRoid J_Bip_*
+  const presetsIdx = JSON.parse(
+    fs.readFileSync(path.join(rootDir, "client/public/config/scene_presets_index.json"), "utf8")
+  );
+  assert.ok(presetsIdx.presets.some((p) => p.id === "preset_office_penthouse_3d"));
+  assert.ok(presetsIdx.presets.some((p) => p.id === "preset_school_sunset_3d"));
+  assert.ok(fs.existsSync(path.join(rootDir, "client/src/3d/environment/OfficePenthouseStage3D.jsx")));
+  assert.ok(fs.existsSync(path.join(rootDir, "client/src/components/StealthCamouflageOverlay.jsx")));
+  assert.ok(fs.existsSync(path.join(rootDir, "OPTIMIZE_VROID_ANIME.bat")));
+
+  const skinnedSrc = fs.readFileSync(path.join(rootDir, "client/src/3d/actors/SkinnedCharacterGLB.jsx"), "utf8");
+  assert.ok(skinnedSrc.includes("j_bip_c_hips") && skinnedSrc.includes("faceMorphTargets"), "Phải hỗ trợ xương VRoid J_Bip_* & Blink/LipSync");
+});
+
+// 57. V4.6.1 — Kỹ Năng 3D Độc Lập, Lời Kết & Danh Hiệu 0% Lẫn Ma Sói, Âm Thanh Mặc Định BẬT & Phòng Thí Nghiệm Dev Kép
+runScenario("57. V4.6.1: Kỹ năng 3D độc lập, Lời kết/Danh hiệu 0% từ Ma Sói (Office/School), Âm thanh BẬT mặc định & Dual Dev Test Lab", () => {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const rootDir = path.resolve(__dirname, "../..");
+
+  // 1) Âm thanh mặc định BẬT bình thường ở cả 3 Không Gian (ai thích im lặng bấm nút 🔇)
+  assert.equal(UNIVERSE_THEMES.classic.silentByDefault, false);
+  assert.equal(UNIVERSE_THEMES.office.silentByDefault, false, "Công Sở phải bật tiếng bình thường mặc định");
+  assert.equal(UNIVERSE_THEMES.school.silentByDefault, false, "Học Đường phải bật tiếng bình thường mặc định");
+
+  // 2) Quét 100% Từ Điển Lời Kết, 22 Nhịp Phim Recap, Danh Hiệu Server & 4 Kết Cục Giả Lập (0% lọt từ kinh dị/Ma Sói!)
+  const FORBIDDEN_HORROR_RE =
+    /(?<![\p{L}\p{N}])(ma sói|bầy sói|đàn sói|sói|cắn|nanh vuốt|móng vuốt|máu|treo cổ|pháp trường|lửa trại|cõi chết|hấp hối|lìa đời|tử nạn|quyên sinh|đao phủ|cõi vĩnh hằng|đạn bạc)(?![\p{L}\p{N}])/iu;
+
+  const ALL_BEAT_KEYS = [
+    "opening_reveal",
+    "guard_pick",
+    "wolf_aim",
+    "wolf_chat",
+    "wolf_strike",
+    "shield_block",
+    "witch_save",
+    "witch_poison",
+    "seer_scan",
+    "cursed_turn",
+    "tough_endure",
+    "night_death",
+    "peaceful_dawn",
+    "village_chat",
+    "day_nominate",
+    "day_defense",
+    "day_verdict",
+    "cupid_link",
+    "alpha_convert",
+    "lover_heartbreak",
+    "hunter_shot",
+    "mayor_reveal",
+    "mvp_finale",
+  ];
+
+  // Classic giữ nguyên 100% (trả về null để không chạm vào Ma Sói gốc)
+  assert.equal(formatUniverseRecapBeat("classic", "wolf_strike", {}), null);
+
+  for (const uId of ["office", "school"]) {
+    // Quét Winner Config & UI Labels
+    const winTable = UNIVERSE_RECAP_WINNER_CONFIG[uId];
+    for (const wKey of ["village", "wolf", "tanner", "lovers"]) {
+      const wInfo = winTable[wKey];
+      assert.ok(wInfo?.title && wInfo?.subtitle, `Thiếu cấu hình thắng ${uId}.${wKey}`);
+      assert.equal(
+        FORBIDDEN_HORROR_RE.test(`${wInfo.title} ${wInfo.subtitle}`),
+        false,
+        `Winner ${uId}.${wKey} còn lọt từ Ma Sói: ${wInfo.title} | ${wInfo.subtitle}`
+      );
+    }
+    const uiPack = UNIVERSE_RECAP_UI_LABELS[uId];
+    assert.equal(
+      FORBIDDEN_HORROR_RE.test(Object.values(uiPack).join(" ")),
+      false,
+      `UI Labels của ${uId} còn lọt từ Ma Sói`
+    );
+
+    // Quét đủ 23 khóa kịch bản Beat với mọi biến thể boolean (switched, isWolfResult, isHanged, isTannerWin)
+    for (const bKey of ALL_BEAT_KEYS) {
+      for (const flag of [false, true]) {
+        const localized = formatUniverseRecapBeat(uId, bKey, {
+          dayNum: 2,
+          actorName: "Minh Anh",
+          targetName: "Hoàng Khoa",
+          prevName: "Thảo Vy",
+          partnerName: "Tuấn Kiệt",
+          chatText: "Mọi người kiểm tra kỹ lịch trình ca tối nhé!",
+          switched: flag,
+          isWolfResult: flag,
+          isWolfSpeaker: flag,
+          isCollectiveVote: flag,
+          isHanged: flag,
+          isTannerWin: flag,
+          roleLabel: uId === "office" ? "Sếp Vi Hành" : "Cô Chủ Nhiệm",
+          mvpName: "Minh Anh",
+          mvpDescription: "Đóng góp xuất sắc!",
+        });
+        assert.ok(localized, `Thiếu kịch bản ${bKey} cho không gian ${uId}`);
+        const joinedText = Object.values(localized).filter(Boolean).join(" | ");
+        assert.equal(
+          FORBIDDEN_HORROR_RE.test(joinedText),
+          false,
+          `Beat ${uId}.${bKey} (flag=${flag}) còn lọt từ Ma Sói: ${joinedText}`
+        );
+      }
+    }
+
+    // Giả lập thật 4 kết cục qua devSimulateRecap & kiểm tra computeMatchAwards + localizeBeatForUniverse
+    const testRoom = createRoom(`sock_v461_${uId}`, { universeId: uId });
+    addPlayer(testRoom.code, `sock_v461_${uId}`, "TesterDev");
+    for (const wType of ["village", "wolf", "tanner", "lovers"]) {
+      const simRes = devSimulateRecap(testRoom, wType, null);
+      assert.equal(simRes.ok, true);
+      assert.equal(testRoom.phase, "ended");
+      assert.equal(testRoom.game.winner, wType);
+      assert.ok(testRoom.game.replayTimeline.length >= 12, "Phải sinh >= 12 khung hình kỹ năng cho Dev test");
+      assert.ok(testRoom.game.awards.length >= 2, "Phải sinh đầy đủ bảng danh hiệu cuối ván");
+
+      for (const aw of testRoom.game.awards) {
+        const awStr = `${aw.title} ${aw.description}`;
+        assert.equal(
+          FORBIDDEN_HORROR_RE.test(awStr),
+          false,
+          `Danh hiệu ${uId}/${wType} (${aw.id}) còn lọt từ Ma Sói: ${awStr}`
+        );
+      }
+
+      // Kiểm chứng localizeBeatForUniverse biến đổi sạch cả câu chuyện lẫn nhãn 3D trên đầu nhân vật
+      const sampleRawBeat = {
+        id: "rf_5_wolf_strike",
+        kind: "night",
+        day: 1,
+        tag: "🌙 ĐÊM 1 • ĐẠI CẢNH ĐÀN SÓI CẮN",
+        title: "Cả Đàn Sói Đồng Loạt Lao Ra Tấn Công!",
+        narration: "Cả đàn Sói phóng móng vuốt đỏ rực chụp xuống!",
+        vfxCue: {
+          vfxType: "wolf_attack",
+          sourceId: testRoom.players[1].id,
+          coActorIds: [testRoom.players[1].id, testRoom.players[7].id],
+          targetId: testRoom.players[3].id,
+        },
+        actorStates: {
+          [testRoom.players[1].id]: { badgeText: "🐺 ĐÀN SÓI VỒ MỒI!" },
+          [testRoom.players[3].id]: { badgeText: "🩸 TRÚNG NANH ĐÀN SÓI!" },
+        },
+      };
+      const cleanBeat = localizeBeatForUniverse(sampleRawBeat, {
+        universeId: uId,
+        players: testRoom.players,
+        awards: testRoom.game.awards,
+        winner: wType,
+      });
+      const beatDump = [
+        cleanBeat.tag,
+        cleanBeat.title,
+        cleanBeat.narration,
+        ...Object.values(cleanBeat.actorStates).map((s) => s.badgeText || ""),
+      ].join(" | ");
+      assert.equal(
+        FORBIDDEN_HORROR_RE.test(beatDump),
+        false,
+        `localizeBeatForUniverse (${uId}) còn sót chữ Ma Sói: ${beatDump}`
+      );
+    }
+
+    // Kiểm tra devSwitchUniverseLive đổi nóng sang không gian khác và tự chấm lại danh hiệu
+    const nextU = uId === "office" ? "school" : "office";
+    const swRes = devSwitchUniverseLive(testRoom, nextU);
+    assert.equal(swRes.ok, true);
+    assert.equal(testRoom.universeId, nextU);
+    for (const aw of testRoom.game.awards) {
+      assert.equal(FORBIDDEN_HORROR_RE.test(`${aw.title} ${aw.description}`), false);
+    }
+    deleteRoom(testRoom.code);
+  }
+
+  // 3) Kiểm tra mã nguồn 3D Choreography, 3D VFX, Studio /?choreo=1 & DevSandbox
+  const choreoSrc = fs.readFileSync(
+    path.join(rootDir, "client/src/3d/animation/actorChoreography3D.js"),
+    "utf8"
+  );
+  const vfxSrc = fs.readFileSync(
+    path.join(rootDir, "client/src/3d/actors/ActionChoreoVfx3D.jsx"),
+    "utf8"
+  );
+  const sceneSrc = fs.readFileSync(
+    path.join(rootDir, "client/src/3d/scene/WerewolfScene3D.jsx"),
+    "utf8"
+  );
+  const devSandboxSrc = fs.readFileSync(
+    path.join(rootDir, "client/src/components/DevSandbox.jsx"),
+    "utf8"
+  );
+  assert.ok(choreoSrc.includes("getChoreoScenariosForUniverse"), "Phải có bộ kịch bản Studio 3 không gian");
+  assert.ok(vfxSrc.includes('universeId === "office"') && vfxSrc.includes('universeId === "school"'), "3D VFX phải tách nhánh đạo cụ riêng cho Công Sở & Học Đường");
+  assert.ok(sceneSrc.includes("ws:dev-preview-choreo") && sceneSrc.includes("handleChangeStudioUniverse"), "WerewolfScene3D phải hỗ trợ 1-Click Preview & chuyển nóng 3 không gian trong Studio");
+  assert.ok(devSandboxSrc.includes("dev:simulateRecap") && devSandboxSrc.includes("dev:setUniverse"), "DevSandbox phải có bộ nút test 4 lời kết & chuyển nóng không gian");
+});
+
+// 58. V4.6.2 — Giao Diện Mở Đầu Mobile-First Tối Giản 4 Bước, 18 Avatar 3 Không Gian 1:1 Ghế 3D & Chống Tràn iOS
+runScenario("58. V4.6.2: Wizard mở đầu Mobile 4 bước (Không gian -> Tên -> Avatar -> Sảnh), đồng bộ 1:1 Avatar 3D & chống zoom iOS 16px", () => {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const rootDir = path.resolve(__dirname, "../..");
+
+  // 1) Kiểm tra 6 Avatar riêng cho từng Không Gian (0% lọt chữ Bắc Âu/Bô Lão vào Công Sở & Học Đường)
+  const classicSet = getUniverseOnboardingAvatars("classic");
+  const officeSet = getUniverseOnboardingAvatars("office");
+  const schoolSet = getUniverseOnboardingAvatars("school");
+  assert.equal(classicSet.length, 6);
+  assert.equal(officeSet.length, 6);
+  assert.equal(schoolSet.length, 6);
+
+  const NORDIC_LEAK_RE = /(bắc âu|bô lão|thôn nữ|nông dân|áo choàng)/i;
+  for (const item of [...officeSet, ...schoolSet]) {
+    assert.equal(
+      NORDIC_LEAK_RE.test(`${item.label} ${item.shortLabel} ${item.desc}`),
+      false,
+      `Avatar ${item.id} bị lẫn nhãn cổ trang Bắc Âu: ${item.label}`
+    );
+    assert.ok(UNIVERSE_ANIME_SPECS[item.id], `Server defaultNames.js thiếu cấu hình ${item.id}`);
+    assert.ok(ANIME_AVATAR_3D_LOOKS[item.id], `Thiếu bảng màu/tóc 3D Anime cho ${item.id}`);
+    assert.equal(sanitizeCitizenModelId(item.id), item.id);
+    assert.equal(sanitizeAvatarUrl(item.portraitBadge), item.portraitBadge);
+
+    const svgFull = path.join(rootDir, "client/public", item.portraitBadge.replace(/^\//, ""));
+    assert.ok(fs.existsSync(svgFull), `Thiếu file ảnh chân dung SVG cho ${item.id}: ${svgFull}`);
+
+    // Người chơi thật nhận đúng Avatar 1:1; AI Bot vẫn khóa cứng 4 Dân Làng gốc
+    const humanSpec = resolveCitizenAvatarSpec(item.id, { forBot: false });
+    assert.equal(humanSpec.citizenModelId, item.id);
+    assert.equal(humanSpec.avatar, item.portraitBadge);
+
+    const botSpec = resolveCitizenAvatarSpec(item.id, { forBot: true, fallbackSeed: "bot_test" });
+    assert.ok(BUILTIN_VILLAGER_IDS.includes(botSpec.citizenModelId));
+  }
+
+  // Tự căn chỉnh Avatar mặc định khi chuyển Không Gian ở Bước 1
+  assert.equal(resolveAlignedCitizenModelForUniverse("office", "villager_cloak"), "office_suit_m");
+  assert.equal(resolveAlignedCitizenModelForUniverse("school", "villager_cloak"), "school_boy_blazer");
+  assert.equal(resolveAlignedCitizenModelForUniverse("office", "office_blazer_f"), "office_blazer_f");
+
+  // Phòng Chơi Cùng BOT AI (hidden) không được làm rác Danh sách phòng công khai đang online
+  const soloHiddenRoom = createRoom("sock_solo_v462", {
+    universeId: "office",
+    accessMode: "hidden",
+  });
+  addPlayer(soloHiddenRoom.code, "sock_solo_v462", "Minh Công Sở", null, null, "", {
+    citizenModelId: "office_blazer_f",
+  });
+  addBotsToRoom(soloHiddenRoom.code, 7);
+  assert.equal(soloHiddenRoom.players[0].citizenModelId, "office_blazer_f");
+  assert.equal(soloHiddenRoom.players[0].avatar, "/portraits/universe/office_blazer_f.svg");
+  assert.equal(
+    getPublicRoomsList().some((r) => r.code === soloHiddenRoom.code),
+    false,
+    "Phòng Chơi Cùng BOT AI không được làm rác danh sách phòng online công khai"
+  );
+  deleteRoom(soloHiddenRoom.code);
+
+  // 2) Kiểm tra cấu trúc mã nguồn Lobby.jsx & Lobby.css (4 bước tuần tự + iOS 16px + 2 nút chủ lực + mã phòng)
+  const lobbySrc = fs.readFileSync(path.join(rootDir, "client/src/components/Lobby.jsx"), "utf8");
+  const lobbyCss = fs.readFileSync(path.join(rootDir, "client/src/components/Lobby.css"), "utf8");
+  assert.ok(
+    lobbySrc.includes('onboardingStep === "universe"') &&
+      lobbySrc.includes('onboardingStep === "name"') &&
+      lobbySrc.includes('onboardingStep === "avatar"') &&
+      lobbySrc.includes("VÀO CHƠI NHANH") &&
+      lobbySrc.includes("VÀO CHƠI CÙNG BOT AI") &&
+      lobbySrc.includes("Phòng đang online"),
+    "Lobby.jsx phải có đủ 4 bước tuần tự và 2 nút Vào Chơi Nhanh / Vào Chơi Cùng BOT AI + Phòng đang online"
+  );
+  assert.ok(
+    lobbyCss.includes("font-size: 16px !important") &&
+      lobbyCss.includes("100dvh") &&
+      /\.mobile-onboard-shell\s*\{[^}]*position:\s*relative;[^}]*z-index:\s*1;/s.test(lobbyCss),
+    "Lobby.css phải khóa font-size: 16px chống zoom iOS Safari, 100dvh và z-index: 1 nổi trên .home-arcane-backdrop"
+  );
+  const runtimeEnvSrc = fs.readFileSync(path.join(rootDir, "client/src/config/runtimeEnv.js"), "utf8");
+  assert.ok(
+    runtimeEnvSrc.includes("resolveLocalDevServerUrl") && runtimeEnvSrc.includes("192\\.168"),
+    "runtimeEnv.js phải hỗ trợ tự động nối cổng :3001 cho cả localhost lẫn IP LAN điện thoại"
   );
 });
 
